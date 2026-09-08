@@ -2,82 +2,86 @@
 
 Durable status record for the main orchestration process. Update at phase
 boundaries or before context compaction. History belongs here only as far as
-"what phase are we in"; do not let this rot into a changelog.
+"what phase are we in"; do not let this rot into a changelog — narrative
+detail belongs in `docs/decisions.md`.
 
 ## Integrated revision
 
-Local git repo initialized at
-`/mnt/home/ldevos/Projects/QuasiStrided.jl` (no remote; not published,
-registered, or pushed, per handoff §2/§8).
+Local git repo at `/mnt/home/ldevos/Projects/QuasiStrided.jl`, `main` branch,
+HEAD `5d50a53` ("Phase 4: review since Phase 2b, close 2 coverage gaps,
+driver benchmarks"). No remote; not published, registered, or pushed, per
+handoff §2/§8.
 
-## Environment (scouted 2026-09-08)
+## Environment
 
-- Julia 1.12.6 on PATH.
-- `StridedViews` v0.5.1/0.5.2 and `Strided` v2.6.3/2.6.4 resolvable locally;
-  local checkouts also exist at `~/Projects/StridedViews.jl`,
-  `~/Projects/Strided.jl/main`.
-- `SIMD.jl` v3.7.1 installed locally (chosen SIMD dependency).
-- CPU: AVX-512 (f/dq/cd/bw/vl) + AVX2 + FMA capable, Cascade Lake-class.
+- Julia 1.12.6. `StridedViews` v0.5.1/0.5.2 and `SIMD.jl` v3.7.2 resolvable
+  locally (declared deps); `Strided` v2.6.3/2.6.4 resolvable (test-only dep).
+- Reference machine: Xeon Gold 6244, Cascade Lake, AVX-512(f/dq/cd/bw/vl) +
+  AVX2 + FMA. All measurements in this project were taken on this one
+  machine — no cross-microarchitecture claim is made anywhere.
 
-## Phase status
+## Phase status — all complete
 
-- [x] Phase 0 (bootstrap/freeze): package skeleton created, `contract!`
-      signature frozen, dependencies chosen. See `docs/decisions.md`.
-- [x] Phase 1 (indexing + oracle): complete and gated 2026-09-08.
-      `src/axis_group.jl` implements AxisGroup/offsets/fill_offsets!/
-      BlockDescriptor/normalize_group per spec. Independent oracle +
-      property tests + Strided integration tests + test-only packer/
-      contraction consumer all pass: `Pkg.test()` → 11714/11714,
-      `18.5s`. One integration fix by main process: added `Random` to
-      `Project.toml`'s test targets (needed by the property tests).
-      `benchmark/bench_axis_group.jl` exists and reports zero steady-state
-      allocations for `fill_offsets!`/`block_descriptors!` on ccqlin038.
-- [x] Phase 2 contract frozen: `src/kernel_descriptor.jl` (`KernelDescriptor{MR,NR,T}`,
-      `packed_a_offset`/`packed_b_offset` = `i+MR*p`/`j+NR*p`,
-      `packed_a_length`/`packed_b_length`), main-process-owned, tested in
-      `test/test_kernel_descriptor.jl`.
-- [x] Phase 2 (tiles/packing/scalar): complete and gated 2026-09-08.
-      `src/tiles.jl` (AffineAxis/ScatterAxis/QSTile=SourceTile=DestinationTile),
-      `src/packing.jl` (pack_a!/pack_b!), `src/kernel.jl` (ScalarKernel,
-      zero_accumulator/accumulate/store_tile!/execute_tile!). Two integration
-      reconciliations by main process (destination-tile type drift,
-      kernel/packing coupling — see docs/decisions.md "Phase 2 integration
-      notes"), plus a new `test/test_phase2_integration.jl` end-to-end
-      fixture. `Pkg.test()`: 12318/12318, 25.4s.
-- [x] Phase 2b (Fable review): complete 2026-09-08. `fable_review_used: true`
-      (spent; do not relaunch Fable per handoff §5/§6). Found 2 blocking
-      (missing storage-bounds checks before `@inbounds` hot paths in
-      `pack_a!`/`pack_b!` and `execute_tile!`) + 1 should-fix (unchecked
-      packed-buffer length vs kc) + coverage gap + a deferred allocation
-      finding + 3 accepted notes. All blocking/should-fix items fixed and
-      regression-tested except the allocation finding (deferred, documented,
-      not correctness-affecting). Full disposition in docs/decisions.md
-      "Phase 2b Fable review: triage and disposition". `Pkg.test()`:
-      12346/12346, 28.7s.
-- [ ] Phase 3 (SIMD + serial driver): not started.
-- [ ] Phase 4 (review, measurement, handoff): not started.
+- [x] **Phase 0** (bootstrap/freeze): package skeleton, `contract!` signature
+      frozen, SIMD dependency chosen.
+- [x] **Phase 1** (indexing + independent oracle): `AxisGroup`/`offsets`/
+      `fill_offsets!`/`BlockDescriptor`/`normalize_group`, independent
+      `CartesianIndices` oracle, real `StridedView` integration.
+- [x] **Phase 2** (tiles/packing/scalar kernel): `AffineAxis`/`ScatterAxis`/
+      `QSTile`, `pack_a!`/`pack_b!`, `ScalarKernel`. Two integration
+      reconciliations (destination-tile type drift, kernel/packing coupling).
+- [x] **Phase 2b** (Fable review): 2 blocking findings (missing storage-bounds
+      checks before `@inbounds` hot paths) fixed and regression-tested; 1
+      allocation finding deferred (not correctness-affecting).
+      `fable_review_used: true` — spent, do not relaunch.
+- [x] **Phase 3** (SIMD + serial driver): `SIMDKernel` (register-resident,
+      `@code_llvm`-verified, 3.9-6.3x vs scalar single-tile), `contract!`/
+      `plan_contract`/`execute!` driver (label resolution, output tiling,
+      multi-K-panel, beta applied once). Both workers converged on the same
+      integration pattern independently — `SIMDKernel` is a drop-in `kernel=`
+      swap in the driver with zero driver changes needed, verified.
+- [x] **Phase 4** (review + measurement + handoff): Sonnet-High review of
+      everything since Phase 2b — no blocking findings; 2 coverage gaps
+      closed (SIMDKernel-through-driver allocation test, dangling-in-B label
+      test). Driver-level benchmark taken (planning vs. steady-state
+      execution cost). README.md finished. This file is the closing record.
 
-- [x] Phase 3 (SIMD + serial driver): complete and gated 2026-09-08.
-      `src/kernels/simd.jl` (SIMDKernel, NTuple-of-Vec accumulator,
-      register-resident per @code_llvm inspection, 3.9-6.3x vs scalar on
-      Cascade Lake). `src/driver.jl` (ContractPlan/plan_contract/execute!/
-      contract!, label resolution, output tiling, multi-K-panel). Both
-      workers independently followed the ScalarKernel integration pattern,
-      so SIMDKernel slots into the driver as a drop-in kernel= swap with no
-      driver changes — verified in test/test_phase3_integration.jl (main
-      process). `Pkg.test()`: 12623/12623.
+**Final test count: `Pkg.test("QuasiStrided")` → 12627/12627 passing.**
 
-## Active owners
+Full narrative for every decision, integration reconciliation, and review
+disposition is in `docs/decisions.md` — that file, not this one, is
+authoritative for *why*. This file is only *what phase, what count*.
 
-- Phase 4 reviewer (Sonnet, high effort): reviewing everything since Phase 2b
-  (src/kernels/simd.jl, src/driver.jl, test/test_phase3_integration.jl).
-  Launched 2026-09-08.
+## What works, measured
+
+- Correctness: full test suite green, including an independent oracle
+  (Phase 1), real `StridedView` integration (permuted/sliced/negative-stride/
+  zero-stride), two independent review passes, and scalar-vs-SIMD numerical
+  agreement (`atol=1e-8`–`1e-10`, not bitwise — expected, documented).
+- Performance, single machine only: scalar and SIMD kernels are
+  zero-steady-state-allocation and (SIMD) register-resident, confirmed by
+  `@allocated`/`@code_llvm` inspection, not assumed from source-level tuples.
+  SIMD is 3.9-6.3x faster than scalar at the single-tile level (kc 1-256) and
+  faster-with-lower-allocation through the full driver on a 64×64×64 case.
+  Driver planning cost (~4.4-6.7 µs/call) is under 3% of execution cost at
+  that size and fully amortizable across a reused plan.
+
+## What's known and unresolved
+
+- `pack_a!`/`pack_b!` allocate ~80 B/call in steady state; root cause not
+  isolated (three individually-zero-allocating sub-pieces measured, but the
+  full function body still allocates). Not a correctness issue. This is the
+  one open item a future session should pick up first if continuing
+  performance work — see `docs/decisions.md`'s Phase 2b disposition (finding
+  5) for what was already ruled out.
+- No cache-blocked macro-kernel, autotuning, threading, or GPU path — all
+  explicitly deferred per the handoff, not gaps in this milestone's scope.
 
 ## Next task
 
-Await the Phase 4 review. Triage findings (main process fixes directly or
-follow-up per handoff escalation policy). Then: complete test suite once
-more, driver-level benchmarks (plan_contract setup cost vs execute! steady-
-state cost, per spec section 2/12 — not yet measured; the SIMD worker only
-benchmarked single execute_tile! calls, not through the driver), finish
-README.md, and this file as the final handoff.
+None outstanding for this milestone. A future session extending this work
+should start by reading `docs/decisions.md` in full (it is the frozen-
+interface and disposition record every subsequent change must respect), then
+`docs/decisions.md`'s Phase 2b finding 5 (the deferred allocation) if
+continuing performance work, or the two specs' "Deferred work"/"Deferred
+extensions" sections if extending scope.
