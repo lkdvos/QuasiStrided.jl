@@ -57,15 +57,27 @@ registered, or pushed, per handoff §2/§8).
 - [ ] Phase 3 (SIMD + serial driver): not started.
 - [ ] Phase 4 (review, measurement, handoff): not started.
 
+- [x] Phase 3 (SIMD + serial driver): complete and gated 2026-09-08.
+      `src/kernels/simd.jl` (SIMDKernel, NTuple-of-Vec accumulator,
+      register-resident per @code_llvm inspection, 3.9-6.3x vs scalar on
+      Cascade Lake). `src/driver.jl` (ContractPlan/plan_contract/execute!/
+      contract!, label resolution, output tiling, multi-K-panel). Both
+      workers independently followed the ScalarKernel integration pattern,
+      so SIMDKernel slots into the driver as a drop-in kernel= swap with no
+      driver changes — verified in test/test_phase3_integration.jl (main
+      process). `Pkg.test()`: 12623/12623.
+
 ## Active owners
 
-None currently active; about to launch Phase 3.
+None currently active; about to launch Phase 4.
 
 ## Next task
 
-Launch Phase 3: SIMD implementer (Sonnet High, owns `src/kernels/simd.jl`)
-and driver implementer (Sonnet Medium, owns `src/driver.jl`,
-`test/test_driver.jl`), in parallel, against
-`Julia-Microkernel-Tile-Interface-Design.md` and the frozen `contract!`
-signature in `docs/decisions.md`. Neither may change the packed format or
-accumulator-to-output convention independently.
+Launch Phase 4: a Sonnet High reviewer for everything since Phase 2b
+(src/kernels/simd.jl, src/driver.jl, plus the main process's Phase 3
+integration test), supplying the Phase 2b findings/dispositions so it
+doesn't repeat that ground. Then run the complete test suite once more,
+focused benchmarks (already partially done by the SIMD worker; driver-level
+benchmarks still needed — setup/plan cost vs execute! cost, per spec
+section 2/12), and finish README.md/this file as the final handoff. Do not
+begin complex arithmetic, threading, or GPU work.

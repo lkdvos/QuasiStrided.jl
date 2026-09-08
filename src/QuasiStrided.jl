@@ -25,8 +25,9 @@ export ScalarKernel, zero_accumulator, accumulate, scale_tile!, store_tile!, exe
 
 # --- Phase 3: SIMD kernel + serial driver ---
 include("kernels/simd.jl")
+export SIMDKernel, lanewidth, avecs_per_column
 
 include("driver.jl")
-export contract!
+export contract!, plan_contract, execute!, ContractPlan
 
 end # module QuasiStrided

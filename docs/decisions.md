@@ -187,3 +187,45 @@ findings kept in `STATUS.md`'s history is unnecessary; disposition of each:
    unavoidable anyway.
 
 `Pkg.test()` after Phase 2b fixes: 12346/12346 passing, 28.7s.
+
+## Phase 3 integration notes
+
+Two workers (SIMD implementer, driver implementer) ran in parallel with
+disjoint file ownership (`src/kernels/simd.jl`+`test/test_simd_kernel.jl` vs
+`src/driver.jl`+`test/test_driver.jl`) and, unlike Phase 2, needed almost no
+reconciliation: both independently followed the `ScalarKernel` pattern
+(wrap `KernelDescriptor`, forward `mr`/`nr`/`scalartype`/`packed_*`, add
+`pack_a!`/`pack_b!` forwarding methods per the Phase 2 integration note),
+so `SIMDKernel` slotted into the driver as a drop-in `kernel=` swap with zero
+source changes to `src/driver.jl`. Main process integration work:
+
+1. Exported `SIMDKernel`, `lanewidth`, `avecs_per_column` (from
+   `kernels/simd.jl`) and `plan_contract`, `execute!`, `ContractPlan` (from
+   `driver.jl`) in `src/QuasiStrided.jl` — neither worker could edit that
+   file themselves.
+2. Added `test/test_simd_kernel.jl` and (new, main-process-owned)
+   `test/test_phase3_integration.jl` to `test/runtests.jl`'s include list.
+3. `test/test_phase3_integration.jl`: verifies `plan_contract`/`execute!`
+   actually accept `SIMDKernel` in place of the default `ScalarKernel` and
+   agree numerically (both against a direct `Amat*Bmat` reference and
+   against each other, `atol=1e-10`/`1e-8`) — through the real driver
+   (multi-output-tile, multi-K-panel), not just at the single-tile level
+   that `test_simd_kernel.jl` already covers against `ScalarKernel` directly.
+   Neither worker's own tests exercised this combination.
+4. One incident, no data lost: the driver implementer accidentally deleted
+   an untracked, never-committed scratch file (`scratch_simd_smoke.jl`)
+   belonging to the SIMD implementer while both worked in the same shared
+   checkout concurrently. Not part of any deliverable (git-tracked files were
+   unaffected); no recovery needed. Noted here as a caution for any future
+   phase running two workers against one shared checkout rather than
+   worktrees: scratch files are not protected by "own these files" scoping.
+
+`Pkg.test()` after Phase 3 integration: 12623/12623 passing.
+
+SIMD kernel measured performance (Cascade Lake, MR=8/NR=6/W=4, Float64,
+warmed, single `execute_tile!` call): 3.9-6.3x faster than the scalar
+reference across kc in {1,4,16,64,256} — see the SIMD implementer's own
+report for exact numbers; not independently re-measured by the main process
+(no cluster-exclusivity requirement applies to a single-call microbenchmark
+of this kind, but see `docs/measurement-rules.md`-equivalent caution: this is
+a single machine, single microarchitecture, not a cross-machine claim).
