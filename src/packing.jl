@@ -90,6 +90,10 @@ function pack_a!(packed::Vector{T}, source::QSTile, kernel::KernelDescriptor{MR,
 
     kc == 0 && return packed
 
+    # Fable review (Phase 2b) follow-up: validate reachable storage bounds
+    # before entering the unchecked @inbounds load loop (spec section 6).
+    checked_tile_storage_bounds(source)
+
     load = (i, p) -> tile_load(source, i, p)
     packed_offset = (i, p) -> packed_a_offset(kernel, i, p)
     _pack_panel!(packed, MR, kc, m, transform, load, packed_offset)
@@ -145,6 +149,10 @@ function pack_b!(packed::Vector{T}, source::QSTile, kernel::KernelDescriptor{MR,
                                  "need at least packed_b_length(kernel, kc=$kc) = $needed"))
 
     kc == 0 && return packed
+
+    # Fable review (Phase 2b) follow-up: validate reachable storage bounds
+    # before entering the unchecked @inbounds load loop (spec section 6).
+    checked_tile_storage_bounds(source)
 
     # B[p,j] lives at tile row p (the K axis), tile column j (the N axis):
     # source.rows is the K interval, source.cols is the N interval.

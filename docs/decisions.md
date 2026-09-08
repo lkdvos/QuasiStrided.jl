@@ -123,3 +123,67 @@ Two reconciliations, both anticipated by each worker's own task instructions
    unexported (internal to the scalar worker's own tests).
 
 `Pkg.test()` after both reconciliations: 12318/12318 passing, 25.4s.
+
+## Phase 2b Fable review: triage and disposition
+
+Fable High review completed (`fable_review_used: true`), 2026-09-08. Full
+findings kept in `STATUS.md`'s history is unnecessary; disposition of each:
+
+1. **[blocking, FIXED]** `pack_a!`/`pack_b!` never validated reachable
+   source-storage bounds before `@inbounds` reads. Added
+   `axis_offset_range` (per-axis min/max offset, `Int128`-checked) and
+   `checked_tile_storage_bounds` (`src/tiles.jl`, exported), called once per
+   tile in `pack_a!`/`pack_b!` before their loops (`src/packing.jl`).
+2. **[blocking, FIXED]** `execute_tile!` on a real `DestinationTile`
+   (`QSTile`) validated shape (`m<=MR`,`n<=NR`) but never storage bounds
+   before `scale_tile!`/`store_tile!`'s `@inbounds` writes. Added the same
+   `checked_tile_storage_bounds` call in `execute_tile!` (the `QSTile`
+   overload in `src/kernel.jl`), before both the short-circuit and the full
+   accumulate/store path (the review's reproducer used a short-circuit call,
+   so the check had to precede that branch too, not just the main path).
+   `scale_tile!`/`store_tile!` themselves remain intentionally unchecked hot
+   primitives (spec section 9's "do not run an exhaustive... search for
+   every microtile" — the check belongs once, at `execute_tile!`, exactly as
+   `tile_offset`/`checked_tile_offset` already split unchecked/checked).
+3. **[should-fix, FIXED]** Neither `execute_tile!` overload validated
+   `packed_a`/`packed_b` length against `packed_a_length`/`packed_b_length(kernel,kc)`
+   before `accumulate`'s `@inbounds` reads. Added `DimensionMismatch` checks
+   in both overloads in `src/kernel.jl`, positioned after the short-circuit
+   (kc=0/alpha=0 legitimately doesn't need the buffers, so an undersized
+   buffer that is never read must not be rejected — a case added as a test).
+4. **[should-fix, FIXED]** `QSTile`/`DestinationTile` execution path had no
+   dedicated tests (all of `test_kernel.jl`'s coverage was against
+   `ScalarDestination`). Extended `test/test_phase2_integration.jl` with a
+   `QSTile execute_tile!: coverage parity` testset covering alpha=0/beta=0,
+   alpha=0/beta=1, beta=0-with-NaN-old-C, empty destination, extent errors,
+   canaries, Float32, and mixed affine/scattered addressing — plus a
+   regression testset for findings 1-3's exact reproducers and direct unit
+   tests of `axis_offset_range`/`checked_tile_storage_bounds`.
+5. **[should-fix, DEFERRED]** `pack_a!`/`pack_b!` allocate ~80 B/call in
+   steady state even with concrete, function-local types (confirmed; not a
+   measurement artifact — checked with `KernelDescriptor` directly, bypassing
+   the `ScalarKernel` forwarding method, same result). Root cause not
+   isolated in the time available: `checked_tile_storage_bounds`, closure
+   construction, and `_check_packed_eltype` each measured 0 B in isolation,
+   but the full `pack_a!` body still allocates. Not a correctness issue and
+   explicitly lower priority than findings 1-3 per the review itself ("measure
+   before Phase 3 SIMD reuses these wrappers"). Deferred to whoever next
+   touches `pack_a!`/`pack_b!` (packing follow-up or the Phase 3 SIMD
+   implementer, who needs zero-allocation packing regardless).
+6. **[note, ACCEPTED]** `accumulate` is a `Base.accumulate` method, not a
+   fresh binding — kept as documented in `src/kernel.jl` (avoids an
+   `export`/`Base` name collision under `using QuasiStrided`); no better
+   option without renaming the frozen public API.
+7. **[note, ACCEPTED]** `AffineAxis.stride*t` is a single multiplication, not
+   repeated addition; sound in practice because every `AffineAxis` the
+   production chain builds comes from a `BlockDescriptor` whose excursion is
+   already bounded by `AxisGroup`'s constructor-time check. Documented as a
+   deviation, not fixed (would need `AffineAxis` to carry provenance to
+   distinguish "built from a checked descriptor" from "hand-built").
+8. **[note, ACCEPTED]** No `code_llvm`/`code_native` inspection proving the
+   `beta==0` branch has no destination load; relying on textual inspection
+   (documented in `test_kernel.jl`/`test_phase2_integration.jl` comments).
+   Deferred to Phase 3, where the SIMD kernel makes generated-code inspection
+   unavoidable anyway.
+
+`Pkg.test()` after Phase 2b fixes: 12346/12346 passing, 28.7s.

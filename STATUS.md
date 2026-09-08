@@ -44,20 +44,28 @@ registered, or pushed, per handoff §2/§8).
       kernel/packing coupling — see docs/decisions.md "Phase 2 integration
       notes"), plus a new `test/test_phase2_integration.jl` end-to-end
       fixture. `Pkg.test()`: 12318/12318, 25.4s.
-- [ ] Phase 2b (Fable review): not started. `fable_review_used: false`.
+- [x] Phase 2b (Fable review): complete 2026-09-08. `fable_review_used: true`
+      (spent; do not relaunch Fable per handoff §5/§6). Found 2 blocking
+      (missing storage-bounds checks before `@inbounds` hot paths in
+      `pack_a!`/`pack_b!` and `execute_tile!`) + 1 should-fix (unchecked
+      packed-buffer length vs kc) + coverage gap + a deferred allocation
+      finding + 3 accepted notes. All blocking/should-fix items fixed and
+      regression-tested except the allocation finding (deferred, documented,
+      not correctness-affecting). Full disposition in docs/decisions.md
+      "Phase 2b Fable review: triage and disposition". `Pkg.test()`:
+      12346/12346, 28.7s.
 - [ ] Phase 3 (SIMD + serial driver): not started.
 - [ ] Phase 4 (review, measurement, handoff): not started.
 
 ## Active owners
 
-None currently active; about to launch the Phase 2b Fable review.
+None currently active; about to launch Phase 3.
 
 ## Next task
 
-Launch the single Fable High review (fable_review_used will become true) per
-handoff §6 Phase 2b: give it both specs, docs/decisions.md, the integrated
-source paths (src/axis_group.jl, src/kernel_descriptor.jl, src/tiles.jl,
-src/packing.jl, src/kernel.jl), test results, and the
-test/test_phase2_integration.jl fixture. Triage findings; Sonnet owners (or
-main process for small fixes) implement, main process verifies, before
-starting Phase 3 (SIMD + serial driver).
+Launch Phase 3: SIMD implementer (Sonnet High, owns `src/kernels/simd.jl`)
+and driver implementer (Sonnet Medium, owns `src/driver.jl`,
+`test/test_driver.jl`), in parallel, against
+`Julia-Microkernel-Tile-Interface-Design.md` and the frozen `contract!`
+signature in `docs/decisions.md`. Neither may change the packed format or
+accumulator-to-output convention independently.

@@ -312,6 +312,19 @@ function execute_tile!(kernel::ScalarKernel{MR,NR,T}, destination::ScalarDestina
         return destination
     end
 
+    # Fable review (Phase 2b) follow-up: reject undersized packed buffers
+    # before the unchecked @inbounds reads in `accumulate` (spec section 7).
+    # (This method's `destination` is the scalar worker's own test-only
+    # `ScalarDestination`, so no storage-bounds check is added here — see
+    # `checked_tile_storage_bounds` on the `QSTile` overload below, which is
+    # the path Phase 3 uses.)
+    length(packed_a) >= packed_a_length(kernel, kc) ||
+        throw(DimensionMismatch("execute_tile!: packed_a has length $(length(packed_a)), " *
+                                 "need at least packed_a_length(kernel, kc=$kc) = $(packed_a_length(kernel, kc))"))
+    length(packed_b) >= packed_b_length(kernel, kc) ||
+        throw(DimensionMismatch("execute_tile!: packed_b has length $(length(packed_b)), " *
+                                 "need at least packed_b_length(kernel, kc=$kc) = $(packed_b_length(kernel, kc))"))
+
     acc = zero_accumulator(kernel)
     acc = accumulate(kernel, acc, packed_a, packed_b, kc)
     store_tile!(destination, acc, alphaT, betaT, kernel)
@@ -397,10 +410,25 @@ function execute_tile!(kernel::ScalarKernel{MR,NR,T}, destination::QSTile,
 
     (m == 0 || n == 0) && return destination
 
+    # Fable review (Phase 2b) follow-up: validate reachable destination
+    # storage bounds, and that the supplied packed buffers are at least as
+    # large as this kc demands, before entering any unchecked @inbounds path
+    # below (spec section 3: "in bounds ... before entering unchecked hot
+    # paths"; section 7: "reject incompatible buffers ... before kernel
+    # execution").
+    checked_tile_storage_bounds(destination)
+
     if kc == 0 || iszero(alphaT)
         scale_tile!(destination, betaT)
         return destination
     end
+
+    length(packed_a) >= packed_a_length(kernel, kc) ||
+        throw(DimensionMismatch("execute_tile!: packed_a has length $(length(packed_a)), " *
+                                 "need at least packed_a_length(kernel, kc=$kc) = $(packed_a_length(kernel, kc))"))
+    length(packed_b) >= packed_b_length(kernel, kc) ||
+        throw(DimensionMismatch("execute_tile!: packed_b has length $(length(packed_b)), " *
+                                 "need at least packed_b_length(kernel, kc=$kc) = $(packed_b_length(kernel, kc))"))
 
     acc = zero_accumulator(kernel)
     acc = accumulate(kernel, acc, packed_a, packed_b, kc)

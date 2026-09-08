@@ -15,7 +15,7 @@ export KernelDescriptor, mr, nr, scalartype, packed_a_offset, packed_b_offset,
 
 include("tiles.jl")
 export AffineAxis, ScatterAxis, SourceTile, DestinationTile,
-    axis_from_descriptor, nrows, ncols
+    axis_from_descriptor, nrows, ncols, axis_offset_range, checked_tile_storage_bounds
 
 include("packing.jl")
 export pack_a!, pack_b!

@@ -259,3 +259,76 @@ function checked_tile_store!(tile::QSTile, i::Int, j::Int, v)
     tile.storage[addr+1] = v
     return tile
 end
+
+# ----------------------------------------------------------------------------
+# Integration (main process, Phase 2b Fable review follow-up): validate that
+# every address a tile can name is in bounds for its storage, BEFORE any
+# unchecked hot-path loop runs.
+#
+# `axis_offset(ax, t)` and `tile_offset(tile, i, j)` are deliberately
+# unchecked, matching `tile_store!`/`scale_tile!`/`accumulate`'s own
+# `@inbounds` hot paths (spec: "do not perform a regularity/bounds test per
+# scalar element"). The Fable review (Phase 2b) found that nothing upstream
+# of those hot paths actually validated the tile's *storage bounds* before
+# entering them — `pack_a!`/`pack_b!` and `execute_tile!` checked shape
+# (m/n/kc vs MR/NR) but not whether `base + row_offset(i) + col_offset(j)`
+# stays within `0:length(storage)-1` for every valid (i,j). This is the
+# missing "reachable storage bounds" check spec section 6 requires before
+# packing, and the missing "in bounds before entering unchecked hot paths"
+# check spec section 3 requires before execution. `axis_offset_range` and
+# `checked_tile_storage_bounds` below are the one-time-per-tile checks that
+# close that gap; call sites are in packing.jl and kernel.jl.
+# ----------------------------------------------------------------------------
+
+"""
+    axis_offset_range(ax::Union{AffineAxis,ScatterAxis}) -> (lo::Int, hi::Int)
+
+The minimum and maximum zero-based offset `ax` can produce over its valid
+domain `0:axis_length(ax)-1`. For an empty axis (`axis_length(ax) == 0`) the
+result is `(0, -1)` (an empty range, `lo > hi`) since no offset is ever
+produced. Uses `Int128` internally so the range computation itself cannot
+overflow even when the endpoints are representable as `Int`.
+"""
+function axis_offset_range(ax::AffineAxis)
+    ax.count == 0 && return (0, -1)
+    lo128 = Int128(ax.base)
+    hi128 = Int128(ax.base) + Int128(ax.count - 1) * Int128(ax.stride)
+    lo128, hi128 = minmax(lo128, hi128)
+    (typemin(Int) <= lo128 && hi128 <= typemax(Int)) ||
+        throw(OverflowError("axis_offset_range: affine axis range not representable as Int"))
+    return (Int(lo128), Int(hi128))
+end
+
+function axis_offset_range(ax::ScatterAxis)
+    ax.count == 0 && return (0, -1)
+    prefix = view(ax.offsets, 1:ax.count)
+    return (Int(minimum(prefix)), Int(maximum(prefix)))
+end
+
+"""
+    checked_tile_storage_bounds(base::Int, rows::Axis, cols::Axis, storage_length::Int)
+
+Validate that every address `base + row_offset(i) + col_offset(j)` for
+`0 <= i < axis_length(rows)`, `0 <= j < axis_length(cols)` lies in
+`0:storage_length-1`. An empty tile (either axis has length 0) always
+passes: no address is ever produced. Throws `BoundsError` otherwise. Uses
+`Int128` for the summation so the check itself never overflows.
+"""
+function checked_tile_storage_bounds(base::Int, rows::Axis, cols::Axis, storage_length::Int)
+    (axis_length(rows) == 0 || axis_length(cols) == 0) && return nothing
+    (rlo, rhi) = axis_offset_range(rows)
+    (clo, chi) = axis_offset_range(cols)
+    lo128 = Int128(base) + Int128(rlo) + Int128(clo)
+    hi128 = Int128(base) + Int128(rhi) + Int128(chi)
+    (lo128 >= 0 && hi128 <= Int128(storage_length - 1)) ||
+        throw(BoundsError("tile addresses [$lo128, $hi128] exceed storage bounds [0, $(storage_length - 1)]", base))
+    return nothing
+end
+
+"""
+    checked_tile_storage_bounds(tile::QSTile)
+
+Convenience form: validate `tile` against `length(tile.storage)`.
+"""
+checked_tile_storage_bounds(tile::QSTile) =
+    checked_tile_storage_bounds(tile.base, tile.rows, tile.cols, length(tile.storage))
