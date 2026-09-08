@@ -83,3 +83,43 @@ the main process; this table is updated first.
 independent oracle/property tests, which use `Random.MersenneTwister` with a
 fixed seed). Added by the main process post-integration: `Random` in
 `[extras]` and `[targets] test`. No other cross-worker conflicts.
+
+## Phase 2 integration notes
+
+Two reconciliations, both anticipated by each worker's own task instructions
+(neither worker was told to block on the other):
+
+1. **Destination-tile type drift.** The scalar implementer (owning
+   `src/kernel.jl`) was explicitly told not to block on `src/tiles.jl`
+   landing, and wrote its own `ScalarDestination` (closures for row/col
+   addressing) rather than depending on the packing implementer's real
+   `QSTile`/`DestinationTile`. Both express the same addressing contract
+   (`base + row_offset(i) + col_offset(j)`, affine-or-scattered per axis).
+   Fix: added `scale_tile!`/`store_tile!`/`execute_tile!` methods dispatching
+   on `QSTile` directly (mirroring the `ScalarDestination`-typed methods
+   line-for-line, substituting `nrows`/`ncols`/`tile_load`/`tile_store!` for
+   `destination.m`/`.n`/closures) to `src/kernel.jl`. **`DestinationTile` +
+   these new methods is the path Phase 3's driver should use**;
+   `ScalarDestination` remains only as the scalar worker's own test
+   scaffolding and is not exported.
+2. **Kernel/packing coupling.** `pack_a!`/`pack_b!` (packing implementer)
+   dispatch on a bare `KernelDescriptor`; `ScalarKernel` (scalar implementer)
+   wraps one rather than being one, so passing a `ScalarKernel` straight
+   through to `pack_a!`/`pack_b!` was a `MethodError`. Fix: two one-line
+   forwarding methods in `src/kernel.jl`,
+   `pack_a!(packed, source, k::ScalarKernel, transform) = pack_a!(packed, source, k.descriptor, transform)`
+   (and same for `pack_b!`). Any future concrete kernel wrapping a
+   `KernelDescriptor` as a `.descriptor` field should add the same two
+   one-liners.
+3. Added `test/test_phase2_integration.jl` (main-process-owned): drives the
+   full `AxisGroup -> block_descriptors! -> axis_from_descriptor -> QSTile ->
+   pack_a!/pack_b! -> ScalarKernel execute_tile!` path by hand on the shared
+   worked A[a,k,b]/B[k,n]/C[a,n,b] fixture, including 3 K-panels (lengths
+   2,2,1) with beta applied once and nontrivial alpha/beta — this is also the
+   fixture supplied to the Phase 2b Fable review.
+4. New exports added to `src/QuasiStrided.jl`: `axis_from_descriptor`,
+   `nrows`, `ncols` (from `tiles.jl`), `ScalarKernel`, `scale_tile!` (from
+   `kernel.jl`). `ScalarDestination`, `affine_axis`, `scatter_axis` remain
+   unexported (internal to the scalar worker's own tests).
+
+`Pkg.test()` after both reconciliations: 12318/12318 passing, 25.4s.

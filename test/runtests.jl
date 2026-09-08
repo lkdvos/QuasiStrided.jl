@@ -1,4 +1,5 @@
 using Test
+using Random
 using QuasiStrided
 
 @testset "QuasiStrided.jl" begin
@@ -7,5 +8,6 @@ using QuasiStrided
     include("test_kernel_descriptor.jl")
     include("test_packing.jl")
     include("test_kernel.jl")
+    include("test_phase2_integration.jl")
     include("test_driver.jl")
 end

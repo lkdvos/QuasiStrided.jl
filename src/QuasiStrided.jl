@@ -14,13 +14,14 @@ export KernelDescriptor, mr, nr, scalartype, packed_a_offset, packed_b_offset,
     packed_a_length, packed_b_length
 
 include("tiles.jl")
-export AffineAxis, ScatterAxis, SourceTile, DestinationTile
+export AffineAxis, ScatterAxis, SourceTile, DestinationTile,
+    axis_from_descriptor, nrows, ncols
 
 include("packing.jl")
 export pack_a!, pack_b!
 
 include("kernel.jl")
-export zero_accumulator, accumulate, store_tile!, execute_tile!
+export ScalarKernel, zero_accumulator, accumulate, scale_tile!, store_tile!, execute_tile!
 
 # --- Phase 3: SIMD kernel + serial driver ---
 include("kernels/simd.jl")

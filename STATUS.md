@@ -32,21 +32,32 @@ registered, or pushed, per handoff §2/§8).
       `Project.toml`'s test targets (needed by the property tests).
       `benchmark/bench_axis_group.jl` exists and reports zero steady-state
       allocations for `fill_offsets!`/`block_descriptors!` on ccqlin038.
-- [ ] Phase 2 (tiles/packing/scalar): not started.
+- [x] Phase 2 contract frozen: `src/kernel_descriptor.jl` (`KernelDescriptor{MR,NR,T}`,
+      `packed_a_offset`/`packed_b_offset` = `i+MR*p`/`j+NR*p`,
+      `packed_a_length`/`packed_b_length`), main-process-owned, tested in
+      `test/test_kernel_descriptor.jl`.
+- [x] Phase 2 (tiles/packing/scalar): complete and gated 2026-09-08.
+      `src/tiles.jl` (AffineAxis/ScatterAxis/QSTile=SourceTile=DestinationTile),
+      `src/packing.jl` (pack_a!/pack_b!), `src/kernel.jl` (ScalarKernel,
+      zero_accumulator/accumulate/store_tile!/execute_tile!). Two integration
+      reconciliations by main process (destination-tile type drift,
+      kernel/packing coupling — see docs/decisions.md "Phase 2 integration
+      notes"), plus a new `test/test_phase2_integration.jl` end-to-end
+      fixture. `Pkg.test()`: 12318/12318, 25.4s.
 - [ ] Phase 2b (Fable review): not started. `fable_review_used: false`.
 - [ ] Phase 3 (SIMD + serial driver): not started.
 - [ ] Phase 4 (review, measurement, handoff): not started.
 
 ## Active owners
 
-None currently active; about to launch Phase 2.
+None currently active; about to launch the Phase 2b Fable review.
 
 ## Next task
 
-Launch Phase 2: packing implementer (Sonnet Medium, owns `src/tiles.jl`,
-`src/packing.jl`, `test/test_packing.jl`) and scalar implementer (Sonnet
-Medium, owns `src/kernel.jl`, `test/test_kernel.jl`), in parallel, against
-`Julia-Microkernel-Tile-Interface-Design.md` sections 4-9 and the frozen
-packed-offset formulas (A: `i + MR*p`, B: `j + NR*p`). Main process to freeze
-exact packed offset formulas / kernel descriptor shape in `docs/decisions.md`
-before launching, per handoff §6 Phase 2 gate instructions.
+Launch the single Fable High review (fable_review_used will become true) per
+handoff §6 Phase 2b: give it both specs, docs/decisions.md, the integrated
+source paths (src/axis_group.jl, src/kernel_descriptor.jl, src/tiles.jl,
+src/packing.jl, src/kernel.jl), test results, and the
+test/test_phase2_integration.jl fixture. Triage findings; Sonnet owners (or
+main process for small fixes) implement, main process verifies, before
+starting Phase 3 (SIMD + serial driver).
