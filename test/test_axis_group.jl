@@ -1,14 +1,6 @@
-# OWNER: see docs/decisions.md for phase/owner assignment.
-#
-# Independent verification of AxisGroup indexing (Julia-Tensor-Indexing-Agent-Spec.md
-# section 3, "Mathematical semantics", and section 11, "Required verification").
-#
-# IMPORTANT: this file is deliberately written WITHOUT reading
-# src/axis_group.jl. All expected values are derived from the spec's math
-# (section 3), the fixed fixtures (section 8), and an independent oracle
-# built here from Julia's `CartesianIndices`. The oracle never calls
-# `offsets`, `fill_offsets!`, `block_descriptors!`, or any other AxisGroup
-# method under test -- it is a from-scratch re-derivation of the same math.
+# Independent verification of AxisGroup indexing, written without reading
+# src/axis_group.jl: an oracle built from Julia's `CartesianIndices`, never
+# calling offsets/fill_offsets!/block_descriptors! themselves.
 
 using Test
 using Random

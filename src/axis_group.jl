@@ -1,41 +1,11 @@
-# OWNER: indexing implementer (Phase 1). See docs/decisions.md and
-# Julia-Tensor-Indexing-Agent-Spec.md for the full contract.
-#
-# Implements: AxisGroup, axis_length, offsets, fill_offsets!, BlockDescriptor,
-# describe_block, block_descriptors!, normalize_group.
-#
-# Conventions (see the spec for the full rationale):
-#   - Logical coordinates and element offsets are zero-based.
-#   - The first (fastest) dimension of an AxisGroup varies fastest, matching
-#     column-major / Fortran-order tensor storage.
-#   - Offsets are relative: an AxisGroup knows nothing about a tensor's base
-#     pointer, storage bounds, element type, or conjugation.
-
-# ----------------------------------------------------------------------------
-# AxisGroup
-# ----------------------------------------------------------------------------
+# Zero-based coordinates, fastest dimension first (column-major); an AxisGroup
+# is a pure layout descriptor with no base offset, storage, dtype, or conjugation.
 
 """
     AxisGroup{D,P}
 
-A shared logical coordinate enumeration over `D` dimensions with lengths
-`lengths::NTuple{D,Int}`, together with `P` physical offset maps
-`strides::NTuple{P,NTuple{D,Int}}` (one map per participating tensor operand).
-
-Coordinates are zero-based and the first dimension varies fastest: for
-`0 <= q < axis_length(g)`,
-
-    x[d] = (q ÷ prod(lengths[1:d-1])) % lengths[d]
-    offset[p](q) = sum(x[d] * strides[p][d] for d in 1:D)
-
-`AxisGroup` is a pure layout descriptor: it carries no base offset, no
-storage, no element type, and no conjugation information. Construction
-validates that every quantity used by [`offsets`](@ref) and
-[`fill_offsets!`](@ref) is representable as `Int` without overflow; see the
-package documentation / spec for the exact conservative bound used.
-
-Use [`axis_length`](@ref) to query the cardinality; `AxisGroup` intentionally
-does not implement the `AbstractArray` interface.
+Shared logical coordinate enumeration over `D` dims (`lengths`) with `P`
+physical offset maps (`strides`, one `NTuple{D,Int}` per operand).
 """
 struct AxisGroup{D,P}
     lengths::NTuple{D,Int}
@@ -55,24 +25,16 @@ end
 """
     AxisGroup(lengths::NTuple{D,Int}, strides::NTuple{P,NTuple{D,Int}}) where {D,P}
 
-Construct a validated `AxisGroup`. `D` may be zero (a rank-zero group, whose
-only valid coordinate is `q = 0`); `P` must be at least one. Lengths must be
-nonnegative; strides may be any sign, including zero. Dimensions are kept in
-the order supplied: construction never reorders, removes, or folds axes (see
-[`normalize_group`](@ref) for that, as an explicit, separate step).
-
-Throws `ArgumentError` for invalid lengths or `P < 1`, and `OverflowError` if
-the cardinality or any map's maximum offset excursion is not representable as
-`Int` (see the overflow policy in the spec, section 4).
+Construct a validated `AxisGroup` (axes kept in the order supplied; see
+[`normalize_group`](@ref) to fold/drop them). Throws `ArgumentError` for
+invalid lengths or `P < 1`, `OverflowError` if the cardinality or any map's
+offset excursion doesn't fit `Int`.
 """
 AxisGroup(lengths::NTuple{D,Int}, strides::NTuple{P,NTuple{D,Int}}) where {D,P} =
     AxisGroup{D,P}(lengths, strides)
 
-# Checked cardinality: Q = prod(lengths), with an empty domain (any length
-# zero) always yielding Q = 0, even if the product of the nonzero lengths
-# would itself overflow. Uses Int128 accumulation to detect overflow without
-# ever wrapping; this is validation-time-only arithmetic (construction may
-# allocate/widen; hot execution below never does).
+# Q = prod(lengths); empty domain (any zero length) always gives Q = 0.
+# Int128 accumulation detects overflow without wrapping (validation-time only).
 function _checked_axis_length(lengths::NTuple{D,Int}) where {D}
     any(==(0), lengths) && return 0
     q = one(Int128)
@@ -84,15 +46,12 @@ function _checked_axis_length(lengths::NTuple{D,Int}) where {D}
     return Int(q)
 end
 
-# Full construction-time validation: cardinality, and (for a nonempty domain)
-# the conservative per-map offset-excursion bound from the spec:
-#     sum((L[d]-1) * abs(S[p][d]) for d) <= typemax(Int)
-# evaluated in Int128 so that neither the multiplication, the sum, nor
-# abs(typemin(Int)) can silently wrap.
+# Validates cardinality and, per map, sum((L[d]-1)*abs(S[d])) <= typemax(Int),
+# all in Int128 so nothing (incl. abs(typemin(Int))) can silently wrap.
 function _validate_axis_group_bounds(lengths::NTuple{D,Int},
                                       strides::NTuple{P,NTuple{D,Int}}) where {D,P}
     Q = _checked_axis_length(lengths)
-    Q == 0 && return nothing  # empty domain: no offsets exist, nothing to validate.
+    Q == 0 && return nothing
     for (p, S) in enumerate(strides)
         acc = zero(Int128)
         for d in 1:D
@@ -110,10 +69,7 @@ end
 """
     axis_length(g::AxisGroup)::Int
 
-The cardinality `Q = prod(lengths)` of the group's coordinate enumeration
-(with the empty product, `D == 0`, equal to one). Already validated at
-construction to be representable as `Int`, so this uses plain `Int`
-arithmetic.
+Cardinality `Q = prod(lengths)` (already validated to fit `Int`).
 """
 axis_length(g::AxisGroup) = _unchecked_axis_length(g.lengths)
 
@@ -125,19 +81,12 @@ axis_length(g::AxisGroup) = _unchecked_axis_length(g.lengths)
     return q
 end
 
-# Stack-allocated, type-stable "replace element i of an NTuple{N,Int}".
-# Avoids depending on the (undocumented) Base.setindex for tuples.
+# Type-stable, stack-allocated "replace element i of an NTuple{N,Int}".
 @inline _tupleset(t::NTuple{N,Int}, i::Int, v::Int) where {N} =
     ntuple(j -> ifelse(j == i, v, t[j]), Val(N))
 
-# The following three helpers exist purely to dodge a Julia closure-boxing
-# pitfall: a `ntuple(p -> offs[p] + ..., Val(P))` lambda written *inline*
-# inside `offsets`/`fill_offsets!` captures `offs` (and `d`), which are
-# reassigned in the enclosing loop — that reassignment forces the compiler to
-# box the captured variable, which allocates on every call. Lifting the
-# update into a dedicated function makes `offs`/`g`/`d`/`x` plain, never-
-# reassigned arguments in a fresh scope, so no boxing occurs and these stay
-# fully stack-allocated. Verified with `@allocated` in the benchmark script.
+# Lifted out of offsets/fill_offsets! to avoid closure-boxing an inline lambda
+# over loop-reassigned variables, which would allocate every call.
 @inline function _add_offsets(offs::NTuple{P,Int}, g::AxisGroup{D,P}, d::Int, x::Int) where {D,P}
     return ntuple(p -> offs[p] + x * g.strides[p][d], Val(P))
 end
@@ -146,18 +95,11 @@ end
     return ntuple(p -> offs[p] - (Ld - 1) * g.strides[p][d], Val(P))
 end
 
-# ----------------------------------------------------------------------------
-# 5.1 Reference random access
-# ----------------------------------------------------------------------------
-
 """
     offsets(g::AxisGroup{D,P}, q::Int)::NTuple{P,Int}
 
-Decode a single logical coordinate `0 <= q < axis_length(g)` into the `P`
-relative element offsets, one per map. Implemented as a direct mixed-radix
-decode (`O(D)` divisions); this is the reference definition that
-[`fill_offsets!`](@ref) must reproduce for every requested `q`, not a
-fast path. Throws `BoundsError` if `q` is out of `[0, axis_length(g))`.
+Decode logical coordinate `0 <= q < axis_length(g)` into the `P` relative
+element offsets via mixed-radix decode. Throws `BoundsError` if out of range.
 """
 function offsets(g::AxisGroup{D,P}, q::Int) where {D,P}
     Q = axis_length(g)
@@ -175,29 +117,14 @@ function offsets(g::AxisGroup{D,P}, q::Int) where {D,P}
     return offs
 end
 
-# ----------------------------------------------------------------------------
-# 5.2 Interval generation
-# ----------------------------------------------------------------------------
-
 """
     fill_offsets!(buffers::NTuple{P,Vector{Int}}, g::AxisGroup{D,P}, first::Int, count::Int)
 
-Fill `buffers[p][t+1] = offsets(g, first + t)[p]` for every map `p` and
-`0 <= t < count`, using a single mixed-radix decode of `first` followed by
-reset-before-carry increments (spec section 6) — never a per-element
-`divrem` and never a naive `L[d] * stride` reset step. Returns `buffers`.
-
-Requires `count >= 0`, `0 <= first <= axis_length(g)`, and
-`count <= axis_length(g) - first` (checked without ever forming a possibly
-overflowing `first + count`). Every buffer must have `length(buffer) >=
-count`, and the `P` buffers must be pairwise distinct `Vector{Int}` objects.
-All arguments and buffers are validated before any mutation; entries at
-positions `count+1:end` are left untouched. An empty interval (`count == 0`)
-performs no writes and no coordinate decoding, but is still fully validated.
-
-Throws `ArgumentError` for a negative `count` or repeated buffer objects,
-`BoundsError` for an out-of-domain interval, and `DimensionMismatch` for an
-insufficient buffer length.
+Fill `buffers[p][t+1] = offsets(g, first + t)[p]` for `0 <= t < count`, via
+one mixed-radix decode of `first` plus reset-before-carry increments.
+Requires `count >= 0`, `0 <= first <= axis_length(g)`,
+`count <= axis_length(g) - first`, buffers long enough and pairwise distinct.
+Throws `ArgumentError`/`BoundsError`/`DimensionMismatch` accordingly; returns `buffers`.
 """
 function fill_offsets!(buffers::NTuple{P,Vector{Int}}, g::AxisGroup{D,P},
                         first::Int, count::Int) where {D,P}
@@ -220,8 +147,7 @@ function fill_offsets!(buffers::NTuple{P,Vector{Int}}, g::AxisGroup{D,P},
 
     count == 0 && return buffers
 
-    # Decode `first` once into coordinates and the corresponding initial
-    # offsets for every map (step 3).
+    # Decode `first` once into coordinates and initial per-map offsets.
     r = first
     x = ntuple(_ -> 0, Val(D))
     offs = ntuple(_ -> 0, Val(P))
@@ -243,7 +169,7 @@ function fill_offsets!(buffers::NTuple{P,Vector{Int}}, g::AxisGroup{D,P},
         t += 1
         t == count && break
 
-        # Advance coordinates fastest-first, reset-before-carry (step 6).
+        # Advance coordinates fastest-first, reset-before-carry.
         d = 1
         while d <= D
             L = g.lengths[d]
@@ -263,26 +189,15 @@ function fill_offsets!(buffers::NTuple{P,Vector{Int}}, g::AxisGroup{D,P},
     return buffers
 end
 
-# ----------------------------------------------------------------------------
-# 5.3 Block descriptor
-# ----------------------------------------------------------------------------
-
 """
     BlockDescriptor
 
-Classification of a materialized offset interval for one map:
-
-- `base`: the offset of the first element (or `0` for an empty interval).
-- `stride`: the constant per-step stride when `regular == true` and
-  `count >= 2`; otherwise not meaningful (`0`).
-- `count`: the number of valid elements the descriptor describes.
-- `regular`: whether `buffer[t+1] == base + t*stride` holds exactly for all
-  `0 <= t < count`.
-
-When `regular == false`, `base` and `stride` do not define addressing;
-consumers must read the underlying buffer directly. A `BlockDescriptor`
-becomes stale as soon as its source buffer is refilled with a different
-interval — it owns no offset storage of its own.
+Classification of a materialized offset interval for one map: `base` (first
+element's offset, or 0 if empty), `stride` (constant per-step stride when
+`regular`, else meaningless), `count`, and `regular` (whether
+`buffer[t+1] == base + t*stride` for all `0 <= t < count`). If `!regular`,
+consumers must read the underlying buffer directly; stale once that buffer
+is refilled.
 """
 struct BlockDescriptor
     base::Int
@@ -294,20 +209,9 @@ end
 """
     describe_block(buffer::Vector{Int}, count::Int)::BlockDescriptor
 
-Classify `buffer[1:count]` (read-only; `buffer` is never mutated) as empty,
-singleton, affine, or irregular:
-
-| Interval             | base       | stride                | regular |
-|----------------------|------------|------------------------|---------|
-| Empty (`count == 0`) | `0`        | `0`                    | `true`  |
-| Singleton            | `buffer[1]`| `0`                    | `true`  |
-| Affine, `count >= 2` | `buffer[1]`| `buffer[2]-buffer[1]`  | `true`  |
-| Irregular            | `buffer[1]`| `0`                    | `false` |
-
-All adjacent-difference comparisons use overflow-checked subtraction; a
-difference that is not representable as `Int` is classified irregular rather
-than compared against a wrapped value. Throws `ArgumentError` for a negative
-`count` and `DimensionMismatch` if `count` exceeds `length(buffer)`.
+Classify `buffer[1:count]` (read-only) as empty/singleton/affine/irregular
+(overflow-checked adjacent differences; a non-representable diff is
+irregular). Throws `ArgumentError`/`DimensionMismatch` for bad `count`.
 """
 function describe_block(buffer::Vector{Int}, count::Int)
     count >= 0 || throw(ArgumentError("count must be nonnegative, got $count"))
@@ -330,18 +234,11 @@ function describe_block(buffer::Vector{Int}, count::Int)
     return BlockDescriptor(base, stride, count, true)
 end
 
-# ----------------------------------------------------------------------------
-# 5.4 Combined convenience operation
-# ----------------------------------------------------------------------------
-
 """
     block_descriptors!(buffers::NTuple{P,Vector{Int}}, g::AxisGroup{D,P}, first::Int, count::Int)
 
-Fill `buffers` via [`fill_offsets!`](@ref) and classify each map's resulting
-buffer contents via [`describe_block`](@ref), returning
-`NTuple{P,BlockDescriptor}`. Shares `fill_offsets!`'s validation and mutation
-contract; the returned descriptors all describe the same interval, but
-regularity may differ from map to map.
+Fill `buffers` via [`fill_offsets!`](@ref) and classify each via
+[`describe_block`](@ref); returns `NTuple{P,BlockDescriptor}`.
 """
 function block_descriptors!(buffers::NTuple{P,Vector{Int}}, g::AxisGroup{D,P},
                              first::Int, count::Int) where {D,P}
@@ -349,36 +246,13 @@ function block_descriptors!(buffers::NTuple{P,Vector{Int}}, g::AxisGroup{D,P},
     return ntuple(p -> describe_block(buffers[p], count), Val(P))
 end
 
-# ----------------------------------------------------------------------------
-# 7. Explicit normalization
-# ----------------------------------------------------------------------------
-
 """
     normalize_group(g::AxisGroup)::AxisGroup
 
 Return a (possibly lower-rank) `AxisGroup` with the same `axis_length` and
-the same complete flattened offset sequence for every map, obtained by:
-
-1. Returning `g` unchanged if its domain is empty (some length is zero).
-2. Dropping singleton dimensions (`length == 1`), whose strides are
-   irrelevant.
-3. Scanning the remaining dimensions fastest to slowest and folding adjacent
-   dimensions whenever, for *every* map `p` simultaneously,
-   `next_stride[p] == current_length * current_stride[p]` holds exactly
-   (checked in a wider integer type so a non-representable product is simply
-   treated as "does not fold", never as a wrapped false match).
-4. If every original dimension was singleton, returning a rank-zero group
-   with the same map count.
-
-Folding is refused unless it holds for every map — a group may be affine for
-one map and not another without being jointly foldable; that per-map
-classification is what [`describe_block`](@ref) is for, not this function.
-Axes are never reordered. The result is revalidated through the `AxisGroup`
-constructor.
-
-Intended for planning time (it may allocate); execute interval generation
-against whichever group — normalized or not — you have, since correctness
-must not depend on prior normalization.
+per-map offset sequence: drop singleton dims, then fold adjacent dims
+fastest-to-slowest wherever `next_stride[p] == current_length*current_stride[p]`
+holds for *every* map. Planning-time only (may allocate); never reorders axes.
 """
 function normalize_group(g::AxisGroup{D,P}) where {D,P}
     Q = axis_length(g)

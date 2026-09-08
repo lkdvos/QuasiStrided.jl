@@ -1,10 +1,5 @@
-# OWNER: main process. Phase 3 integration gate: confirms the driver
-# (test_driver.jl, Sonnet-medium worker) and the SIMD kernel
-# (test_simd_kernel.jl, Sonnet-high worker) — built concurrently, neither
-# aware of the other landing — actually compose: `plan_contract`/`execute!`
-# accept `SIMDKernel` as a drop-in swap for the default `ScalarKernel`,
-# producing numerically consistent results through the real driver (not just
-# at the single-tile level, which test_simd_kernel.jl already covers).
+# Integration gate: plan_contract/execute! accept SIMDKernel as a drop-in
+# swap for ScalarKernel, agreeing numerically through the real driver.
 
 using StridedViews: StridedView
 

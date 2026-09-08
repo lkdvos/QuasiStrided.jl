@@ -1,12 +1,6 @@
-# OWNER: packing implementer (Phase 2). See docs/decisions.md and
-# Julia-Microkernel-Tile-Interface-Design.md sections 4-6 and 12
-# ("Packing tests").
-#
-# Verifies: AffineAxis/ScatterAxis addressing, axis_from_descriptor,
-# SourceTile/DestinationTile (QSTile) addressing, and pack_a!/pack_b! against
-# direct tensor indexing, independently of the production tile-address
-# helpers where the spec asks for that (packed-value checks compute expected
-# values by hand / from a plain Array, not by calling tile_load again).
+# Verifies AffineAxis/ScatterAxis addressing, axis_from_descriptor,
+# SourceTile/DestinationTile (QSTile), and pack_a!/pack_b! against direct
+# tensor indexing (expected values computed by hand, not via tile_load).
 
 using Test
 using QuasiStrided

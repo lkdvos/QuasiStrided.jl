@@ -1,25 +1,13 @@
-# OWNER: see docs/decisions.md for phase/owner assignment.
-#
-# Strided/StridedViews integration (Julia-Tensor-Indexing-Agent-Spec.md
-# section 9), plus the test-only packing consumer and scalar contraction
-# consumer (section 10, and section 11 "Consumer integration").
-#
-# Like test_axis_group.jl, this file is written against the frozen spec and
-# signatures, without reading src/axis_group.jl's internals.
+# StridedViews integration, plus a test-only packing/contraction consumer,
+# written against the frozen spec without reading src/axis_group.jl's internals.
 
 using Test
 using StridedViews: StridedView, offset
 using QuasiStrided: AxisGroup, axis_length, offsets, fill_offsets!, BlockDescriptor,
     describe_block, block_descriptors!, normalize_group
 
-# =====================================================================
-# Test-only adapter: StridedView metadata -> AxisGroup
-# =====================================================================
-#
-# Per spec section 9: "The first version does not need a public label parser
-# or a public adapter API. A small internal/test adapter suffices to
-# establish compatibility." This is exactly that: local to this test file,
-# not exported, not a production API.
+# Test-only adapter: StridedView metadata -> AxisGroup (local to this file,
+# not a production API).
 #
 # Uses only documented StridedViews accessors: `size`, `strides` (both
 # generic AbstractArray/Base methods that StridedView supports), and the

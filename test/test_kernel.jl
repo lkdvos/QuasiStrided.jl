@@ -1,19 +1,9 @@
-# OWNER: scalar implementer (Phase 2). See docs/decisions.md and
-# Julia-Microkernel-Tile-Interface-Design.md sections 7-9, 12 ("Arithmetic
-# and store tests", scalar-only subset).
-#
 # Exercises src/kernel.jl: ScalarKernel, zero_accumulator, accumulate,
-# store_tile!, scale_tile!, execute_tile!, ScalarDestination.
+# store_tile!, scale_tile!, execute_tile! (against QSTile destinations).
 
 using Random
 
-# `ScalarKernel`, `ScalarDestination`, `affine_axis`, `scatter_axis` and
-# `scale_tile!` are not (yet) part of QuasiStrided's public export list (see
-# src/kernel.jl's header comment / this worker's final report: `ScalarKernel`
-# is a new public-facing name the main process may want to add to
-# `src/QuasiStrided.jl`'s export list). Import them explicitly here rather
-# than relying on `using QuasiStrided` re-exporting them.
-using QuasiStrided: ScalarKernel, ScalarDestination, affine_axis, scatter_axis, scale_tile!
+using QuasiStrided: ScalarKernel, scale_tile!, QSTile, AffineAxis, ScatterAxis
 
 @testset "kernel.jl (scalar reference)" begin
 
@@ -64,8 +54,7 @@ using QuasiStrided: ScalarKernel, ScalarDestination, affine_axis, scatter_axis, 
 
     # --- destination helpers for the tests below ---
 
-    # Build a ScalarDestination whose storage has `pad` canary cells before
-    # and after the addressed region, filled with a recognizable sentinel.
+    # Storage with `pad` canary cells before and after the addressed region.
     function canary_storage(len::Int; pad::Int=3, sentinel=-999.0)
         v = fill(sentinel, len + 2 * pad)
         return v, pad
@@ -92,14 +81,14 @@ using QuasiStrided: ScalarKernel, ScalarDestination, affine_axis, scatter_axis, 
 
         storage, pad = canary_storage(MR * NR; pad=4, sentinel=NaN)
         base = pad
-        rowaddr = affine_axis(0, 1)   # unit-stride rows, contiguous
-        coladdr = affine_axis(0, MR)  # column-major within the tile
-        dest = ScalarDestination(storage, base, rowaddr, coladdr, MR, NR)
+        rows = AffineAxis(0, 1, MR)   # unit-stride rows, contiguous
+        cols = AffineAxis(0, MR, NR)  # column-major within the tile
+        dest = QSTile(storage, base, rows, cols)
 
         execute_tile!(k, dest, packed_a, packed_b, kc, 1.0, 0.0)
 
         for i in 0:(MR - 1), j in 0:(NR - 1)
-            addr = base + rowaddr(i) + coladdr(j)
+            addr = base + i * 1 + j * MR
             @test storage[addr + 1] ≈ expected[i + 1, j + 1]
         end
         # canaries untouched
@@ -121,9 +110,9 @@ using QuasiStrided: ScalarKernel, ScalarDestination, affine_axis, scatter_axis, 
         # Case 1: unit rows, unit cols but interleaved via a nonunit column stride.
         len = 100
         storage = fill(NaN, len)
-        rowaddr = affine_axis(20, 1)     # contiguous rows starting at 20
-        coladdr = affine_axis(0, 7)      # nonunit column stride
-        dest = ScalarDestination(storage, 0, rowaddr, coladdr, MR, NR)
+        rows = AffineAxis(20, 1, MR)     # contiguous rows starting at 20
+        cols = AffineAxis(0, 7, NR)      # nonunit column stride
+        dest = QSTile(storage, 0, rows, cols)
         execute_tile!(k, dest, packed_a, packed_b, kc, 2.0, 0.0)
         for i in 0:(MR - 1), j in 0:(NR - 1)
             addr = 20 + i * 1 + j * 7
@@ -132,9 +121,9 @@ using QuasiStrided: ScalarKernel, ScalarDestination, affine_axis, scatter_axis, 
 
         # Case 2: negative row stride (rows stored in reverse), nonunit cols.
         storage2 = fill(NaN, len)
-        rowaddr2 = affine_axis(50, -3)
-        coladdr2 = affine_axis(0, 11)
-        dest2 = ScalarDestination(storage2, 0, rowaddr2, coladdr2, MR, NR)
+        rows2 = AffineAxis(50, -3, MR)
+        cols2 = AffineAxis(0, 11, NR)
+        dest2 = QSTile(storage2, 0, rows2, cols2)
         execute_tile!(k, dest2, packed_a, packed_b, kc, 1.0, 0.0)
         for i in 0:(MR - 1), j in 0:(NR - 1)
             addr = 50 - 3i + 11j
@@ -157,9 +146,9 @@ using QuasiStrided: ScalarKernel, ScalarDestination, affine_axis, scatter_axis, 
         row_offsets = [5, 40, 12]   # arbitrary, distinct, irregular
         col_offsets = [0, 200]
         storage = fill(NaN, 300)
-        rowaddr = scatter_axis(row_offsets)
-        coladdr = scatter_axis(col_offsets)
-        dest = ScalarDestination(storage, 0, rowaddr, coladdr, MR, NR)
+        rows = ScatterAxis(row_offsets, MR)
+        cols = ScatterAxis(col_offsets, NR)
+        dest = QSTile(storage, 0, rows, cols)
         execute_tile!(k, dest, packed_a, packed_b, kc, 1.0, 0.0)
         for i in 0:(MR - 1), j in 0:(NR - 1)
             addr = row_offsets[i + 1] + col_offsets[j + 1]
@@ -168,8 +157,8 @@ using QuasiStrided: ScalarKernel, ScalarDestination, affine_axis, scatter_axis, 
 
         # Mixed: scattered rows, affine columns.
         storage2 = fill(NaN, 300)
-        coladdr2 = affine_axis(0, 100)
-        dest2 = ScalarDestination(storage2, 0, rowaddr, coladdr2, MR, NR)
+        cols2 = AffineAxis(0, 100, NR)
+        dest2 = QSTile(storage2, 0, rows, cols2)
         execute_tile!(k, dest2, packed_a, packed_b, kc, 1.0, 0.0)
         for i in 0:(MR - 1), j in 0:(NR - 1)
             addr = row_offsets[i + 1] + j * 100
@@ -184,19 +173,15 @@ using QuasiStrided: ScalarKernel, ScalarDestination, affine_axis, scatter_axis, 
         packed_b = rand(MersenneTwister(3), packed_b_length(k, kc))
 
         storage = fill(NaN, MR * NR)  # old C entirely NaN
-        rowaddr = affine_axis(0, 1)
-        coladdr = affine_axis(0, MR)
-        dest = ScalarDestination(storage, 0, rowaddr, coladdr, MR, NR)
+        rows = AffineAxis(0, 1, MR)
+        cols = AffineAxis(0, MR, NR)
+        dest = QSTile(storage, 0, rows, cols)
         execute_tile!(k, dest, packed_a, packed_b, kc, 1.5, 0.0)
         @test all(isfinite, storage)
 
         # Textual confirmation (see src/kernel.jl): in store_tile!'s
         # `iszero(beta)` branch, and in scale_tile!'s `iszero(beta)` branch,
-        # the only statement touching `destination.storage[addr + 1]` is an
-        # assignment (`= alpha * acc[...]` / `= zero(T)`) — there is no
-        # occurrence of `destination.storage[addr + 1]` on the right-hand
-        # side, i.e. no load, in either branch. Confirmed by inspection of
-        # src/kernel.jl's store_tile! and scale_tile! definitions.
+        # the only statement touching storage is an assignment, never a load.
     end
 
     @testset "alpha=0 skips accumulator arithmetic (no Inf/NaN from operands)" begin
@@ -208,9 +193,9 @@ using QuasiStrided: ScalarKernel, ScalarDestination, affine_axis, scatter_axis, 
         packed_b = [Inf, 0.0]
 
         storage = [1.0, 2.0, 3.0, 4.0]
-        rowaddr = affine_axis(0, 1)
-        coladdr = affine_axis(0, MR)
-        dest = ScalarDestination(storage, 0, rowaddr, coladdr, MR, NR)
+        rows = AffineAxis(0, 1, MR)
+        cols = AffineAxis(0, MR, NR)
+        dest = QSTile(storage, 0, rows, cols)
         old = copy(storage)
         execute_tile!(k, dest, packed_a, packed_b, kc, 0.0, 2.0)
         # alpha=0, beta=2: result should be exactly 2*old C, no NaN anywhere.
@@ -219,13 +204,13 @@ using QuasiStrided: ScalarKernel, ScalarDestination, affine_axis, scatter_axis, 
 
         # alpha=0 && beta=0: writes zero(T), no read of C or acc.
         storage2 = fill(NaN, 4)
-        dest2 = ScalarDestination(storage2, 0, rowaddr, coladdr, MR, NR)
+        dest2 = QSTile(storage2, 0, rows, cols)
         execute_tile!(k, dest2, packed_a, packed_b, kc, 0.0, 0.0)
         @test all(iszero, storage2)
 
         # alpha=0 && beta=1: full no-op (storage unchanged, including NaNs).
         storage3 = fill(NaN, 4)
-        dest3 = ScalarDestination(storage3, 0, rowaddr, coladdr, MR, NR)
+        dest3 = QSTile(storage3, 0, rows, cols)
         execute_tile!(k, dest3, packed_a, packed_b, kc, 0.0, 1.0)
         @test all(isnan, storage3)
     end
@@ -258,14 +243,14 @@ using QuasiStrided: ScalarKernel, ScalarDestination, affine_axis, scatter_axis, 
         pad = 5
         storage = fill(-777.0, m * n + 2 * pad)
         base = pad
-        rowaddr = affine_axis(0, 1)
-        coladdr = affine_axis(0, m)
-        dest = ScalarDestination(storage, base, rowaddr, coladdr, m, n)
+        rows = AffineAxis(0, 1, m)
+        cols = AffineAxis(0, m, n)
+        dest = QSTile(storage, base, rows, cols)
         execute_tile!(k, dest, packed_a, packed_b, kc, 1.0, 0.0)
 
         # Valid rectangle: finite and correct.
         for i in 0:(m - 1), j in 0:(n - 1)
-            addr = base + rowaddr(i) + coladdr(j)
+            addr = base + i * 1 + j * m
             @test isfinite(storage[addr + 1])
             @test storage[addr + 1] ≈ acc[i + 1, j + 1]
         end
@@ -293,9 +278,9 @@ using QuasiStrided: ScalarKernel, ScalarDestination, affine_axis, scatter_axis, 
         Cold = rand(rng, MR, NR)
         storage = vec(permutedims(Cold))  # so that row-major-style affine addressing lines up
         # Use simple row-major-ish affine addressing: addr(i,j) = i*NR + j
-        rowaddr = affine_axis(0, NR)
-        coladdr = affine_axis(0, 1)
-        dest = ScalarDestination(copy(storage), 0, rowaddr, coladdr, MR, NR)
+        rows = AffineAxis(0, NR, MR)
+        cols = AffineAxis(0, 1, NR)
+        dest = QSTile(copy(storage), 0, rows, cols)
         execute_tile!(k, dest, packed_a, packed_b, kc, alpha, beta)
 
         expected = alpha .* (Amat * Bmat) .+ beta .* Cold
@@ -309,9 +294,9 @@ using QuasiStrided: ScalarKernel, ScalarDestination, affine_axis, scatter_axis, 
         MR, NR = 2, 2
         k = ScalarKernel(Val(MR), Val(NR), Float64)
         storage = [1.0, 2.0, 3.0, 4.0]
-        rowaddr = affine_axis(0, 1)
-        coladdr = affine_axis(0, MR)
-        dest = ScalarDestination(storage, 0, rowaddr, coladdr, MR, NR)
+        rows = AffineAxis(0, 1, MR)
+        cols = AffineAxis(0, MR, NR)
+        dest = QSTile(storage, 0, rows, cols)
         # Deliberately empty/undersized packed buffers: if execute_tile! read
         # from them for kc=0 this would throw a BoundsError.
         empty_a = Float64[]
@@ -324,9 +309,9 @@ using QuasiStrided: ScalarKernel, ScalarDestination, affine_axis, scatter_axis, 
         MR, NR = 2, 2
         k = ScalarKernel(Val(MR), Val(NR), Float64)
         storage = fill(NaN, 4)
-        rowaddr = affine_axis(0, 1)
-        coladdr = affine_axis(0, MR)
-        dest = ScalarDestination(storage, 0, rowaddr, coladdr, 0, 0)
+        rows = AffineAxis(0, 1, 0)
+        cols = AffineAxis(0, MR, 0)
+        dest = QSTile(storage, 0, rows, cols)
         execute_tile!(k, dest, Float64[], Float64[], 0, 1.0, 1.0)
         @test all(isnan, storage)  # untouched, still NaN
     end
@@ -335,9 +320,9 @@ using QuasiStrided: ScalarKernel, ScalarDestination, affine_axis, scatter_axis, 
         MR, NR = 2, 2
         k = ScalarKernel(Val(MR), Val(NR), Float64)
         storage = zeros(10)
-        rowaddr = affine_axis(0, 1)
-        coladdr = affine_axis(0, MR)
-        dest = ScalarDestination(storage, 0, rowaddr, coladdr, 3, 2)  # m=3 > MR=2
+        rows = AffineAxis(0, 1, 3)  # m=3 > MR=2
+        cols = AffineAxis(0, MR, 2)
+        dest = QSTile(storage, 0, rows, cols)
         @test_throws ArgumentError execute_tile!(k, dest, [1.0, 2.0], [1.0, 2.0], 1, 1.0, 0.0)
     end
 
@@ -350,9 +335,9 @@ using QuasiStrided: ScalarKernel, ScalarDestination, affine_axis, scatter_axis, 
         @test eltype(acc) == Float32
         accumulate(k, acc, packed_a, packed_b, kc)
         storage = zeros(Float32, 4)
-        rowaddr = affine_axis(0, 1)
-        coladdr = affine_axis(0, MR)
-        dest = ScalarDestination(storage, 0, rowaddr, coladdr, MR, NR)
+        rows = AffineAxis(0, 1, MR)
+        cols = AffineAxis(0, MR, NR)
+        dest = QSTile(storage, 0, rows, cols)
         execute_tile!(k, dest, packed_a, packed_b, kc, Float32(1), Float32(0))
         @test eltype(storage) == Float32
     end

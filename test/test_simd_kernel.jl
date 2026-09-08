@@ -1,15 +1,5 @@
-# OWNER: SIMD implementer (Phase 3). See docs/decisions.md and
-# Julia-Microkernel-Tile-Interface-Design.md sections 7-9, 12 ("Arithmetic
-# and store tests" / "Allocation and generated-code checks", SIMD subset).
-#
-# Exercises src/kernels/simd.jl: SIMDKernel, zero_accumulator, accumulate,
-# store_tile!, execute_tile!, compared against src/kernel.jl's ScalarKernel
-# on identical inputs (numerical tolerance, never bitwise equality — see
-# design doc section 8/12 and this file's own docstrings).
-#
-# `SIMDKernel` is not (yet) exported by QuasiStrided (see src/kernels/simd.jl
-# header and this worker's final report) — import explicitly, matching
-# test_kernel.jl's own pattern for ScalarKernel/ScalarDestination.
+# Exercises src/kernels/simd.jl: SIMDKernel vs. ScalarKernel on identical
+# inputs (numerical tolerance, never bitwise equality).
 using QuasiStrided: SIMDKernel, ScalarKernel, lanewidth, avecs_per_column
 using Random
 using SIMD: Vec

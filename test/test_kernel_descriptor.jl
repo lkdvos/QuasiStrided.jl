@@ -1,5 +1,3 @@
-# OWNER: main process (frozen Phase 2 contract; see src/kernel_descriptor.jl).
-
 @testset "KernelDescriptor" begin
     k = KernelDescriptor(Val(8), Val(6), Float64)
     @test mr(k) == 8

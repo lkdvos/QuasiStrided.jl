@@ -1,11 +1,6 @@
-# OWNER: main process. Phase 2 integration gate: exercises the real
-# AxisGroup -> BlockDescriptor -> axis_from_descriptor -> QSTile ->
-# pack_a!/pack_b! -> ScalarKernel execute_tile! path end to end, on the
-# worked A[a,k,b]/B[k,n]/C[a,n,b] fixture from both specs (indexing spec
-# section 8, microkernel spec section 11), including multiple K panels
-# applying beta once (microkernel spec section 10's contract, without the
-# not-yet-written driver: this test drives the loop by hand once to prove
-# the pieces compose before Phase 3 builds the general version).
+# Integration gate: exercises AxisGroup -> BlockDescriptor ->
+# axis_from_descriptor -> QSTile -> pack_a!/pack_b! -> ScalarKernel
+# execute_tile! end to end, including multiple K panels applying beta once.
 
 @testset "Phase 2 integration: AxisGroup -> tiles -> packing -> ScalarKernel" begin
     # A[a,k,b] shape (3,5,2), B[k,n] shape (5,4), C[a,n,b] shape (3,4,2),
@@ -160,10 +155,7 @@ end
         @test_throws BoundsError checked_tile_storage_bounds(-1, AffineAxis(0, 1, 3), AffineAxis(0, 3, 2), 6)
     end
 
-    @testset "QSTile execute_tile!: coverage parity with ScalarDestination path" begin
-        # These cases were exercised on ScalarDestination in test_kernel.jl
-        # but not on the real QSTile/DestinationTile path (Fable review
-        # finding #4); repeat the essentials here.
+    @testset "QSTile execute_tile!: alpha/beta shortcut coverage" begin
         kernel = ScalarKernel(Val(3), Val(2), Float64)
         packed_a = Float64[1, 2, 3, 4, 5, 6]   # MR=3, kc=2
         packed_b = Float64[10, 20, 30, 40]     # NR=2, kc=2

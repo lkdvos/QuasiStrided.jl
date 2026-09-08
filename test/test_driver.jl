@@ -1,23 +1,12 @@
-# OWNER: driver implementer (Phase 3). See docs/decisions.md for the frozen
-# contract! signature and Julia-Microkernel-Tile-Interface-Design.md sections
-# 10-12 for the driver-relevant acceptance checks this file exercises.
-
 using StridedViews: StridedView, offset
 
-# `plan_contract`/`execute!`/`ContractPlan` are not exported by
-# src/QuasiStrided.jl (only `contract!` is, per the driver-implementer task's
-# file-ownership constraints: that file is not owned by this worker). They
-# are still part of the driver's public surface -- reference them qualified.
+# plan_contract/execute!/ContractPlan aren't exported (only contract! is).
 const plan_contract = QuasiStrided.plan_contract
 const execute! = QuasiStrided.execute!
 const ContractPlan = QuasiStrided.ContractPlan
 
-# =====================================================================
-# Worked fixture (indexing spec section 8 / microkernel spec section 11):
-# A[a,k,b] shape (3,5,2), B[k,n] shape (5,4), C[a,n,b] shape (3,4,2),
-# C[a,n,b] = sum_k A[a,k,b]*B[k,n]. Label choice: a=1, k=2, b=3, n=4, so
-# indA=(1,2,3), indB=(2,4), indC=(1,4,3).
-# =====================================================================
+# Worked fixture: A[a,k,b] (3,5,2), B[k,n] (5,4), C[a,n,b] (3,4,2),
+# C[a,n,b] = sum_k A[a,k,b]*B[k,n]; labels a=1,k=2,b=3,n=4.
 
 function _worked_fixture()
     A = reshape(collect(1.0:30.0), 3, 5, 2)
