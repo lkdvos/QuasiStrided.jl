@@ -109,15 +109,14 @@ macro-kernel tuning, autotuning, or CPU-feature dispatch tables; threading;
 GPU execution / GemmKernels integration; complex-arithmetic methods
 (planar/1m/3m); K padding.
 
-Known, deferred, non-correctness issue: `pack_a!`/`pack_b!` allocate ~80
-bytes/call in steady state even with concrete, function-local, reused
-buffers — root cause not isolated (closures, bounds-check call, and eltype
-check each measured zero in isolation, but the full function body still
-allocates). Documented in `docs/decisions.md`'s Phase 2b disposition (finding
-5) and re-confirmed, not re-investigated, in Phase 3/4. Does not affect
-correctness; affects the "zero steady-state allocation" performance target
-for packing specifically (the kernels themselves — scalar and SIMD — are
-zero-allocation, confirmed by `@allocated` after warmup).
+`pack_a!`/`pack_b!`'s previously-deferred ~80 bytes/call allocation (Phase 2b
+finding 5) is now fixed — root cause was a missing `where`-bound type
+parameter on a forwarding argument, causing dynamic dispatch; see
+`docs/decisions.md`. Packing, and both kernels' `zero_accumulator`/
+`accumulate`/`execute_tile!` (scalar's `Matrix` accumulator aside, which is
+spec-accepted), are now zero-allocation in isolation. A smaller, newly
+observed residual allocation remains specifically in `execute!`'s driver
+loop (not yet diagnosed) — see `STATUS.md`.
 
 ## Development process
 

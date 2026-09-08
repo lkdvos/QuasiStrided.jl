@@ -159,17 +159,42 @@ findings kept in `STATUS.md`'s history is unnecessary; disposition of each:
    canaries, Float32, and mixed affine/scattered addressing — plus a
    regression testset for findings 1-3's exact reproducers and direct unit
    tests of `axis_offset_range`/`checked_tile_storage_bounds`.
-5. **[should-fix, DEFERRED]** `pack_a!`/`pack_b!` allocate ~80 B/call in
-   steady state even with concrete, function-local types (confirmed; not a
-   measurement artifact — checked with `KernelDescriptor` directly, bypassing
-   the `ScalarKernel` forwarding method, same result). Root cause not
-   isolated in the time available: `checked_tile_storage_bounds`, closure
-   construction, and `_check_packed_eltype` each measured 0 B in isolation,
-   but the full `pack_a!` body still allocates. Not a correctness issue and
-   explicitly lower priority than findings 1-3 per the review itself ("measure
-   before Phase 3 SIMD reuses these wrappers"). Deferred to whoever next
-   touches `pack_a!`/`pack_b!` (packing follow-up or the Phase 3 SIMD
-   implementer, who needs zero-allocation packing regardless).
+5. **[should-fix, RESOLVED 2026-09-08]** `pack_a!`/`pack_b!` allocated ~80
+   B/call in steady state. **Root cause**: `transform` (and, in
+   `_pack_panel!`, `transform`/`load`/`packed_offset`) were accepted with no
+   `where`-bound type parameter — a forwarding argument that is only ever
+   passed along, never called directly in the outer method, is compiled
+   against a widened type unless explicitly bound, forcing a dynamic
+   dispatch into `_pack_panel!` that heap-allocates the closure passed
+   alongside it. `Profile.Allocs` pinpointed the exact allocation (an
+   anonymous-closure struct, 80 bytes) at the `_pack_panel!` call site,
+   confirming the mechanism. The three sub-pieces measured "0 B in
+   isolation" (Phase 2b) were genuinely 0 B — the bug was invisible to
+   per-piece measurement because it was specifically the missing binding on
+   the *forwarding* parameter, not any one piece's own logic. **Fix**: gave
+   `transform` (`pack_a!`/`pack_b!`) and `transform`/`load`/`packed_offset`
+   (`_pack_panel!`) their own free type parameters. No signature, contract,
+   or packed-offset-formula change. The identical bug recurred one layer up
+   in `ScalarKernel`'s and `SIMDKernel`'s `pack_a!`/`pack_b!` forwarding
+   methods (`src/kernel.jl`, `src/kernels/simd.jl` — untyped `kernel`/
+   `transform` parameters), found and fixed by the main process with the
+   same pattern (the diagnosis task was correctly scoped to not touch those
+   two files, so it flagged this precisely rather than exceeding scope).
+   Verified zero allocation, after warmup, for both `pack_a!`/`pack_b!`
+   called directly with `KernelDescriptor` and via both kernel forwarding
+   paths, across affine/scattered sources, `kc=0`, and a nontrivial
+   transform. Regression tests in `test/test_packing.jl`.
+   **Residual, newly observed, NOT part of this fix**: `execute!` through
+   the driver still allocates (measured: ScalarKernel ~10.7KB, SIMDKernel
+   ~5.9KB for a 9x10x8 case with 2 K-panels) — smaller than before this fix
+   (was ~15KB/~10.2KB), but not zero. `ScalarKernel`'s `zero_accumulator`
+   (176 B/call, a `Matrix{T}`) is spec-accepted and not a bug (see design
+   doc section 8: acceptable for the scalar reference, unlike SIMD, whose
+   `zero_accumulator` measures 0 B). The rest of the residual is in
+   `src/driver.jl`'s own tiling loop, not diagnosed here — this fix was
+   correctly scoped to `pack_a!`/`pack_b!` only, per its task instructions,
+   and did not touch the driver. Left as a new, smaller, open item — see
+   `STATUS.md`.
 6. **[note, ACCEPTED]** `accumulate` is a `Base.accumulate` method, not a
    fresh binding — kept as documented in `src/kernel.jl` (avoids an
    `export`/`Base` name collision under `using QuasiStrided`); no better

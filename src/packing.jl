@@ -29,7 +29,7 @@ end
 # layout exactly: for fixed p, incrementing the inner index by one advances
 # the packed offset by exactly one, so writes to `packed` are sequential.
 @inline function _pack_panel!(packed::Vector{T}, physical_dim::Int, kc::Int, valid::Int,
-                               transform, load, packed_offset) where {T}
+                               transform::F, load::L, packed_offset::P) where {T,F,L,P}
     @inbounds for p in 0:(kc-1)
         for i in 0:(physical_dim-1)
             v = i < valid ? convert(T, transform(load(i, p)))::T : zero(T)
@@ -73,7 +73,7 @@ elementwise callable; exceptions it raises are not rolled back.
 Never allocates: `packed` is written in place and returned.
 """
 function pack_a!(packed::Vector{T}, source::QSTile, kernel::KernelDescriptor{MR,NR,T2},
-                  transform) where {T,MR,NR,T2}
+                  transform::F) where {T,MR,NR,T2,F}
     _check_packed_eltype(packed, kernel)
 
     m = nrows(source)
@@ -133,7 +133,7 @@ must be pure and elementwise, exactly as in [`pack_a!`](@ref).
 Never allocates: `packed` is written in place and returned.
 """
 function pack_b!(packed::Vector{T}, source::QSTile, kernel::KernelDescriptor{MR,NR,T2},
-                  transform) where {T,MR,NR,T2}
+                  transform::F) where {T,MR,NR,T2,F}
     _check_packed_eltype(packed, kernel)
 
     kc = nrows(source)

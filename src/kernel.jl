@@ -75,9 +75,9 @@ packed_b_length(k::ScalarKernel, kc::Int) = packed_b_length(k.descriptor, kc)
 # future concrete kernel wrapping a KernelDescriptor as `.descriptor`) to it,
 # so the same `kernel` object can be passed to packing and to
 # zero_accumulator/accumulate/store_tile!/execute_tile! uniformly.
-pack_a!(packed::Vector, source::QSTile, kernel::ScalarKernel, transform) =
+pack_a!(packed::Vector{T}, source::QSTile, kernel::ScalarKernel{MR,NR,T}, transform::F) where {T,MR,NR,F} =
     pack_a!(packed, source, kernel.descriptor, transform)
-pack_b!(packed::Vector, source::QSTile, kernel::ScalarKernel, transform) =
+pack_b!(packed::Vector{T}, source::QSTile, kernel::ScalarKernel{MR,NR,T}, transform::F) where {T,MR,NR,F} =
     pack_b!(packed, source, kernel.descriptor, transform)
 
 """

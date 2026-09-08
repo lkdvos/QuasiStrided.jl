@@ -596,3 +596,112 @@ end
         @test packed[packed_a_offset(kernel, i, p)+1] == storage[i+p+1]
     end
 end
+
+# =====================================================================
+# Steady-state allocation (Phase 2b Fable review finding 5, deferred;
+# root-caused and fixed by whoever next reads this): pack_a!/pack_b!
+# called directly against a bare KernelDescriptor must allocate zero
+# bytes once warmed, for both affine and scattered sources, kc=0, and a
+# nontrivial (non-identity) transform. Root cause was that `transform`
+# (and `_pack_panel!`'s `transform`/`load`/`packed_offset`) had no type
+# parameter in the signature: a `Function`-typed argument that a method
+# only *forwards* (never calls directly) gets compiled against a
+# widened/abstract type unless bound by an explicit `where` clause, which
+# forced a dynamic call and heap-allocated the `load` closure passed
+# alongside it. Fixed by giving each of those parameters its own free
+# type parameter (`transform::F where {F}`, etc.) so the compiler is
+# forced to specialize per concrete callable type.
+#
+# NOTE: this test only covers pack_a!/pack_b! called directly against a
+# `KernelDescriptor`, matching this file's ownership scope. Calling
+# through the `ScalarKernel`/`SIMDKernel` forwarding one-liners in
+# src/kernel.jl / src/kernels/simd.jl still allocates (confirmed
+# separately): those forwarding methods declare `kernel::ScalarKernel`
+# (resp. `SIMDKernel`) and `transform` with no `where` clause of their
+# own, so the same widening happens one layer up, in files this task
+# does not own and must not edit. That is a distinct, currently
+# unresolved allocation and is intentionally not asserted here.
+@testset "pack_a!/pack_b!: zero steady-state allocation (direct KernelDescriptor)" begin
+    nontrivial(x) = 2.0 * x + 1.0
+
+    function run()
+        kernel = KernelDescriptor(Val(8), Val(6), Float64)
+        packed_a = zeros(8 * 4)
+        packed_b = zeros(6 * 4)
+
+        src_affine = SourceTile(rand(1000), 0, AffineAxis(0, 1, 8), AffineAxis(0, 8, 4))
+        src_b_affine = SourceTile(rand(1000), 0, AffineAxis(0, 1, 4), AffineAxis(0, 4, 6))
+
+        offs_rows = collect(0:7)
+        offs_cols = [0, 8, 16, 24]
+        src_scatter = SourceTile(rand(1000), 0, ScatterAxis(offs_rows, 8), ScatterAxis(offs_cols, 4))
+
+        offs_rows_b = collect(0:3)
+        offs_cols_b = [0, 4, 8, 12, 16, 20]
+        src_b_scatter = SourceTile(rand(1000), 0, ScatterAxis(offs_rows_b, 4), ScatterAxis(offs_cols_b, 6))
+
+        src_kc0 = SourceTile(rand(10), 0, AffineAxis(0, 1, 8), AffineAxis(0, 8, 0))
+        src_b_kc0 = SourceTile(rand(10), 0, AffineAxis(0, 1, 0), AffineAxis(0, 0, 6))
+
+        bytes = Int[]
+
+        pack_a!(packed_a, src_affine, kernel, identity)
+        push!(bytes, @allocated pack_a!(packed_a, src_affine, kernel, identity))
+
+        pack_a!(packed_a, src_affine, kernel, nontrivial)
+        push!(bytes, @allocated pack_a!(packed_a, src_affine, kernel, nontrivial))
+
+        pack_b!(packed_b, src_b_affine, kernel, identity)
+        push!(bytes, @allocated pack_b!(packed_b, src_b_affine, kernel, identity))
+
+        pack_b!(packed_b, src_b_affine, kernel, nontrivial)
+        push!(bytes, @allocated pack_b!(packed_b, src_b_affine, kernel, nontrivial))
+
+        pack_a!(packed_a, src_scatter, kernel, identity)
+        push!(bytes, @allocated pack_a!(packed_a, src_scatter, kernel, identity))
+
+        pack_a!(packed_a, src_scatter, kernel, nontrivial)
+        push!(bytes, @allocated pack_a!(packed_a, src_scatter, kernel, nontrivial))
+
+        pack_b!(packed_b, src_b_scatter, kernel, identity)
+        push!(bytes, @allocated pack_b!(packed_b, src_b_scatter, kernel, identity))
+
+        pack_b!(packed_b, src_b_scatter, kernel, nontrivial)
+        push!(bytes, @allocated pack_b!(packed_b, src_b_scatter, kernel, nontrivial))
+
+        pack_a!(packed_a, src_kc0, kernel, identity)
+        push!(bytes, @allocated pack_a!(packed_a, src_kc0, kernel, identity))
+
+        pack_b!(packed_b, src_b_kc0, kernel, identity)
+        push!(bytes, @allocated pack_b!(packed_b, src_b_kc0, kernel, identity))
+
+        return bytes
+    end
+
+    @test all(iszero, run())
+end
+
+# Main-process follow-up: the diagnosis above fixed pack_a!/pack_b! called
+# with a bare KernelDescriptor, but the identical missing-`where`-clause bug
+# recurred one layer up in ScalarKernel's and SIMDKernel's own pack_a!/
+# pack_b! forwarding methods (src/kernel.jl, src/kernels/simd.jl) — fixed
+# there too (same pattern: bind the kernel's type parameters and give
+# `transform` its own free type parameter). Regression-test both forwarding
+# paths, not just the direct-KernelDescriptor path above.
+@testset "pack_a!/pack_b!: zero steady-state allocation (ScalarKernel/SIMDKernel forwarding)" begin
+    function run_forwarding(kernel)
+        packed_a = zeros(scalartype(kernel), mr(kernel) * 4)
+        packed_b = zeros(scalartype(kernel), nr(kernel) * 4)
+        src_a = SourceTile(rand(scalartype(kernel), 1000), 0, AffineAxis(0, 1, mr(kernel)), AffineAxis(0, mr(kernel), 4))
+        src_b = SourceTile(rand(scalartype(kernel), 1000), 0, AffineAxis(0, 1, 4), AffineAxis(0, 4, nr(kernel)))
+
+        pack_a!(packed_a, src_a, kernel, identity)
+        a1 = @allocated pack_a!(packed_a, src_a, kernel, identity)
+        pack_b!(packed_b, src_b, kernel, identity)
+        b1 = @allocated pack_b!(packed_b, src_b, kernel, identity)
+        return (a1, b1)
+    end
+
+    @test run_forwarding(ScalarKernel(Val(8), Val(6), Float64)) == (0, 0)
+    @test run_forwarding(SIMDKernel(Val(8), Val(6), Float64)) == (0, 0)
+end

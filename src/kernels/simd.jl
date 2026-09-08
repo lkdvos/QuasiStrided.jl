@@ -127,9 +127,9 @@ avecs_per_column(::SIMDKernel{MR,NR,T,W}) where {MR,NR,T,W} = MR ÷ W
 # Integration (main process, matching the pack_a!/pack_b! forwarding pattern
 # established for ScalarKernel in src/kernel.jl / docs/decisions.md): pack_a!/
 # pack_b! dispatch on a bare KernelDescriptor, so forward SIMDKernel to it.
-pack_a!(packed::Vector, source::QSTile, kernel::SIMDKernel, transform) =
+pack_a!(packed::Vector{T}, source::QSTile, kernel::SIMDKernel{MR,NR,T}, transform::F) where {T,MR,NR,F} =
     pack_a!(packed, source, kernel.descriptor, transform)
-pack_b!(packed::Vector, source::QSTile, kernel::SIMDKernel, transform) =
+pack_b!(packed::Vector{T}, source::QSTile, kernel::SIMDKernel{MR,NR,T}, transform::F) where {T,MR,NR,F} =
     pack_b!(packed, source, kernel.descriptor, transform)
 
 # ----------------------------------------------------------------------------

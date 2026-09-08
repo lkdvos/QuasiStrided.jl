@@ -68,20 +68,28 @@ authoritative for *why*. This file is only *what phase, what count*.
 
 ## What's known and unresolved
 
-- `pack_a!`/`pack_b!` allocate ~80 B/call in steady state; root cause not
-  isolated (three individually-zero-allocating sub-pieces measured, but the
-  full function body still allocates). Not a correctness issue. This is the
-  one open item a future session should pick up first if continuing
-  performance work — see `docs/decisions.md`'s Phase 2b disposition (finding
-  5) for what was already ruled out.
+- **RESOLVED 2026-09-08**: `pack_a!`/`pack_b!`'s ~80 B/call allocation
+  (Phase 2b finding 5) is fixed — root cause was a missing `where`-bound
+  type parameter on the forwarding `transform` argument, causing dynamic
+  dispatch. Zero allocation now confirmed for both direct-`KernelDescriptor`
+  and `ScalarKernel`/`SIMDKernel`-forwarding call paths. Full account in
+  `docs/decisions.md`'s Phase 2b finding 5.
+- **New, smaller, open item**: `execute!` through the driver still allocates
+  (~10.7 KB scalar / ~5.9 KB SIMD for a small multi-tile/multi-panel case;
+  down from ~15/~10.2 KB before the fix above, since packing no longer
+  contributes). `ScalarKernel`'s 176 B/call `zero_accumulator` is
+  spec-accepted (a `Matrix{T}`, explicitly fine for the scalar reference);
+  the rest is somewhere in `src/driver.jl`'s own tiling loop, not yet
+  diagnosed. This is the next thing to pick up if continuing performance
+  work — scope a fresh bounded diagnosis task to `src/driver.jl` the same
+  way the packing one was scoped to `src/packing.jl`.
 - No cache-blocked macro-kernel, autotuning, threading, or GPU path — all
   explicitly deferred per the handoff, not gaps in this milestone's scope.
 
 ## Next task
 
-None outstanding for this milestone. A future session extending this work
-should start by reading `docs/decisions.md` in full (it is the frozen-
-interface and disposition record every subsequent change must respect), then
-`docs/decisions.md`'s Phase 2b finding 5 (the deferred allocation) if
-continuing performance work, or the two specs' "Deferred work"/"Deferred
-extensions" sections if extending scope.
+None outstanding for this milestone's original scope. If continuing
+performance work, the next bounded task is diagnosing `execute!`'s residual
+driver-loop allocation (see above). Otherwise, a future session extending
+scope should start by reading `docs/decisions.md` in full, then the two
+specs' "Deferred work"/"Deferred extensions" sections.
