@@ -76,3 +76,10 @@ axis-list front end per the handoff (no einsum string parsing).
 
 A worker needing to edit a file outside this table requests a transfer through
 the main process; this table is updated first.
+
+## Phase 1 integration note
+
+`Project.toml`'s `[targets] test` was missing `Random` (needed by the
+independent oracle/property tests, which use `Random.MersenneTwister` with a
+fixed seed). Added by the main process post-integration: `Random` in
+`[extras]` and `[targets] test`. No other cross-worker conflicts.
