@@ -229,3 +229,41 @@ report for exact numbers; not independently re-measured by the main process
 (no cluster-exclusivity requirement applies to a single-call microbenchmark
 of this kind, but see `docs/measurement-rules.md`-equivalent caution: this is
 a single machine, single microarchitecture, not a cross-machine claim).
+
+## Phase 4 review: findings and disposition
+
+Sonnet High review of everything since Phase 2b (`src/kernels/simd.jl`,
+`src/driver.jl`, `test/test_phase3_integration.jl`), 2026-09-08. No blocking
+findings — confirmed the Phase 2b bounds checks are not bypassed anywhere in
+the driver's tiling loop or in `SIMDKernel`'s own `execute_tile!`, beta is
+applied exactly once per output tile across K panels, and label
+classification matches the frozen table exactly. Two coverage gaps, both
+closed:
+
+1. No test measured `execute!` allocation with `SIMDKernel` specifically
+   (only `ScalarKernel` was covered). Reviewer measured it directly and
+   found no driver-induced allocation regression (`SIMDKernel` was in fact
+   *lower*, not higher, allocation than `ScalarKernel` through the driver —
+   both nonzero only from the already-deferred `pack_a!`/`pack_b!` finding).
+   Added a permanent regression test,
+   `test/test_driver.jl`'s "execution allocation through SIMDKernel is not
+   worse than ScalarKernel" testset, asserting this rather than relying on a
+   one-off manual check.
+2. `_classify_labels`'s dangling-only-in-B case ((F,T,F) — a distinct code
+   path from the dangling-only-in-A case, the B loop rather than the A
+   loop) was untested. Added to `test/test_driver.jl`'s label-validation
+   testset.
+
+Driver-level benchmark (Cascade Lake, 64x64x64 contraction, MR=8/NR=6,
+kc_panel=32, warmed, `Pkg.test()`-independent one-off measurement, not part
+of the committed test suite): planning (`plan_contract`) is ~4.4-6.7 µs/call
+regardless of kernel — under 3% of total cost for this size and fully
+amortizable across repeated `execute!` calls on a reused plan. Steady-state
+`execute!`: scalar kernel 301.6 µs/call (156288 B), SIMD kernel 188.2 µs/call
+(68992 B) — SIMD is both faster and lower-allocation than scalar at this
+size, through the real driver (not just a single-tile microbenchmark). All
+allocation is attributable to the deferred `pack_a!`/`pack_b!` ~80B/call
+finding, scaling with (M-tiles × N-tiles × K-panels) — 8×11×2×2 (A and B) ≈
+352 pack calls for this shape, consistent with the measured totals.
+
+`Pkg.test()` after Phase 4 fixes: 12627/12627 passing.

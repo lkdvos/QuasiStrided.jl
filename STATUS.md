@@ -69,15 +69,15 @@ registered, or pushed, per handoff §2/§8).
 
 ## Active owners
 
-None currently active; about to launch Phase 4.
+- Phase 4 reviewer (Sonnet, high effort): reviewing everything since Phase 2b
+  (src/kernels/simd.jl, src/driver.jl, test/test_phase3_integration.jl).
+  Launched 2026-09-08.
 
 ## Next task
 
-Launch Phase 4: a Sonnet High reviewer for everything since Phase 2b
-(src/kernels/simd.jl, src/driver.jl, plus the main process's Phase 3
-integration test), supplying the Phase 2b findings/dispositions so it
-doesn't repeat that ground. Then run the complete test suite once more,
-focused benchmarks (already partially done by the SIMD worker; driver-level
-benchmarks still needed — setup/plan cost vs execute! cost, per spec
-section 2/12), and finish README.md/this file as the final handoff. Do not
-begin complex arithmetic, threading, or GPU work.
+Await the Phase 4 review. Triage findings (main process fixes directly or
+follow-up per handoff escalation policy). Then: complete test suite once
+more, driver-level benchmarks (plan_contract setup cost vs execute! steady-
+state cost, per spec section 2/12 — not yet measured; the SIMD worker only
+benchmarked single execute_tile! calls, not through the driver), finish
+README.md, and this file as the final handoff.

@@ -223,6 +223,12 @@ end
     # Label present only in indA (not in indB or indC): dangling.
     @test_throws ArgumentError contract!(Cv, 1.0, Av, (1, 2), Bv, (5, 3), 0.0, (1, 3))
 
+    # Label present only in indB (not in indA or indC): dangling. This is a
+    # structurally distinct code path from the indA-only case above (the B
+    # loop in _classify_labels, not the A loop) and was not previously
+    # exercised (Phase 4 review coverage note).
+    @test_throws ArgumentError contract!(Cv, 1.0, Av, (1, 2), Bv, (2, 9), 0.0, (1, 3))
+
     # Label present in all three (batch-like), unsupported this milestone.
     @test_throws ArgumentError contract!(Cv, 1.0, Av, (1, 2), Bv, (2, 3), 0.0, (2, 3))
 end
@@ -276,4 +282,39 @@ end
     fill!(Cmat, 0.0)
     cold_allocs = @allocated contract!(Cv, 1.0, Av, indA, Bv, indB, 0.0, indC)
     @test cold_allocs >= planning_allocs
+end
+
+@testset "driver: execution allocation through SIMDKernel is not worse than ScalarKernel" begin
+    # Phase 4 review: the SIMD worker only benchmarked a single execute_tile!
+    # call directly, never through the driver's own tiling/dispatch loop.
+    # Assert here (not just spot-check once) that going through execute!
+    # with a SIMDKernel doesn't introduce driver-induced boxing/allocation
+    # beyond what pack_a!/pack_b! already contribute (the same deferred
+    # ~80B/call finding applies to both kernels equally, scaled by tile x
+    # panel count) -- i.e. no *additional* per-call allocation specific to
+    # SIMDKernel dispatch through the driver.
+    Random.seed!(99)
+    Ma, Ka, Na = 9, 10, 8
+    Amat = randn(Ma, Ka)
+    Bmat = randn(Ka, Na)
+    indA, indB, indC = (1, 2), (2, 3), (1, 3)
+    Av, Bv = StridedView(Amat), StridedView(Bmat)
+
+    Cmat_s = zeros(Ma, Na)
+    plan_s = plan_contract(StridedView(Cmat_s), Av, indA, Bv, indB, indC;
+                            kernel = ScalarKernel(Val(4), Val(3), Float64), kc_panel = 4)
+    execute!(plan_s, 1.0, 0.0)
+    fill!(Cmat_s, 0.0)
+    scalar_exec_allocs = @allocated execute!(plan_s, 1.0, 0.0)
+
+    Cmat_v = zeros(Ma, Na)
+    plan_v = plan_contract(StridedView(Cmat_v), Av, indA, Bv, indB, indC;
+                            kernel = SIMDKernel(Val(4), Val(3), Float64), kc_panel = 4)
+    execute!(plan_v, 1.0, 0.0)
+    fill!(Cmat_v, 0.0)
+    simd_exec_allocs = @allocated execute!(plan_v, 1.0, 0.0)
+
+    @test Cmat_s ≈ Amat * Bmat
+    @test Cmat_v ≈ Amat * Bmat
+    @test simd_exec_allocs <= scalar_exec_allocs
 end
