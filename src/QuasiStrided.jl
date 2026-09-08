@@ -9,6 +9,10 @@ export AxisGroup, axis_length, offsets, fill_offsets!, BlockDescriptor, describe
     block_descriptors!, normalize_group
 
 # --- Phase 2: tiles, packing, scalar kernel ---
+include("kernel_descriptor.jl")
+export KernelDescriptor, mr, nr, scalartype, packed_a_offset, packed_b_offset,
+    packed_a_length, packed_b_length
+
 include("tiles.jl")
 export AffineAxis, ScatterAxis, SourceTile, DestinationTile
 
