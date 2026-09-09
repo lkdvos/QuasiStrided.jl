@@ -425,3 +425,79 @@ end
         @test isapprox(Cmat, expected; rtol = _macro_rtol(Float64, Ka))
     end
 end
+
+# =====================================================================
+# 8. Irregular (ScatterAxis) slivers at nonzero offset within a macro
+# block (Phase D Fable review, should-fix 1). `describe_block`/`_axis_of`
+# are called at every sliver boundary with the sliver's offset *within
+# its block's buffer* as `first` -- for a dense 2-index matmul (all
+# other testsets here) that offset always lands on a `regular` (affine)
+# classification, because a single-label AxisGroup map never has an
+# internal "carry" boundary to break the constant-stride sequence. This
+# fixture uses a 2-label M group (labels a,q) where A's own map is
+# naturally contiguous (q-stride == a_n * a-stride, satisfying the fold
+# condition even across an a-boundary) but C's map is deliberately padded
+# so it does NOT satisfy that condition -- forcing `describe_block` to
+# return `regular=false` (a `ScatterAxis`) for the C-side sliver that
+# straddles the a/q boundary, with `first > 0` (it's the *second* sliver
+# of its macro block). `_axis_of` is the single helper used identically
+# for the M, N, and K sides (driver.jl:126-129), so exercising it here
+# with a real regular=false/first>0 combination exercises the same code
+# path the N/K sides share.
+# =====================================================================
+
+@testset "macro driver: irregular sliver at nonzero offset (multi-label M group)" begin
+    a_n, q_n, k_n, n_n = 7, 2, 5, 3   # M = (a,q), a fastest; length 14
+    pad = 3                            # breaks C's fold condition (a_n+pad != a_n)
+
+    # A[a,q,k]: dense, naturally contiguous (a-stride=1, q-stride=a_n) --
+    # A's own M-map is affine even across an a-boundary.
+    Amat = randn(a_n, q_n, k_n)
+    Av = StridedView(Amat)
+    indA = (1, 2, 3)
+
+    Bmat = randn(k_n, n_n)
+    Bv = StridedView(Bmat)
+    indB = (3, 4)
+
+    # C[a,q,n]: embedded with a gap in the q dimension (q-stride = a_n+pad,
+    # not a_n) so C's M-map fails the fold condition at every a-boundary.
+    Cbig = randn(a_n + pad, q_n, n_n)
+    Csub = view(Cbig, 1:a_n, :, :)
+    Cv = StridedView(Csub)
+    indC = (1, 2, 4)
+    Cstart = copy(Csub)
+
+    # Independent reference: plain nested loops over logical indices.
+    alpha, beta = 1.7, -0.4
+    Cref = zeros(a_n, q_n, n_n)
+    for nn in 1:n_n, qq in 1:q_n, aa in 1:a_n
+        s = 0.0
+        for kk in 1:k_n
+            s += Amat[aa, qq, kk] * Bmat[kk, nn]
+        end
+        Cref[aa, qq, nn] = alpha * s + beta * Cstart[aa, qq, nn]
+    end
+
+    kernel = ScalarKernel(Val(4), Val(3), Float64)
+    # mc=8 gives the first ic block (mblock=8) two MR=4 slivers: rfirst=0
+    # (coords 0:3, a=0..3,q=0 -- no boundary) and rfirst=4 (coords 4:7 ==
+    # a=4,5,6,q=0 then a=0,q=1 -- crosses the a/q boundary, the case this
+    # testset targets). The second (tail) ic block, mblock=6, exercises a
+    # further rfirst=4 sliver (regular, no crossing) -- included for
+    # tail-block coverage, not because it's irregular.
+    plan = QuasiStrided.plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, mc = 8, kc = 5, nc = 3)
+    QuasiStrided.execute!(plan, alpha, beta)
+    @test isapprox(Array(Csub), Cref; rtol = 50 * k_n * eps(Float64))
+
+    # execute! vs execute_tilewise! agreement on the same irregular fixture.
+    Cbig_tw = randn(a_n + pad, q_n, n_n)
+    Cbig_tw[1:a_n, :, :] .= Cstart
+    Csub_tw = view(Cbig_tw, 1:a_n, :, :)
+    plan_tw = QuasiStrided.plan_contract(
+        StridedView(Csub_tw), Av, indA, Bv, indB, indC;
+        kernel = kernel, mc = 8, kc = 5, nc = 3
+    )
+    QuasiStrided.execute_tilewise!(plan_tw, alpha, beta)
+    @test isapprox(Array(Csub_tw), Array(Csub); rtol = 50 * k_n * eps(Float64))
+end

@@ -135,7 +135,12 @@ recorded in `docs/decisions.md` once triaged).
       residual driver-induced allocation. `@code_warntype` confirmed no
       `Union`/partially-applied `QSTile` downstream of axis construction.
       12901/12901 passing.
-- [ ] Phase D (one Fable review of the integrated macro path)
+- [x] **Phase D** (Fable review): no blocking findings. One should-fix
+      (missing permanent test coverage for the irregular-sliver-at-
+      nonzero-offset driver path) fixed and verified; three notes accepted
+      without action (one pre-existing, unchanged behavior; two design
+      observations for a future threading milestone). Full disposition in
+      `docs/decisions.md`. 12903/12903 passing.
 - [ ] Phase E (benchmark sweep, replace provisional block-size constants)
 - [ ] Phase F (final review, docs, CI, merge)
 

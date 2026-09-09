@@ -416,3 +416,64 @@ them with sweep-measured values and records provenance here.
 
 `src/kernel.jl` (beyond the two forwarding methods above), `src/kernels/simd.jl`,
 `src/kernel_descriptor.jl` remain frozen this milestone.
+
+## Phase D: Fable review of the integrated macro path
+
+Fable High review completed (`fable_review_macro_used: true`), 2026-09-08,
+on the integrated `execute!` rewrite (HEAD `b33678e`). No blocking findings.
+Confirmed by direct trace + a 160-combination scratch check (regular and
+irregular slivers, tail blocks in M/N/K simultaneously): beta is applied
+exactly once per output element (the `pc==0`/`firstpanel` decision is made
+once per K block, not per tile, and the M/N/K block partitions are disjoint
+and exhaustive); sliver-stride addressing agrees between the pack and
+consume sides at every block (both always use the current block's actual
+`kc_len` via `_sliver_range`, and a stride mismatch would raise
+`DimensionMismatch`, not misread); no borrowed-buffer staleness (each of
+`m_buf_*`/`n_buf_*`/`k_buf_*` is filled and consumed within its own
+`ic`/`jc`/`pc` scope, never read after a later refill); `Blocking`'s
+effective-value clamping cannot produce a zero-length buffer or zero-sliver
+block on a nonzero input shape.
+
+Disposition of each finding:
+
+1. **[should-fix, FIXED]** The driver's irregular-sliver-at-nonzero-offset
+   path (`describe_block`/`_axis_of` called with `regular=false` and
+   `first>0`, `driver.jl:426-427,446,460-461,467,475,479`) had zero
+   permanent test coverage — every existing multi-block test used a
+   single-label (dense-matmul) M/N/K group, which is always classified
+   `regular` regardless of `first`, since a single dimension has no
+   internal "carry" boundary to break the constant-stride sequence. The
+   reviewer verified correctness via an ad hoc 160-combination scratch
+   check, not a committed test. Added
+   `test/test_macro_driver.jl`'s "irregular sliver at nonzero offset
+   (multi-label M group)" testset: a 2-label M group (`a`,`q`) where `A`'s
+   map is naturally contiguous (regular even across the `a`/`q` boundary)
+   but `C`'s map is deliberately padded so it fails the affine-fold
+   condition at that same boundary — forcing `describe_block` to return
+   `regular=false` for the C-side sliver at `first=4`. Directly confirmed
+   (not just inferred from the test passing) via a standalone
+   `describe_block` call reproducing the exact offset sequence:
+   `buf_A=[4,5,6,7]` (regular=true), `buf_C=[4,5,6,10]` (regular=false).
+   `_axis_of` is the one helper used identically for the M/N/K sides
+   (`driver.jl:126-129`), so this exercises the same code path the N and K
+   sides share, without needing to also construct a multi-label N or K
+   fixture. `Pkg.test()`: 12903/12903 passing.
+2. **[note, ACCEPTED, pre-existing]** `_scale_all_of_C!`
+   (`driver.jl:157-160`, reached only on the `Qk==0`/`alpha==0`
+   short-circuit) calls `scale_tile!` without a
+   `checked_tile_storage_bounds` call first — unchanged from the old
+   driver's equivalent short-circuit (its old line 247), and the reviewer
+   could not construct a failing input (offsets come from the validated
+   `AxisGroup`). Not fixed: no demonstrated failure, and it predates this
+   milestone.
+3. **[note, ACCEPTED]** `test/test_macro_driver.jl`'s buffer-poisoning
+   testset can only detect read-before-fill, not intra-call staleness (the
+   actual macro-blocking risk) — but the small-random-block cases in
+   testset 1 (`mc,kc,nc ∈ 1:13` against shapes up to 37) are what would
+   actually catch a staleness bug, and did not. No action needed.
+4. **[note, ACCEPTED]** `ContractPlan`'s shared `(jc,pc)` state (`n_buf_*`,
+   `n_desc_*`, `k_buf_*`, `packed_b`) and per-`ic` state (`m_buf_*`,
+   `m_desc_*`, `packed_a`) are disjoint fields today, so a future
+   parallelization over `ic` is not precluded, but would need the M-side
+   extracted into a per-worker struct — a design note for a future
+   threading milestone, not an action now.
