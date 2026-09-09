@@ -67,8 +67,10 @@ function build_plain(::Type{T}, spec::ShapeSpec, rng) where {T}
     Bmat = randn(rng, T, spec.Ka, spec.Na)
     Cmat = zeros(T, spec.Ma, spec.Na)
     Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
-    return (Av = Av, indA = (1, 2), Bv = Bv, indB = (2, 3), Cv = Cv, indC = (1, 3),
-        Amat = Amat, Bmat = Bmat, Cmat = Cmat)
+    return (
+        Av = Av, indA = (1, 2), Bv = Bv, indB = (2, 3), Cv = Cv, indC = (1, 3),
+        Amat = Amat, Bmat = Bmat, Cmat = Cmat,
+    )
 end
 
 # 3-index / scattered-C fixture (permuted A, negative-stride B,
@@ -122,7 +124,7 @@ function print_header(io::IO)
             " W(SIMD)=", lanewidth(simdk)
         )
     end
-    println(io, "date = ", now())
+    return println(io, "date = ", now())
 end
 print_header(stdout)
 
@@ -148,7 +150,7 @@ function log_row(kernel_name, T, shapename, Ma, Ka, Na, method, mc, kc, nc, reps
         "$kernel_name,$T,$shapename,$Ma,$Ka,$Na,$method,$mc,$kc,$nc,$reps,",
         @sprintf("%.9f", t)
     )
-    flush(csv_io)
+    return flush(csv_io)
 end
 
 # Canary: a small, fixed case run at the start / middle / end of the sweep
