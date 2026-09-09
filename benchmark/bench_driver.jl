@@ -231,7 +231,7 @@ for (kname, kctor) in pairs(KERNEL_CTORS)
                 t = median_time_s(() -> execute!(plan, 1.0, 0.0); reps = 9)
                 log_row(
                     kname, T, spec.name, spec.Ma, spec.Ka, spec.Na,
-                    "execute!", mc, kc, nc, 5, t
+                    "execute!", mc, kc, nc, 9, t
                 )
                 push!(
                     raw_execute,
@@ -258,7 +258,7 @@ for (kname, kctor) in pairs(KERNEL_CTORS)
             t = median_time_s(() -> execute_tilewise!(plan, 1.0, 0.0); reps = 9)
             log_row(
                 kname, T, spec.name, spec.Ma, spec.Ka, spec.Na,
-                "execute_tilewise!", mc, kc, nc, 5, t
+                "execute_tilewise!", mc, kc, nc, 9, t
             )
         end
     end
@@ -274,7 +274,7 @@ for T in DTYPES
     for spec in MAIN_SHAPES
         fx = build_plain(T, spec, rng)
         t = median_time_s(() -> mul!(fx.Cmat, fx.Amat, fx.Bmat); reps = 9)
-        log_row("mul!", T, spec.name, spec.Ma, spec.Ka, spec.Na, "mul!", 0, 0, 0, 5, t)
+        log_row("mul!", T, spec.name, spec.Ma, spec.Ka, spec.Na, "mul!", 0, 0, 0, 9, t)
     end
 end
 
@@ -297,7 +297,7 @@ for (kname, kctor) in pairs(KERNEL_CTORS)
             t_exec = median_time_s(() -> execute!(plan, 1.0, 0.0); reps = 9)
             log_row(
                 kname, T, spec.name, spec.Ma, spec.Ka, spec.Na,
-                "execute!", mc, kc, nc, 5, t_exec
+                "execute!", mc, kc, nc, 9, t_exec
             )
             plan_tw = plan_contract(
                 fx.Cv, fx.Av, fx.indA, fx.Bv, fx.indB, fx.indC;
@@ -306,11 +306,11 @@ for (kname, kctor) in pairs(KERNEL_CTORS)
             t_tw = median_time_s(() -> execute_tilewise!(plan_tw, 1.0, 0.0); reps = 9)
             log_row(
                 kname, T, spec.name, spec.Ma, spec.Ka, spec.Na,
-                "execute_tilewise!", mc, kc, nc, 5, t_tw
+                "execute_tilewise!", mc, kc, nc, 9, t_tw
             )
             if kname == :ScalarKernel  # mul! doesn't depend on kernel; log once
                 t_mul = median_time_s(() -> mul!(fx.Cmat, fx.Amat, fx.Bmat); reps = 9)
-                log_row("mul!", T, spec.name, spec.Ma, spec.Ka, spec.Na, "mul!", 0, 0, 0, 5, t_mul)
+                log_row("mul!", T, spec.name, spec.Ma, spec.Ka, spec.Na, "mul!", 0, 0, 0, 9, t_mul)
             end
         end
 
@@ -322,7 +322,7 @@ for (kname, kctor) in pairs(KERNEL_CTORS)
             kernel = kernel, mc = mc, kc = kc, nc = nc
         )
         t_exec = median_time_s(() -> execute!(plan, 1.0, 0.0); reps = 9)
-        log_row(kname, T, "scattered_a64k64b16n64", 64, 64, 64, "execute!", mc, kc, nc, 5, t_exec)
+        log_row(kname, T, "scattered_a64k64b16n64", 64, 64, 64, "execute!", mc, kc, nc, 9, t_exec)
         plan_tw = plan_contract(
             fx.Cv, fx.Av, fx.indA, fx.Bv, fx.indB, fx.indC;
             kernel = kernel, mc = mc, kc = kc, nc = nc
@@ -330,7 +330,7 @@ for (kname, kctor) in pairs(KERNEL_CTORS)
         t_tw = median_time_s(() -> execute_tilewise!(plan_tw, 1.0, 0.0); reps = 9)
         log_row(
             kname, T, "scattered_a64k64b16n64", 64, 64, 64,
-            "execute_tilewise!", mc, kc, nc, 5, t_tw
+            "execute_tilewise!", mc, kc, nc, 9, t_tw
         )
     end
 end

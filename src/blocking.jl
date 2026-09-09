@@ -29,13 +29,14 @@ end
     default_blocking(kernel) -> Blocking
 
 Default cache-blocking factors for `kernel`, dispatched on
-`scalartype(kernel)`. **Provisional**: these are hardcoded, single-machine
-placeholders (docs/decisions.md, "Block-size policy"), not derived from any
-cache model and not yet sweep-measured for this milestone -- Phase E
-replaces them and records provenance in `docs/decisions.md`. Values are the
-*requested* `mc`/`nc` (not yet rounded to `mr(kernel)`/`nr(kernel)`
-multiples -- `plan_contract` does that, and also clamps everything to the
-contraction's actual extents).
+`scalartype(kernel)`. Hardcoded, single-machine constants
+(docs/decisions.md, "Block-size policy"), not derived from any cache model
+-- measured by the Phase E benchmark sweep on the reference machine
+(Cascade Lake; see `benchmark/results/.../PROVENANCE.txt` and
+`docs/decisions.md`'s "Macro-blocking milestone" -> Phase E for the grid,
+chosen values, and runner-up spread). Values are the *requested* `mc`/`nc`
+(not yet rounded to `mr(kernel)`/`nr(kernel)` multiples -- `plan_contract`
+does that, and also clamps everything to the contraction's actual extents).
 """
 default_blocking(kernel) = default_blocking(scalartype(kernel))
 
