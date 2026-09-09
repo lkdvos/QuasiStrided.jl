@@ -235,7 +235,7 @@ end
     Cmat = copy(Cstart)
 
     plan = _dense_plan(Cmat, Amat, Bmat, kernel, mc, kc, nc)
-    poisoned = _poison_plan_scratch_buffers!(plan)
+    poisoned = _poison_plan_scratch_buffers!(plan.workspace)
     if isempty(poisoned)
         @warn "macro driver staleness test: no plan field matched the packed/index-buffer " *
             "heuristic; fields were $(fieldnames(typeof(plan)))."
@@ -248,7 +248,7 @@ end
 
     # Again on the same (reused) plan: targets staleness across calls, as
     # opposed to across the blocks of one call.
-    _poison_plan_scratch_buffers!(plan)
+    _poison_plan_scratch_buffers!(plan.workspace)
     copyto!(Cmat, Cstart)
     QuasiStrided.execute!(plan, alpha, beta)
     @test isapprox(Cmat, expected; rtol = _macro_rtol(Float64, Ka))

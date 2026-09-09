@@ -1,0 +1,12 @@
+git_commit = 314c47f552e84ea9c1e4dc39848d937636aace2e
+command = julia --project=. benchmark/bench_tensoroperations.jl
+cpu = cascadelake
+julia = 1.12.6
+nthreads = 1 blas_threads = 1
+date = 2026-09-09T10:58:23.533
+backends = [:StridedNative, :StridedBLAS, :QuasiStrided]
+dtypes = DataType[Float64, Float32]
+shapes = ["64^3", "128^3", "256^3", "512^3", "shallowK_256x24x256", "1024x256x1024"]
+reps = 9
+caveat = single machine (ccqlin038.flatironinstitute.org), single measurement session; 
+  not averaged across machines or repeated sessions. Numbers are indicative of this reference machine only, matching the caveat in the macro-blocking milestone's benchmark/results/ccqlin038.flatironinstitute.org-2026-09-08/PROVENANCE.txt.

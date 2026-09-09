@@ -23,6 +23,8 @@
 # to measure rather than assume.
 
 using QuasiStrided
+using QuasiStrided: AxisGroup, axis_length, offsets, fill_offsets!, describe_block,
+    block_descriptors!, normalize_group
 using Printf
 
 # ------------------------------------------------------------------------
