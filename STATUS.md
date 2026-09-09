@@ -103,11 +103,34 @@ by marking the two allocation assertions `skip=(VERSION < v"1.11")` in
 gap stays visible rather than hidden. `julia = "1.10"` compat is otherwise
 honored (all 13026 correctness assertions pass on 1.10).
 
+## Macro-blocking milestone (in progress)
+
+Opened 2026-09-08. Goal: replace `execute!`'s tile-by-tile loop with a
+BLIS five-loop (`NC`/`KC`/`MC`) macro-blocking nest with packed-panel reuse.
+Full design and orchestration plan recorded in the session's plan file;
+narrative decisions in `docs/decisions.md`'s "Macro-blocking milestone"
+section (frozen interfaces, block-size policy, allocation root-cause).
+
+`fable_review_macro_used: false` (the Phase 2b Fable review above is spent
+on the prior milestone and does not carry over; a new one is budgeted for
+this milestone's Phase D).
+
+- [x] **Phase A** (scout + diagnose): interface/CPU inventory done; the
+      residual `execute!` allocation noted below (~10.7 KB scalar / ~5.9 KB
+      SIMD) is now root-caused — `axis_from_descriptor`'s
+      `Union{AffineAxis,ScatterAxis}` leaves `QSTile`'s type parameters
+      unresolved, forcing heap-allocated tiles and a dynamic
+      `execute_tile!` call that boxes `alpha`/`beta`. Fix folded into the
+      Phase C rewrite (see `docs/decisions.md`).
+- [ ] Phase B (interface additions: `first`-offset overloads,
+      `AbstractVector` packing widening)
+- [ ] Phase C (macro-kernel rewrite + independent oracle tests)
+- [ ] Phase D (one Fable review of the integrated macro path)
+- [ ] Phase E (benchmark sweep, replace provisional block-size constants)
+- [ ] Phase F (final review, docs, CI, merge)
+
 ## Next task
 
-None outstanding for this milestone's original scope. If continuing
-performance work, two known items: (1) `execute!`'s residual driver-loop
-allocation (see above), (2) whether the Julia-1.10 SIMD allocation gap is
-fixable without restructuring `_accumulate_step`. Otherwise, a future
-session extending scope should start by reading `docs/decisions.md` in
-full, then the two specs' "Deferred work"/"Deferred extensions" sections.
+Continue the macro-blocking milestone above (Phase B next). Otherwise, a
+future session extending scope should start by reading `docs/decisions.md`
+in full, then the two specs' "Deferred work"/"Deferred extensions" sections.

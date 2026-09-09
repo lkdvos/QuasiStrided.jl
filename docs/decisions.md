@@ -292,3 +292,127 @@ finding, scaling with (M-tiles × N-tiles × K-panels) — 8×11×2×2 (A and B)
 352 pack calls for this shape, consistent with the measured totals.
 
 `Pkg.test()` after Phase 4 fixes: 12627/12627 passing.
+
+## Macro-blocking milestone: Phase A scouting and interface freeze
+
+Base revision `d4ab46b` (clean). This milestone replaces `execute!`'s
+tile-by-tile loop with a BLIS five-loop (`NC`/`KC`/`MC`) macro-blocking nest
+with packed-panel reuse. Orchestration plan: see the session's saved plan;
+narrative decisions recorded here as they're made.
+
+### Phase A findings (scouting + allocation root-cause)
+
+**Reference machine** (same one used throughout this project): Xeon Gold
+6244, Cascade Lake, 2 sockets x 8 cores, L1d 32 KiB/core, L2 1 MiB/core
+(16 MiB / 16 instances), L3 ~24.75 MiB/socket (49.5 MiB / 2 instances),
+Julia 1.12.6. All defaults chosen this milestone are single-machine
+measurements unless a second machine class is explicitly recorded.
+
+**`SIMD.vload` accepts a contiguous `SubArray` view** of a `Vector`
+(confirmed: `FastContiguousArray` in SIMD.jl's `arrayops.jl` includes
+`Base.FastContiguousSubArray`; a direct `vload(Vec{4,Float64}, view(...), 1)`
+call succeeds). So widening `pack_a!`/`pack_b!` to accept `AbstractVector{T}`
+requires no change on the kernel/consume side — `execute_tile!` already
+takes `AbstractVector{T}`.
+
+**Root cause of the existing residual `execute!` allocation** (documented as
+open in `STATUS.md`, not previously diagnosed): reproduced at exactly
+10656 B (ScalarKernel) / 5904 B (SIMDKernel) for the `test_driver.jl`
+9x10x8/kc_panel=4 case, matching `STATUS.md`'s figures. `Profile.Allocs` +
+`@code_warntype` confirm: `axis_from_descriptor` returns
+`Union{AffineAxis, ScatterAxis}`; every `QSTile` built from such an axis
+(`destination`, `source_A`, `source_B` in `execute!`) infers only as the
+partially-applied `QuasiStrided.QSTile{Memory{Float64}}` — an `UnionAll`
+left open over its `R`/`C` type parameters — which is heap-boxed on every
+construction (80 B x 63 constructions = 5040 B). The resulting
+`execute_tile!(kernel, destination, ...)` call becomes a **dynamic
+(generic) call** (confirmed in IR: no `invoke`/`Core.Const` resolution),
+which boxes its scalar arguments (`alphaT`/`beta_eff`: 16 B x 54 = 864 B).
+The remaining 4752 B is `ScalarKernel`'s already-spec-accepted
+`zero_accumulator` `Matrix` allocation (176 B/call x 27), unrelated to this
+bug and out of scope.
+
+**Binding requirement for Phase C (the macro-kernel rewrite):** a
+`Union{AffineAxis,ScatterAxis}` value must never flow into a data structure
+(`QSTile` or its replacement) that is then passed on to further
+type-unstable code inside the hot loop. Each block's regularity
+(`descriptor.regular`) must be branched on **once**, dispatching to a
+concrete-typed inner function/method for that iteration, so no `Union`
+crosses a function boundary into packing/kernel calls. Verify with
+`@code_warntype` that no local downstream of `axis_from_descriptor` ever
+prints as `Union{...}` or as a partially-applied `QSTile{Memory{Float64}}`
+missing its `R`/`C` parameters — that specific pattern, not a small
+few-way union, is the actual trigger. This closes the existing open
+allocation item as a side effect of the rewrite (§2 of the plan sets this
+as a hard target: 0 B for `SIMDKernel` on Julia >= 1.11, bounded for
+`ScalarKernel`).
+
+### Frozen interface additions (additive; commit before any Phase B/C worker launches)
+
+1. `describe_block(buffer::Vector{Int}, first::Int, count::Int)::BlockDescriptor`
+   — classify `buffer[first+1 : first+count]` (zero-based `first`). The
+   existing 2-arg `describe_block(buffer, count)` becomes
+   `describe_block(buffer, 0, count)` (kept, unchanged behavior/signature,
+   forwarding).
+2. `axis_from_descriptor(descriptor::BlockDescriptor, buffer::Vector{Int}, first::Int)`
+   — `AffineAxis` when regular, else `ScatterAxis(view(buffer, first+1 :
+   first+count), count)`. Existing 2-arg form forwards with `first = 0`.
+3. `pack_a!`/`pack_b!` (`src/packing.jl`) widen their `packed` parameter from
+   `Vector{T}` to `AbstractVector{T}`, so a macro panel view can be packed
+   into directly. `_check_packed_eltype` and `_pack_panel!` widen the same
+   way. `src/kernel.jl`'s two forwarding methods (`pack_a!`/`pack_b!` for
+   `DescriptorKernel`) widen identically — this was the exact site of the
+   Phase 2b finding-5 recurrence (missing `where`-bound forwarding
+   parameter), so the Phase B implementer must re-verify zero allocation on
+   the widened signature, not assume it's preserved. Packed offset formulas
+   (`i + MR*p`, `j + NR*p`) are unchanged. No change to `pack_a!`/`pack_b!`'s
+   validation/never-allocates/padding contract.
+4. New: `struct Blocking; mc::Int; kc::Int; nc::Int; end` (fields >= 1),
+   `default_blocking(kernel) -> Blocking` (dispatches on kernel type/
+   scalartype so a future kernel can declare its own budget), and
+   `plan_contract(...; kernel, mc=nothing, kc=nothing, nc=nothing)`. Absent
+   keywords use `default_blocking(kernel)`. Effective values (stored on
+   `ContractPlan`, replacing the `kc_panel::Int` field): round `mc`/`nc` up
+   to whole `mr(kernel)`/`nr(kernel)` multiples, then
+   `mc_eff = min(mc_rounded, roundup(Qm, MRk))`,
+   `nc_eff = min(nc_rounded, roundup(Qn, NRk))`,
+   `kc_eff = min(kc, Qk)`. The `kc_panel` keyword and `ContractPlan.kc_panel`
+   field are **removed** (unregistered v0.1.0 API; only internal tests
+   reference it — the Phase C implementer owns migrating those tests to
+   `kc`/`mc`/`nc`).
+5. New, unexported: `execute_tilewise!(plan, alpha, beta)` — the current
+   `execute!` body verbatim (packs one `MR x kc`/`kc x NR` sliver per output
+   tile, no panel reuse), kept as the independent-of-the-macro-nest
+   correctness oracle. It continues to size its own buffers off `MR`/`NR`
+   only, not the new `mc`/`nc` blocks (or, if it shares `ContractPlan`'s
+   larger buffers, it must only ever address sliver 0 of them — the Phase C
+   implementer decides and documents which, since both satisfy "packs one
+   sliver, doesn't touch macro-block iteration").
+
+### Block-size policy (settled)
+
+Tunable keywords (`mc`, `kc`, `nc` on `plan_contract`) with hardcoded,
+measured, single-machine-labeled defaults via `default_blocking(kernel)`.
+Explicitly **not** an analytical or cache-probing model: `tensorcontract-rs`
+already tried exactly that and it is a recorded refutation there (A33: lost
+14-34% even on its own reference machine, failed on two further machine
+classes; A57: its L2-privacy assumption is false on Apple Silicon, where
+multiple P-cores share one L2 — relevant since this package's CI runs
+macOS). `docs/refuted.md` in that project also failed a depth-adaptive-MC
+attempt. Given MC is documented there as a wide plateau (16x range moves
+geomean <= 3%), a conservative hardcoded constant is forgiving, and a
+keyword lets a caller or future autotuner override without an API change.
+Phase C ships clearly-marked `# PROVISIONAL` constants; Phase E replaces
+them with sweep-measured values and records provenance here.
+
+### File ownership additions (append to the existing table)
+
+| File | Owner | Phase |
+| --- | --- | --- |
+| `src/axis_group.jl` (additive `describe_block`/related methods only), `src/tiles.jl` (additive `axis_from_descriptor` only), `src/packing.jl` (`AbstractVector` widening only), `test/test_axis_group.jl`/`test_packing.jl` (additive tests) | interface implementer | Macro-B |
+| `src/blocking.jl` (new), `src/driver.jl`, `test/test_driver.jl` | macro-kernel implementer | Macro-C |
+| `test/test_macro_driver.jl` (new) | oracle/test implementer | Macro-C |
+| `benchmark/bench_driver.jl` (new) | benchmark implementer | Macro-E |
+
+`src/kernel.jl` (beyond the two forwarding methods above), `src/kernels/simd.jl`,
+`src/kernel_descriptor.jl` remain frozen this milestone.
