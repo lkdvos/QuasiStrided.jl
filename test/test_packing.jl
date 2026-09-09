@@ -122,6 +122,48 @@ end
     @test axreg.base == 15 && axreg.stride == 1
 end
 
+@testset "axis_from_descriptor: 3-arg (descriptor, buffer, first)" begin
+    # Regular slice with first > 0: axis_offset(ax, t) for 0 <= t < count
+    # must equal buf[first+1+t].
+    buf = [99, 99, 7, 10, 13, 16, -1, -1]
+    first = 2
+    count = 4
+    d = describe_block(buf, first, count)
+    @test d.regular
+    ax = axis_from_descriptor(d, buf, first)
+    @test ax isa AffineAxis
+    for t in 0:(count - 1)
+        @test axis_offset(ax, t) == buf[first + 1 + t]
+    end
+
+    # Irregular slice with first > 0.
+    bufi = [-1, -1, 0, 5, 1, 6, -1]
+    firsti = 2
+    counti = 4
+    di = describe_block(bufi, firsti, counti)
+    @test !di.regular
+    axi = axis_from_descriptor(di, bufi, firsti)
+    @test axi isa ScatterAxis
+    for t in 0:(counti - 1)
+        @test axis_offset(axi, t) == bufi[firsti + 1 + t]
+    end
+
+    # ScatterAxis borrows the slice: mutating the buffer at the relevant
+    # position is visible through the axis.
+    bufi[firsti + 1] = 555
+    @test axis_offset(axi, 0) == 555
+
+    # first = 0 (3-arg) must agree with the 2-arg form.
+    buf2 = [7, 10, 13, 16]
+    d2 = describe_block(buf2, 4)
+    ax2a = axis_from_descriptor(d2, buf2)
+    ax2b = axis_from_descriptor(d2, buf2, 0)
+    @test ax2a isa AffineAxis && ax2b isa AffineAxis
+    for t in 0:3
+        @test axis_offset(ax2a, t) == axis_offset(ax2b, t)
+    end
+end
+
 # =====================================================================
 # QSTile (SourceTile / DestinationTile) addressing
 # =====================================================================
@@ -698,4 +740,112 @@ end
 
     @test run_forwarding(ScalarKernel(Val(8), Val(6), Float64)) == (0, 0)
     @test run_forwarding(SIMDKernel(Val(8), Val(6), Float64)) == (0, 0)
+end
+
+# =====================================================================
+# Macro-blocking milestone: pack_a!/pack_b! widened to AbstractVector,
+# packing into a panel-sliver view of a larger buffer.
+# =====================================================================
+
+@testset "pack_a!/pack_b!: packing into a SubArray view matches a fresh Vector" begin
+    kernel = KernelDescriptor(Val(4), Val(3), Float64)
+    MR, NR = mr(kernel), nr(kernel)
+    kc = 5
+    storage = collect(1.0:1000.0)
+
+    sourceA = SourceTile(storage, 10, AffineAxis(0, 1, MR), AffineAxis(0, 4, kc))
+    neededA = packed_a_length(kernel, kc)
+    freshA = zeros(Float64, neededA)
+    pack_a!(freshA, sourceA, kernel, identity)
+
+    bigA = zeros(Float64, neededA + 20)
+    r = 6:(6 + neededA - 1)
+    viewA = view(bigA, r)
+    @test viewA isa SubArray
+    pack_a!(viewA, sourceA, kernel, identity)
+    @test viewA == freshA
+    @test bigA[r] == freshA
+
+    sourceB = SourceTile(storage, 20, AffineAxis(0, 1, kc), AffineAxis(0, kc, NR))
+    neededB = packed_b_length(kernel, kc)
+    freshB = zeros(Float64, neededB)
+    pack_b!(freshB, sourceB, kernel, identity)
+
+    bigB = zeros(Float64, neededB + 20)
+    rB = 4:(4 + neededB - 1)
+    viewB = view(bigB, rB)
+    @test viewB isa SubArray
+    pack_b!(viewB, sourceB, kernel, identity)
+    @test viewB == freshB
+    @test bigB[rB] == freshB
+end
+
+@testset "pack_a!/pack_b!: canary bytes outside a middle panel view untouched" begin
+    kernel = KernelDescriptor(Val(4), Val(3), Float64)
+    MR, NR = mr(kernel), nr(kernel)
+    kc = 5
+    storage = collect(1.0:1000.0)
+    sentinel = -123456.0
+
+    sourceA = SourceTile(storage, 0, AffineAxis(0, 1, MR), AffineAxis(0, 4, kc))
+    neededA = packed_a_length(kernel, kc)
+
+    bigA = fill(sentinel, neededA + 30)
+    lo, hi = 9, 9 + neededA - 1
+    r = lo:hi
+    pack_a!(view(bigA, r), sourceA, kernel, identity)
+    @test all(==(sentinel), bigA[1:(lo - 1)])
+    @test all(==(sentinel), bigA[(hi + 1):end])
+    @test !any(==(sentinel), bigA[r]) # packed region actually got written
+
+    sourceB = SourceTile(storage, 0, AffineAxis(0, 1, kc), AffineAxis(0, kc, NR))
+    neededB = packed_b_length(kernel, kc)
+    bigB = fill(sentinel, neededB + 30)
+    loB, hiB = 12, 12 + neededB - 1
+    rB = loB:hiB
+    pack_b!(view(bigB, rB), sourceB, kernel, identity)
+    @test all(==(sentinel), bigB[1:(loB - 1)])
+    @test all(==(sentinel), bigB[(hiB + 1):end])
+    @test !any(==(sentinel), bigB[rB])
+end
+
+@testset "pack_a!/pack_b!: zero steady-state allocation packing into a SubArray view" begin
+    function run_view(kernel_ctor)
+        kernel = kernel_ctor(Val(8), Val(6), Float64)
+        bigA = zeros(mr(kernel) * 4 + 40)
+        bigB = zeros(nr(kernel) * 4 + 40)
+        viewA = view(bigA, 5:(5 + mr(kernel) * 4 - 1))
+        viewB = view(bigB, 3:(3 + nr(kernel) * 4 - 1))
+
+        src_a_affine = SourceTile(rand(1000), 0, AffineAxis(0, 1, mr(kernel)), AffineAxis(0, mr(kernel), 4))
+        src_b_affine = SourceTile(rand(1000), 0, AffineAxis(0, 1, 4), AffineAxis(0, 4, nr(kernel)))
+
+        offs_rows = collect(0:(mr(kernel) - 1))
+        offs_cols = [0, 8, 16, 24]
+        src_a_scatter = SourceTile(rand(1000), 0, ScatterAxis(offs_rows, mr(kernel)), ScatterAxis(offs_cols, 4))
+
+        offs_rows_b = collect(0:3)
+        offs_cols_b = collect(0:(nr(kernel) - 1)) .* 4
+        src_b_scatter = SourceTile(rand(1000), 0, ScatterAxis(offs_rows_b, 4), ScatterAxis(offs_cols_b, nr(kernel)))
+
+        pack_a!(viewA, src_a_affine, kernel, identity)
+        a_affine = @allocated pack_a!(viewA, src_a_affine, kernel, identity)
+        pack_b!(viewB, src_b_affine, kernel, identity)
+        b_affine = @allocated pack_b!(viewB, src_b_affine, kernel, identity)
+
+        pack_a!(viewA, src_a_scatter, kernel, identity)
+        a_scatter = @allocated pack_a!(viewA, src_a_scatter, kernel, identity)
+        pack_b!(viewB, src_b_scatter, kernel, identity)
+        b_scatter = @allocated pack_b!(viewB, src_b_scatter, kernel, identity)
+
+        return (a_affine, b_affine, a_scatter, b_scatter)
+    end
+
+    # Direct KernelDescriptor.
+    @test run_view(KernelDescriptor) == (0, 0, 0, 0)
+
+    # Via ScalarKernel/SIMDKernel forwarding (the exact site of the Phase 2b
+    # finding-5 recurrence, now widened to AbstractVector).
+    @test run_view(ScalarKernel) == (0, 0, 0, 0)
+    @test run_view(SIMDKernel) == (0, 0, 0, 0)
 end

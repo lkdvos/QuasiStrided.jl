@@ -221,22 +221,38 @@ end
 Classify `buffer[1:count]` (read-only) as empty/singleton/affine/irregular
 (overflow-checked adjacent differences; a non-representable diff is
 irregular). Throws `ArgumentError`/`DimensionMismatch` for bad `count`.
+Forwards to [`describe_block(buffer, first, count)`](@ref) with `first = 0`.
 """
-function describe_block(buffer::Vector{Int}, count::Int)
+describe_block(buffer::Vector{Int}, count::Int) = describe_block(buffer, 0, count)
+
+"""
+    describe_block(buffer::Vector{Int}, first::Int, count::Int)::BlockDescriptor
+
+Classify `buffer[first+1 : first+count]` (zero-based `first`, read-only) as
+empty/singleton/affine/irregular (overflow-checked adjacent differences; a
+non-representable diff is irregular). Throws `ArgumentError`/
+`DimensionMismatch` for bad `first`/`count`.
+"""
+function describe_block(buffer::Vector{Int}, first::Int, count::Int)
+    first >= 0 || throw(ArgumentError("first must be nonnegative, got $first"))
     count >= 0 || throw(ArgumentError("count must be nonnegative, got $count"))
-    count <= length(buffer) ||
-        throw(DimensionMismatch("buffer length $(length(buffer)) is less than count $count"))
+    first + count <= length(buffer) ||
+        throw(
+        DimensionMismatch(
+            "buffer length $(length(buffer)) is less than first+count = $(first + count)"
+        )
+    )
 
     count == 0 && return BlockDescriptor(0, 0, 0, true)
 
-    @inbounds base = buffer[1]
+    @inbounds base = buffer[first + 1]
     count == 1 && return BlockDescriptor(base, 0, 1, true)
 
-    @inbounds stride, overflowed = Base.Checked.sub_with_overflow(buffer[2], buffer[1])
+    @inbounds stride, overflowed = Base.Checked.sub_with_overflow(buffer[first + 2], buffer[first + 1])
     overflowed && return BlockDescriptor(base, 0, count, false)
 
     @inbounds for t in 2:(count - 1)
-        diff, ovf = Base.Checked.sub_with_overflow(buffer[t + 1], buffer[t])
+        diff, ovf = Base.Checked.sub_with_overflow(buffer[first + t + 1], buffer[first + t])
         (ovf || diff != stride) && return BlockDescriptor(base, 0, count, false)
     end
 

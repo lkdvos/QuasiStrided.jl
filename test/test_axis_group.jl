@@ -658,6 +658,50 @@ end
     @test_throws DimensionMismatch describe_block([1, 2], 3)
 end
 
+@testset "describe_block: 3-arg (first, count) matches 2-arg on the extracted slice" begin
+    rng = Random.MersenneTwister(0xDE5C812E)
+
+    # Explicit edge cases: regular/affine, irregular/scattered, empty, singleton,
+    # and first > 0 including near the end of a larger buffer.
+    cases = [
+        (collect(0:2:20), 0, 6),        # regular, first = 0
+        (collect(0:2:20), 3, 4),        # regular, first > 0
+        ([0, 5, 1, 6, 9, 2, 100], 1, 4), # irregular slice
+        ([0, 5, 1, 6, 9, 2, 100], 0, 0), # empty at start
+        ([0, 5, 1, 6, 9, 2, 100], 7, 0), # empty at end (first == length(buffer))
+        ([42], 0, 1),                    # singleton
+        ([1, 2, 42, 3], 2, 1),           # singleton, first > 0
+        (collect(1:10), 8, 2),           # first near the end
+        (collect(1:10), 9, 1),           # first at the very last valid start
+        (collect(1:10), 10, 0),          # first == length(buffer), empty
+    ]
+    for (buf, first, count) in cases
+        d3 = describe_block(buf, first, count)
+        d2 = describe_block(copy(buf[(first + 1):(first + count)]), count)
+        @test (d3.base, d3.stride, d3.count, d3.regular) ==
+            (d2.base, d2.stride, d2.count, d2.regular)
+    end
+
+    # Randomized coverage across regular/irregular buffers.
+    for _trial in 1:100
+        n = rand(rng, 1:20)
+        buf = rand(rng, Bool) ? collect(1:n) .* rand(rng, 1:5) : rand(rng, -50:50, n) # regular or irregular
+        first = rand(rng, 0:n)
+        count = rand(rng, 0:(n - first))
+        d3 = describe_block(buf, first, count)
+        d2 = describe_block(copy(buf[(first + 1):(first + count)]), count)
+        @test (d3.base, d3.stride, d3.count, d3.regular) ==
+            (d2.base, d2.stride, d2.count, d2.regular)
+    end
+end
+
+@testset "describe_block: 3-arg invalid arguments" begin
+    @test_throws ArgumentError describe_block([1, 2, 3], -1, 1)
+    @test_throws ArgumentError describe_block([1, 2, 3], 0, -1)
+    @test_throws DimensionMismatch describe_block([1, 2, 3], 2, 2) # first+count=4 > length=3
+    @test_throws DimensionMismatch describe_block([1, 2], 3, 0)    # first > length
+end
+
 @testset "describe_block: overflow fixtures" begin
     d = describe_block([typemin(Int), typemax(Int)], 2)
     @test d.regular == false

@@ -27,9 +27,16 @@ packed_a_length(k::DescriptorKernel, kc::Int) = packed_a_length(k.descriptor, kc
 packed_b_length(k::DescriptorKernel, kc::Int) = packed_b_length(k.descriptor, kc)
 
 # pack_a!/pack_b! dispatch on a bare KernelDescriptor; forward any wrapper.
-pack_a!(packed::Vector{T}, source::QSTile, kernel::DescriptorKernel{MR, NR, T}, transform::F) where {T, MR, NR, F} =
+# `packed` and `kernel` (via `K`) each carry their own free type parameter,
+# alongside `transform`'s `F` — a forwarding parameter left unbound here is
+# exactly the Phase 2b finding-5 recurrence site (docs/decisions.md).
+pack_a!(
+    packed::V, source::QSTile, kernel::K, transform::F
+) where {T, V <: AbstractVector{T}, MR, NR, K <: DescriptorKernel{MR, NR, T}, F} =
     pack_a!(packed, source, kernel.descriptor, transform)
-pack_b!(packed::Vector{T}, source::QSTile, kernel::DescriptorKernel{MR, NR, T}, transform::F) where {T, MR, NR, F} =
+pack_b!(
+    packed::V, source::QSTile, kernel::K, transform::F
+) where {T, V <: AbstractVector{T}, MR, NR, K <: DescriptorKernel{MR, NR, T}, F} =
     pack_b!(packed, source, kernel.descriptor, transform)
 
 """

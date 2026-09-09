@@ -2,7 +2,7 @@
 # (A: i + MR*p, B: j + NR*p; do not redefine).
 
 # Explicit runtime check (not dispatch) so a mismatch raises ArgumentError.
-@inline function _check_packed_eltype(packed::Vector{T1}, kernel::KernelDescriptor{MR, NR, T2}) where {T1, MR, NR, T2}
+@inline function _check_packed_eltype(packed::AbstractVector{T1}, kernel::KernelDescriptor{MR, NR, T2}) where {T1, MR, NR, T2}
     T1 === T2 ||
         throw(ArgumentError("packed buffer eltype $T1 does not match kernel scalar type $T2"))
     return nothing
@@ -11,9 +11,9 @@ end
 # Shared inner loop for pack_a!/pack_b!; `load`/`packed_offset` close over the
 # operand-specific index mapping. `kc == 0` is handled by the caller.
 @inline function _pack_panel!(
-        packed::Vector{T}, physical_dim::Int, kc::Int, valid::Int,
+        packed::V, physical_dim::Int, kc::Int, valid::Int,
         transform::F, load::L, packed_offset::P
-    ) where {T, F, L, P}
+    ) where {T, V <: AbstractVector{T}, F, L, P}
     @inbounds for p in 0:(kc - 1)
         for i in 0:(physical_dim - 1)
             v = i < valid ? convert(T, transform(load(i, p)))::T : zero(T)
@@ -24,20 +24,20 @@ end
 end
 
 """
-    pack_a!(packed::Vector{T}, source::QSTile, kernel::KernelDescriptor{MR,NR,T}, transform) -> packed
+    pack_a!(packed::AbstractVector{T}, source::QSTile, kernel::KernelDescriptor{MR,NR,T}, transform) -> packed
 
-Pack an A source tile into `packed` (reused buffer) at
-`packed_a_offset(kernel, i, p) == i + mr(kernel)*p`. `source` has
-`0 <= m <= mr(kernel)` rows and `kc = ncols(source)` columns; `packed` needs
-`length >= packed_a_length(kernel, kc)`. Row `i < m` writes
-`convert(T, transform(A[i,p]))`; padding rows (`i >= m`) write `zero(T)`
-without reading `source` or calling `transform`. `kc == 0` is a no-op. All
-validation happens before any write. Never allocates.
+Pack an A source tile into `packed` (reused buffer, e.g. a `Vector{T}` or a
+`SubArray` panel sliver) at `packed_a_offset(kernel, i, p) == i +
+mr(kernel)*p`. `source` has `0 <= m <= mr(kernel)` rows and `kc =
+ncols(source)` columns; `packed` needs `length >= packed_a_length(kernel,
+kc)`. Row `i < m` writes `convert(T, transform(A[i,p]))`; padding rows (`i >=
+m`) write `zero(T)` without reading `source` or calling `transform`. `kc ==
+0` is a no-op. All validation happens before any write. Never allocates.
 """
 function pack_a!(
-        packed::Vector{T}, source::QSTile, kernel::KernelDescriptor{MR, NR, T2},
+        packed::V, source::QSTile, kernel::KernelDescriptor{MR, NR, T2},
         transform::F
-    ) where {T, MR, NR, T2, F}
+    ) where {T, V <: AbstractVector{T}, MR, NR, T2, F}
     _check_packed_eltype(packed, kernel)
 
     m = nrows(source)
@@ -67,9 +67,10 @@ function pack_a!(
 end
 
 """
-    pack_b!(packed::Vector{T}, source::QSTile, kernel::KernelDescriptor{MR,NR,T}, transform) -> packed
+    pack_b!(packed::AbstractVector{T}, source::QSTile, kernel::KernelDescriptor{MR,NR,T}, transform) -> packed
 
-Pack a B source tile into `packed` at `packed_b_offset(kernel, j, p) == j +
+Pack a B source tile into `packed` (reused buffer, e.g. a `Vector{T}` or a
+`SubArray` panel sliver) at `packed_b_offset(kernel, j, p) == j +
 nr(kernel)*p` (not column-major). `source` has `kc = nrows(source)` rows and
 `0 <= n <= nr(kernel)` columns; `packed` needs `length >=
 packed_b_length(kernel, kc)`. Column `j < n` writes `convert(T,
@@ -77,9 +78,9 @@ transform(B[p,j]))`; padding columns write `zero(T)` without reading
 `source`. Same validation/allocation contract as [`pack_a!`](@ref).
 """
 function pack_b!(
-        packed::Vector{T}, source::QSTile, kernel::KernelDescriptor{MR, NR, T2},
+        packed::V, source::QSTile, kernel::KernelDescriptor{MR, NR, T2},
         transform::F
-    ) where {T, MR, NR, T2, F}
+    ) where {T, V <: AbstractVector{T}, MR, NR, T2, F}
     _check_packed_eltype(packed, kernel)
 
     kc = nrows(source)
