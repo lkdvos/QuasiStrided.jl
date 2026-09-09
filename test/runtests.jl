@@ -12,4 +12,5 @@ using QuasiStrided
     include("test_phase2_integration.jl")
     include("test_driver.jl")
     include("test_phase3_integration.jl")
+    include("test_macro_driver.jl")
 end
