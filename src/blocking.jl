@@ -39,10 +39,14 @@ contraction's actual extents).
 """
 default_blocking(kernel) = default_blocking(scalartype(kernel))
 
-# PROVISIONAL — Phase E replaces after measurement.
-default_blocking(::Type{Float64}) = Blocking(128, 256, 1536)
-# PROVISIONAL — Phase E replaces after measurement.
-default_blocking(::Type{Float32}) = Blocking(256, 384, 3072)
+# measured 2026-09-08, Cascade Lake (Xeon Gold 6244, ccqlin038; see
+# benchmark/results/ccqlin038.flatironinstitute.org-2026-09-08/PROVENANCE.txt
+# and docs/decisions.md, "Macro-blocking milestone" -> Phase E).
+default_blocking(::Type{Float64}) = Blocking(64, 128, 768)
+# measured 2026-09-08, Cascade Lake (Xeon Gold 6244, ccqlin038; see
+# benchmark/results/ccqlin038.flatironinstitute.org-2026-09-08/PROVENANCE.txt
+# and docs/decisions.md, "Macro-blocking milestone" -> Phase E).
+default_blocking(::Type{Float32}) = Blocking(96, 384, 1152)
 
 # Smallest multiple of `n` that is >= `x` (`x >= 0`, `n >= 1`).
 @inline _roundup(x::Int, n::Int) = cld(x, n) * n

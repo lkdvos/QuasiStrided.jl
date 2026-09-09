@@ -477,3 +477,104 @@ Disposition of each finding:
    parallelization over `ic` is not precluded, but would need the M-side
    extracted into a per-worker struct — a design note for a future
    threading milestone, not an action now.
+
+## Phase E: benchmark sweep and measured block-size defaults
+
+Machine: Xeon Gold 6244, Cascade Lake, 2x8 cores, L1d 32 KiB/core, L2
+1 MiB/core, L3 ~24.75 MiB/socket, hostname `ccqlin038`, single machine only
+— no second machine class was measured this phase, and none of this
+should be read as portable to a different microarchitecture (this
+project's own standing A56-style rule). Julia 1.12.6. Date 2026-09-08,
+`git` base revision `550468d`.
+
+Script: `benchmark/bench_driver.jl` (new). `julia --project=.
+benchmark/bench_driver.jl`, `Threads.nthreads() == 1`,
+`LinearAlgebra.BLAS.set_num_threads(1)`. Full raw output, chosen-default
+summary, canary CSV and `PROVENANCE.txt` are committed under
+`benchmark/results/ccqlin038.flatironinstitute.org-2026-09-08/`.
+
+**Grid actually run** (a first 9-point corners+center trial finished the
+whole script in ~24s, so the grid was widened to the following before the
+measurement run that produced the numbers below — nothing further needed
+cutting):
+
+* Shapes: `64^3`, `128^3`, `256^3`, `512^3`, a shallow-K case
+  (`256x24x256`), `1024x256x1024`, and a 3-index scattered/sliced-C-row
+  case (`A[a,k,b] B[k,n] -> C[a,n,b]`, `a=64,k=64,b=16,n=64`, adapted
+  directly from `test/test_macro_driver.jl`'s permuted-A /
+  negative-stride-B / sliced-with-offset-C fixture). 512^3 was not skipped
+  — the trial run showed 256^3 costs only ~5 ms/`execute!` call
+  (`ScalarKernel`), so 512^3 (~40 ms) fit the full grid comfortably.
+* `(mc,kc,nc)` grid: Float64 — `kc ∈ {128,256,512}`, `mc ∈
+  {64,128,256,512}`, `nc ∈ {768,1536,3072}` (36 combos; the task spec's
+  text said "27" but listed 4 `mc` values against 3 `kc`/`nc` values, which
+  multiplies to 36 — used the literal sets rather than guessing which
+  number was the typo). Float32 — an analogous grid scaled ~1.5x (`kc ∈
+  {192,384,768}`, `mc ∈ {96,192,384,768}`, `nc ∈ {1152,2304,4608}`, 36
+  combos), run for both `ScalarKernel` and `SIMDKernel`, both at register
+  shape `MR=8,NR=6` (`SIMDKernel`'s lane width `W=4` for `Float64`, `W=8`
+  for `Float32`). Full grid at all 5 main shapes; the two largest/extra
+  shapes (`1024x256x1024`, the scattered case) were run only at each
+  dtype's own middle-of-grid combo (both kernels), to check the grid
+  winner generalizes without paying for the full grid there too — this
+  is the one deliberate reduction from "grid x every shape".
+* 9 timed reps per point (plus 1 discarded warm-up), median reported. Not
+  the task spec's minimum-5 exactly, but higher (9) for better statistics,
+  since the machine time allowed it.
+
+**Canary bracket** (`64^3`, `Float64`, `SIMDKernel`, `mc,kc,nc =
+128,256,1536`, 15 reps, run at the start, the mid-point, and the end of the
+whole sweep): medians `2.5798e-5 s`, `2.5982e-5 s`, `2.5946e-5 s` —
+relative spread `(max-min)/min = 0.71%`. No drift detected during the run;
+the machine was exclusive throughout. (An earlier 7-rep trial on a smaller
+grid had shown a 43% spread on this same canary shape — a timer-resolution
+artefact at a ~25 microsecond measurement, not real drift; raising reps to
+15 resolved it. Recorded here because a shortfall like that is exactly
+what this bracket exists to catch, and it did.)
+
+**Chosen defaults** (geomean of `execute!` time, normalized per
+`(kernel,shape)` by that pair's own minimum across the grid so shapes of
+very different absolute cost weigh equally, computed jointly over both
+`ScalarKernel` and `SIMDKernel` since `default_blocking` dispatches only on
+`scalartype`, not kernel type — the two kernels share one constant per
+dtype):
+
+* **Float64: `mc=64, kc=128, nc=768`.** Geomean ratio 1.0588 (i.e. 5.88%
+  above the grid's best point). Unconstrained best was `mc=64, kc=512,
+  nc=1536` at 1.0098; the chosen point is within the project's own 6%
+  noise-floor convention of that best (4.85% worse) and is the
+  smallest-footprint (`mc*kc*nc`) point satisfying that bound. Runner-up
+  by geomean: `mc=64, kc=512, nc=768` at 1.0124 (a 0.26-point spread from
+  the unconstrained best).
+* **Float32: `mc=96, kc=384, nc=1152`.** Geomean ratio 1.0339 (2.49% above
+  the best). Unconstrained best was `mc=192, kc=768, nc=1152` at 1.0088;
+  runner-up `mc=96, kc=768, nc=4608` at 1.0110. The chosen point is again
+  the smallest footprint within 6% of the best.
+* Both rankings show the wide-plateau pattern this project's own MC
+  precedent predicts (docs/decisions.md, "Block-size policy" cites a 16x
+  range moving geomean <=3% elsewhere): most of each 36-point grid sits
+  within ~6% of its own best, and `kc` is the axis with the clearest signal
+  (small `kc` values are consistently worse for Float64; small `kc` is
+  worse for Float32 too — the worst Float32 points are all `kc=192`).
+
+**`execute!` vs `execute_tilewise!`**: `execute!` was faster than
+`execute_tilewise!` at **every one of the 28 measured
+`(kernel,dtype,shape)` combinations** — no shortfall to report. Speedup
+(best-grid `execute!` time vs. the single `execute_tilewise!` time at the
+mid-grid combo) ranged from 1.66x (`ScalarKernel`, `Float64`, `64^3` — the
+smallest case, where per-call overhead dominates) up to 10.5x
+(`SIMDKernel`, `Float32`, `512^3`). `SIMDKernel` consistently benefits more
+from macro-blocking than `ScalarKernel` (3.5x-10.5x vs. 1.66x-2.4x),
+consistent with panel-reuse mattering most once the micro-kernel itself is
+fast enough that repacking would otherwise dominate.
+
+The `mul!` reference line (BLAS-backed, not a competitor — see
+`benchmark/bench_driver.jl`'s header comment) is, as expected, faster than
+`execute!` throughout (2x-3x for `SIMDKernel`, 10x-36x for `ScalarKernel`);
+this is a reference point, not a regression.
+
+**Known limitations of this measurement**: one machine class only (Cascade
+Lake / AVX-512); the two largest/extra shapes were validated only at the
+mid-grid combo per dtype rather than the full 36-point grid; and the
+6%-noise-floor convention borrowed here is this project's own choice, not
+independently re-derived on this machine this phase.

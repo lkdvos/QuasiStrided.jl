@@ -141,7 +141,17 @@ recorded in `docs/decisions.md` once triaged).
       without action (one pre-existing, unchanged behavior; two design
       observations for a future threading milestone). Full disposition in
       `docs/decisions.md`. 12903/12903 passing.
-- [ ] Phase E (benchmark sweep, replace provisional block-size constants)
+- [x] **Phase E** (benchmark sweep, replace provisional block-size
+      constants): `benchmark/bench_driver.jl` written and run on
+      `ccqlin038` (Cascade Lake), single machine, 2026-09-08 — 7 shapes x a
+      36-combo `(mc,kc,nc)` grid per dtype x `ScalarKernel`/`SIMDKernel`.
+      `default_blocking` now returns measured values (`Float64:
+      mc=64,kc=128,nc=768`; `Float32: mc=96,kc=384,nc=1152`), no longer
+      `# PROVISIONAL`. `execute!` faster than `execute_tilewise!` at all 28
+      measured `(kernel,dtype,shape)` points (1.66x-10.5x). Full provenance
+      in `docs/decisions.md` ("Phase E") and
+      `benchmark/results/ccqlin038.flatironinstitute.org-2026-09-08/`.
+      `Pkg.test()` after the constant swap: 12903/12903 passing.
 - [ ] Phase F (final review, docs, CI, merge)
 
 ## Next task
