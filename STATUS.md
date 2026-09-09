@@ -122,9 +122,20 @@ this milestone's Phase D).
       unresolved, forcing heap-allocated tiles and a dynamic
       `execute_tile!` call that boxes `alpha`/`beta`. Fix folded into the
       Phase C rewrite (see `docs/decisions.md`).
-- [ ] Phase B (interface additions: `first`-offset overloads,
-      `AbstractVector` packing widening)
-- [ ] Phase C (macro-kernel rewrite + independent oracle tests)
+- [x] **Phase B** (interface additions): `describe_block`/`axis_from_descriptor`
+      `first`-offset overloads; `pack_a!`/`pack_b!` widened to
+      `AbstractVector{T}`. 12777/12777 passing.
+- [x] **Phase C** (macro-kernel rewrite + independent oracle): `execute!`
+      rewritten as a BLIS five-loop (`NC`/`KC`/`MC`) nest with packed-panel
+      reuse (`src/blocking.jl`, `src/driver.jl`); `execute_tilewise!` kept
+      unexported as the pre-existing-behavior oracle; independent
+      `test/test_macro_driver.jl` written blind to the implementation and
+      integrated. Closed the Phase A allocation bug as a side effect:
+      `execute!` measured 0 B (SIMDKernel) / 176 B-per-tile-only
+      (ScalarKernel, the already-accepted `zero_accumulator` cost) — no
+      residual driver-induced allocation. `@code_warntype` confirmed no
+      `Union`/partially-applied `QSTile` downstream of axis construction.
+      12901/12901 passing.
 - [ ] Phase D (one Fable review of the integrated macro path)
 - [ ] Phase E (benchmark sweep, replace provisional block-size constants)
 - [ ] Phase F (final review, docs, CI, merge)
