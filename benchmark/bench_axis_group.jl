@@ -66,45 +66,45 @@ interval_shapes = [
 # Timing helpers: separate warmup/compilation from steady-state execution.
 # ------------------------------------------------------------------------
 
-function time_offsets_reference(g, first, count; reps=2000)
+function time_offsets_reference(g, first, count; reps = 2000)
     # Warmup (forces compilation before timing).
     s = 0
-    for t in 0:count-1
+    for t in 0:(count - 1)
         s += sum(offsets(g, first + t))
     end
     t0 = time_ns()
     for _ in 1:reps
-        for t in 0:count-1
+        for t in 0:(count - 1)
             s += sum(offsets(g, first + t))
         end
     end
-    elapsed = (time_ns() - t0) / 1e9
+    elapsed = (time_ns() - t0) / 1.0e9
     return elapsed / reps, s  # seconds per rep; return s to prevent DCE
 end
 
-function time_fill_offsets!(bufs, g, first, count; reps=2000)
+function time_fill_offsets!(bufs, g, first, count; reps = 2000)
     fill_offsets!(bufs, g, first, count)  # warmup
     allocs = @allocated fill_offsets!(bufs, g, first, count)
     t0 = time_ns()
     for _ in 1:reps
         fill_offsets!(bufs, g, first, count)
     end
-    elapsed = (time_ns() - t0) / 1e9
+    elapsed = (time_ns() - t0) / 1.0e9
     return elapsed / reps, allocs
 end
 
-function time_block_descriptors!(bufs, g, first, count; reps=2000)
+function time_block_descriptors!(bufs, g, first, count; reps = 2000)
     block_descriptors!(bufs, g, first, count)  # warmup
     allocs = @allocated block_descriptors!(bufs, g, first, count)
     t0 = time_ns()
     for _ in 1:reps
         block_descriptors!(bufs, g, first, count)
     end
-    elapsed = (time_ns() - t0) / 1e9
+    elapsed = (time_ns() - t0) / 1.0e9
     return elapsed / reps, allocs
 end
 
-function time_describe_block(bufs, count; reps=2000)
+function time_describe_block(bufs, count; reps = 2000)
     P = length(bufs)
     descs = ntuple(p -> describe_block(bufs[p], count), P)  # warmup
     allocs = @allocated ntuple(p -> describe_block(bufs[p], count), P)
@@ -112,7 +112,7 @@ function time_describe_block(bufs, count; reps=2000)
     for _ in 1:reps
         ntuple(p -> describe_block(bufs[p], count), P)
     end
-    elapsed = (time_ns() - t0) / 1e9
+    elapsed = (time_ns() - t0) / 1.0e9
     return elapsed / reps, allocs
 end
 
@@ -124,10 +124,14 @@ println("Julia version: ", VERSION)
 println("CPU: ", Sys.cpu_info()[1].model, " (", length(Sys.cpu_info()), " logical cores reported)")
 println()
 
-@printf("%-16s %-16s %-10s %10s %12s %12s %10s\n",
-        "layout", "interval", "count", "offsets/el", "fill/call", "descr/call", "classify")
-@printf("%-16s %-16s %-10s %10s %12s %12s %10s\n",
-        "", "", "", "(ns)", "(ns, alloc)", "(ns, alloc)", "(ns)")
+@printf(
+    "%-16s %-16s %-10s %10s %12s %12s %10s\n",
+    "layout", "interval", "count", "offsets/el", "fill/call", "descr/call", "classify"
+)
+@printf(
+    "%-16s %-16s %-10s %10s %12s %12s %10s\n",
+    "", "", "", "(ns)", "(ns, alloc)", "(ns, alloc)", "(ns)"
+)
 
 for (glabel, g) in layouts
     P = length(g.strides)
@@ -147,11 +151,13 @@ for (glabel, g) in layouts
         fill_offsets!(bufs, g, first, count)
         t_cls, _ = time_describe_block(bufs, count)
 
-        @printf("%-16s %-16s %-10d %10.2f %8.1f/%-3d %8.1f/%-3d %10.2f\n",
-                glabel, ilabel, count,
-                t_offsets_per_el * 1e9,
-                t_fill * 1e9, a_fill,
-                t_bd * 1e9, a_bd,
-                t_cls * 1e9)
+        @printf(
+            "%-16s %-16s %-10d %10.2f %8.1f/%-3d %8.1f/%-3d %10.2f\n",
+            glabel, ilabel, count,
+            t_offsets_per_el * 1.0e9,
+            t_fill * 1.0e9, a_fill,
+            t_bd * 1.0e9, a_bd,
+            t_cls * 1.0e9
+        )
     end
 end
