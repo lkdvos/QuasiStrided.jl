@@ -111,9 +111,8 @@ Full design and orchestration plan recorded in the session's plan file;
 narrative decisions in `docs/decisions.md`'s "Macro-blocking milestone"
 section (frozen interfaces, block-size policy, allocation root-cause).
 
-`fable_review_macro_used: false` (the Phase 2b Fable review above is spent
-on the prior milestone and does not carry over; a new one is budgeted for
-this milestone's Phase D).
+`fable_review_macro_used: true` (launched at Phase D; disposition to be
+recorded in `docs/decisions.md` once triaged).
 
 - [x] **Phase A** (scout + diagnose): interface/CPU inventory done; the
       residual `execute!` allocation noted below (~10.7 KB scalar / ~5.9 KB
