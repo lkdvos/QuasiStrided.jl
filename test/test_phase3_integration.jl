@@ -15,14 +15,14 @@ using StridedViews: StridedView
     Cscalar = zeros(11, 9)
     plan_s = plan_contract(
         StridedView(Cscalar), A, (1, 2), B, (2, 3), (1, 3);
-        kernel = ScalarKernel(Val(8), Val(6), Float64), kc_panel = 5
+        kernel = ScalarKernel(Val(8), Val(6), Float64), kc = 5
     )
     execute!(plan_s, 1.0, 0.0)
 
     Csimd = zeros(11, 9)
     plan_v = plan_contract(
         StridedView(Csimd), A, (1, 2), B, (2, 3), (1, 3);
-        kernel = SIMDKernel(Val(8), Val(6), Float64), kc_panel = 5
+        kernel = SIMDKernel(Val(8), Val(6), Float64), kc = 5
     )
     execute!(plan_v, 1.0, 0.0)
 
@@ -37,11 +37,11 @@ using StridedViews: StridedView
     Csimd2 = copy(Cstart)
     plan_s2 = plan_contract(
         StridedView(Cscalar2), A, (1, 2), B, (2, 3), (1, 3);
-        kernel = ScalarKernel(Val(4), Val(3), Float64), kc_panel = 4
+        kernel = ScalarKernel(Val(4), Val(3), Float64), kc = 4
     )
     plan_v2 = plan_contract(
         StridedView(Csimd2), A, (1, 2), B, (2, 3), (1, 3);
-        kernel = SIMDKernel(Val(4), Val(3), Float64), kc_panel = 4
+        kernel = SIMDKernel(Val(4), Val(3), Float64), kc = 4
     )
     execute!(plan_s2, 2.5, 0.75)
     execute!(plan_v2, 2.5, 0.75)

@@ -1,9 +1,11 @@
 using StridedViews: StridedView, offset
 
-# plan_contract/execute!/ContractPlan aren't exported (only contract! is).
+# plan_contract/execute!/ContractPlan aren't exported (only contract! is);
+# execute_tilewise! is never exported at all (it's an internal oracle).
 const plan_contract = QuasiStrided.plan_contract
 const execute! = QuasiStrided.execute!
 const ContractPlan = QuasiStrided.ContractPlan
+const execute_tilewise! = QuasiStrided.execute_tilewise!
 
 # Worked fixture: A[a,k,b] (3,5,2), B[k,n] (5,4), C[a,n,b] (3,4,2),
 # C[a,n,b] = sum_k A[a,k,b]*B[k,n]; labels a=1,k=2,b=3,n=4.
@@ -97,8 +99,8 @@ end
     indB = (2, 3)
     indC = (1, 3)
 
-    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, kc_panel = 5)
-    @test plan.kc_panel == 5 # forces multiple K panels since Ka=13 > 5
+    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, kc = 5)
+    @test plan.blocking.kc == 5 # forces multiple K panels since Ka=13 > 5
     execute!(plan, 1.0, 0.0)
 
     @test Cmat ≈ Cref
@@ -117,8 +119,8 @@ end
     indA, indB, indC = (1, 2), (2, 3), (1, 3)
 
     alpha, beta = 2.5, 0.75
-    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, kc_panel = 3)
-    @test plan.kc_panel == 3
+    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, kc = 3)
+    @test plan.blocking.kc == 3
     execute!(plan, alpha, beta)
 
     expected = alpha .* (Amat * Bmat) .+ beta .* Cstart
@@ -239,8 +241,8 @@ end
     indA, indB, indC = (1, 2), (2, 3), (1, 3)
 
     # Planning is a distinct, separately callable/measurable step.
-    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, kc_panel = 4)
-    planning_allocs = @allocated plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, kc_panel = 4)
+    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, kc = 4)
+    planning_allocs = @allocated plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, kc = 4)
     @test planning_allocs > 0 # planning does construct AxisGroups/buffers: expected to allocate
 
     # Warm up execute! once (compilation), then measure steady-state
@@ -292,7 +294,7 @@ end
     Cmat_s = zeros(Ma, Na)
     plan_s = plan_contract(
         StridedView(Cmat_s), Av, indA, Bv, indB, indC;
-        kernel = ScalarKernel(Val(4), Val(3), Float64), kc_panel = 4
+        kernel = ScalarKernel(Val(4), Val(3), Float64), kc = 4
     )
     execute!(plan_s, 1.0, 0.0)
     fill!(Cmat_s, 0.0)
@@ -301,7 +303,7 @@ end
     Cmat_v = zeros(Ma, Na)
     plan_v = plan_contract(
         StridedView(Cmat_v), Av, indA, Bv, indB, indC;
-        kernel = SIMDKernel(Val(4), Val(3), Float64), kc_panel = 4
+        kernel = SIMDKernel(Val(4), Val(3), Float64), kc = 4
     )
     execute!(plan_v, 1.0, 0.0)
     fill!(Cmat_v, 0.0)
@@ -310,4 +312,213 @@ end
     @test Cmat_s ≈ Amat * Bmat
     @test Cmat_v ≈ Amat * Bmat
     @test simd_exec_allocs <= scalar_exec_allocs
+end
+
+# =====================================================================
+# Blocking / default_blocking
+# =====================================================================
+
+@testset "Blocking: field validation" begin
+    b = Blocking(4, 8, 16)
+    @test b.mc == 4 && b.kc == 8 && b.nc == 16
+
+    @test_throws ArgumentError Blocking(0, 8, 16)
+    @test_throws ArgumentError Blocking(4, 0, 16)
+    @test_throws ArgumentError Blocking(4, 8, 0)
+    @test_throws ArgumentError Blocking(-1, 8, 16)
+end
+
+@testset "default_blocking: dispatches on kernel scalar type" begin
+    bf64 = default_blocking(ScalarKernel(Val(8), Val(6), Float64))
+    bf32 = default_blocking(ScalarKernel(Val(8), Val(6), Float32))
+    @test bf64 isa Blocking
+    @test bf32 isa Blocking
+    @test bf64.mc >= 1 && bf64.kc >= 1 && bf64.nc >= 1
+    @test bf32.mc >= 1 && bf32.kc >= 1 && bf32.nc >= 1
+    # Same kernel shape, different scalar type, through SIMDKernel too.
+    @test default_blocking(SIMDKernel(Val(8), Val(6), Float64)) == bf64
+end
+
+@testset "plan_contract: mc/kc/nc keywords are validated and rounded" begin
+    kernel = ScalarKernel(Val(4), Val(3), Float64)
+    Ma, Ka, Na = 9, 10, 8
+    Amat, Bmat, Cmat = randn(Ma, Ka), randn(Ka, Na), zeros(Ma, Na)
+    Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
+    indA, indB, indC = (1, 2), (2, 3), (1, 3)
+
+    @test_throws ArgumentError plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, mc = 0)
+    @test_throws ArgumentError plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, kc = 0)
+    @test_throws ArgumentError plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, nc = -3)
+
+    # mc=5 with MR=4 rounds up to 8, then clamps to roundup(Ma=9,4)=12 -> 8.
+    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, mc = 5, kc = 100, nc = 100)
+    @test plan.blocking.mc == 8
+    @test plan.blocking.kc == 10  # clamped to Qk
+    @test plan.blocking.nc == 9   # NR=3: roundup(8,3)=9, requested 100 clamped down to that
+end
+
+# =====================================================================
+# Macro-blocking: multiple M/N blocks (loop 3 / loop 5 boundaries).
+# =====================================================================
+
+@testset "driver: forced multiple M blocks (mc = MR exactly)" begin
+    Random.seed!(777)
+    kernel = ScalarKernel(Val(4), Val(3), Float64)
+    Ma, Ka, Na = 13, 6, 5 # Ma spans several MR=4 slivers across several mc=4 blocks
+    Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
+    Cmat = zeros(Ma, Na)
+    Cref = Amat * Bmat
+
+    Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
+    indA, indB, indC = (1, 2), (2, 3), (1, 3)
+
+    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, mc = 4)
+    @test plan.blocking.mc == 4 # exactly one sliver per M block: forces several ic iterations
+    execute!(plan, 1.0, 0.0)
+    @test Cmat ≈ Cref
+end
+
+@testset "driver: forced multiple M blocks, non-multiple of MR (mc = 2*MR+1)" begin
+    Random.seed!(778)
+    kernel = ScalarKernel(Val(4), Val(3), Float64)
+    Ma, Ka, Na = 23, 7, 5
+    Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
+    Cmat = zeros(Ma, Na)
+    Cref = Amat * Bmat
+
+    Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
+    indA, indB, indC = (1, 2), (2, 3), (1, 3)
+
+    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, mc = 2 * 4 + 1)
+    @test plan.blocking.mc == 12 # rounds 9 up to a multiple of MR=4 -> 12 (3 slivers/block, tail sliver partial)
+    execute!(plan, 1.0, 0.0)
+    @test Cmat ≈ Cref
+end
+
+@testset "driver: forced multiple N blocks (nc = NR exactly, non-multiple)" begin
+    Random.seed!(779)
+    kernel = ScalarKernel(Val(4), Val(3), Float64)
+    Ma, Ka, Na = 9, 6, 17
+    Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
+    Cmat = zeros(Ma, Na)
+    Cref = Amat * Bmat
+
+    Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
+    indA, indB, indC = (1, 2), (2, 3), (1, 3)
+
+    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, nc = 2 * 3 + 1)
+    @test plan.blocking.nc == 9 # rounds 7 up to a multiple of NR=3 -> 9
+    execute!(plan, 1.0, 0.0)
+    @test Cmat ≈ Cref
+end
+
+@testset "driver: multiple M, N and K blocks simultaneously, nontrivial alpha/beta" begin
+    Random.seed!(780)
+    kernel = ScalarKernel(Val(4), Val(3), Float64)
+    Ma, Ka, Na = 19, 23, 17 # deliberately not multiples of MR/NR or any tidy block size
+    Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
+    Cstart = randn(Ma, Na)
+    Cmat = copy(Cstart)
+
+    Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
+    indA, indB, indC = (1, 2), (2, 3), (1, 3)
+
+    alpha, beta = 1.75, -0.5
+    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, mc = 8, kc = 6, nc = 7)
+    @test plan.blocking.mc == 8
+    @test plan.blocking.kc == 6
+    @test plan.blocking.nc == 9 # roundup(7,3)
+
+    execute!(plan, alpha, beta)
+    expected = alpha .* (Amat * Bmat) .+ beta .* Cstart
+    @test Cmat ≈ expected
+end
+
+# =====================================================================
+# execute! vs. execute_tilewise!: agree on multi-block shapes. Both operate
+# on the SAME ContractPlan/buffers, so run one at a time on a freshly-zeroed
+# (or freshly-copied) C between calls.
+# =====================================================================
+
+@testset "execute! and execute_tilewise! agree on multi-block shapes" begin
+    kernel = ScalarKernel(Val(4), Val(3), Float64)
+
+    cases = (
+        (Ma = 13, Ka = 11, Na = 10, mc = 4, kc = 5, nc = 3, alpha = 1.0, beta = 0.0),
+        (Ma = 19, Ka = 23, Na = 17, mc = 8, kc = 6, nc = 7, alpha = 2.5, beta = -0.75),
+    )
+
+    for (idx, case) in enumerate(cases)
+        Random.seed!(9000 + idx)
+        Amat = randn(case.Ma, case.Ka)
+        Bmat = randn(case.Ka, case.Na)
+        Cstart = randn(case.Ma, case.Na)
+
+        Av, Bv = StridedView(Amat), StridedView(Bmat)
+        indA, indB, indC = (1, 2), (2, 3), (1, 3)
+
+        Cmat_macro = copy(Cstart)
+        plan_macro = plan_contract(
+            StridedView(Cmat_macro), Av, indA, Bv, indB, indC;
+            kernel = kernel, mc = case.mc, kc = case.kc, nc = case.nc
+        )
+        execute!(plan_macro, case.alpha, case.beta)
+
+        Cmat_tw = copy(Cstart)
+        plan_tw = plan_contract(
+            StridedView(Cmat_tw), Av, indA, Bv, indB, indC;
+            kernel = kernel, mc = case.mc, kc = case.kc, nc = case.nc
+        )
+        execute_tilewise!(plan_tw, case.alpha, case.beta)
+
+        @test Cmat_macro ≈ Cmat_tw
+    end
+end
+
+# =====================================================================
+# Allocation targets (docs/decisions.md Phase A binding requirement): the
+# macro-blocking execute! must close the previously-diagnosed QSTile-UnionAll
+# boxing bug. SIMDKernel: 0 B on Julia >= 1.11 (older Julia doesn't keep the
+# Vec-tuple accumulator register-resident; see test_simd_kernel.jl's own
+# skip). ScalarKernel: bounded, not zero -- its `zero_accumulator` is a
+# spec-accepted `Matrix{T}` allocation (176 B/call), so the bound scales with
+# the number of execute_tile! calls (micro-tiles x K-blocks).
+# =====================================================================
+
+@testset "execute! allocation: SIMDKernel is zero, ScalarKernel is bounded" begin
+    Random.seed!(321)
+    Ma, Ka, Na = 19, 23, 17
+    mc, kc, nc = 8, 6, 7
+    Amat = randn(Ma, Ka)
+    Bmat = randn(Ka, Na)
+    Av, Bv = StridedView(Amat), StridedView(Bmat)
+    indA, indB, indC = (1, 2), (2, 3), (1, 3)
+
+    MRk, NRk = 4, 3
+    mtiles = cld(Ma, MRk)
+    ntiles = cld(Na, NRk)
+    kblocks = cld(Ka, kc)
+    ntiles_total = mtiles * ntiles * kblocks
+
+    Cmat_s = zeros(Ma, Na)
+    plan_s = plan_contract(
+        StridedView(Cmat_s), Av, indA, Bv, indB, indC;
+        kernel = ScalarKernel(Val(MRk), Val(NRk), Float64), mc = mc, kc = kc, nc = nc
+    )
+    execute!(plan_s, 1.0, 0.0) # warm up (compile)
+    fill!(Cmat_s, 0.0)
+    scalar_allocs = @allocated execute!(plan_s, 1.0, 0.0)
+    @test Cmat_s ≈ Amat * Bmat
+    @test scalar_allocs <= 176 * ntiles_total + 1
+
+    Cmat_v = zeros(Ma, Na)
+    plan_v = plan_contract(
+        StridedView(Cmat_v), Av, indA, Bv, indB, indC;
+        kernel = SIMDKernel(Val(MRk), Val(NRk), Float64), mc = mc, kc = kc, nc = nc
+    )
+    execute!(plan_v, 1.0, 0.0) # warm up (compile)
+    fill!(Cmat_v, 0.0)
+    simd_allocs = @allocated execute!(plan_v, 1.0, 0.0)
+    @test Cmat_v ≈ Amat * Bmat
+    @test simd_allocs == 0 skip = (VERSION < v"1.11")
 end

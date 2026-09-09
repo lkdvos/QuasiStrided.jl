@@ -27,6 +27,10 @@ export ScalarKernel, zero_accumulator, accumulate, scale_tile!, store_tile!, exe
 include("kernels/simd.jl")
 export SIMDKernel, lanewidth, avecs_per_column
 
+# --- Macro-blocking milestone: BLIS five-loop driver ---
+include("blocking.jl")
+export Blocking, default_blocking
+
 include("driver.jl")
 export contract!, plan_contract, execute!, ContractPlan
 
