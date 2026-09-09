@@ -1,8 +1,6 @@
-# Cache-blocking factors for the macro-blocking driver's five-loop nest
-# (docs/decisions.md, "Macro-blocking milestone" -> frozen interface #4).
-# `Blocking` itself is a plain, always-valid (>=1 per field) user-facing
-# value; `plan_contract` is what rounds/clamps it into the *effective*
-# blocking actually stored on `ContractPlan`.
+# Cache-blocking factors for the driver's five-loop nest. `Blocking` is a
+# plain, always-valid (>=1 per field) user-facing value; `plan_contract`
+# rounds/clamps it into the *effective* blocking stored on `ContractPlan`.
 
 """
     Blocking(mc::Int, kc::Int, nc::Int)
@@ -29,24 +27,17 @@ end
     default_blocking(kernel) -> Blocking
 
 Default cache-blocking factors for `kernel`, dispatched on
-`scalartype(kernel)`. Hardcoded, single-machine constants
-(docs/decisions.md, "Block-size policy"), not derived from any cache model
--- measured by the Phase E benchmark sweep on the reference machine
-(Cascade Lake; see `benchmark/results/.../PROVENANCE.txt` and
-`docs/decisions.md`'s "Macro-blocking milestone" -> Phase E for the grid,
-chosen values, and runner-up spread). Values are the *requested* `mc`/`nc`
-(not yet rounded to `mr(kernel)`/`nr(kernel)` multiples -- `plan_contract`
-does that, and also clamps everything to the contraction's actual extents).
+`scalartype(kernel)`. Hardcoded measured constants, not a cache model
+(docs/decisions.md, "Block-size policy"). These are the *requested* `mc`/`nc`
+-- `plan_contract` rounds them to `mr`/`nr` multiples and clamps them to the
+contraction's actual extents.
 """
 default_blocking(kernel) = default_blocking(scalartype(kernel))
 
-# measured 2026-09-08, Cascade Lake (Xeon Gold 6244, ccqlin038; see
-# benchmark/results/ccqlin038.flatironinstitute.org-2026-09-08/PROVENANCE.txt
-# and docs/decisions.md, "Macro-blocking milestone" -> Phase E).
+# Measured 2026-09-08 on ONE machine class (Cascade Lake, Xeon Gold 6244,
+# ccqlin038): benchmark/results/ccqlin038.flatironinstitute.org-2026-09-08/
+# PROVENANCE.txt, docs/decisions.md -> Phase E.
 default_blocking(::Type{Float64}) = Blocking(64, 128, 768)
-# measured 2026-09-08, Cascade Lake (Xeon Gold 6244, ccqlin038; see
-# benchmark/results/ccqlin038.flatironinstitute.org-2026-09-08/PROVENANCE.txt
-# and docs/decisions.md, "Macro-blocking milestone" -> Phase E).
 default_blocking(::Type{Float32}) = Blocking(96, 384, 1152)
 
 # Smallest multiple of `n` that is >= `x` (`x >= 0`, `n >= 1`).

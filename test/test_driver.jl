@@ -7,6 +7,24 @@ const execute! = QuasiStrided.execute!
 const ContractPlan = QuasiStrided.ContractPlan
 const execute_tilewise! = QuasiStrided.execute_tilewise!
 
+# Plan for the dense matmul C[m,n] = sum_k A[m,k]*B[k,n], the shape most
+# testsets below use. (test_macro_driver.jl has its own copy: both files are
+# included into the same scope, so the names must differ.)
+function _mm_plan(Cmat, Amat, Bmat; kernel, mc = nothing, kc = nothing, nc = nothing)
+    return plan_contract(
+        StridedView(Cmat), StridedView(Amat), (1, 2), StridedView(Bmat), (2, 3), (1, 3);
+        kernel = kernel, mc = mc, kc = kc, nc = nc
+    )
+end
+
+# Steady-state allocation of one execute!/execute_tilewise! call on a reused
+# plan: warm up (compile) first, then measure.
+function _steady_allocs!(run!, plan, Cmat)
+    run!(plan, 1.0, 0.0)
+    fill!(Cmat, 0.0)
+    return @allocated run!(plan, 1.0, 0.0)
+end
+
 # Worked fixture: A[a,k,b] (3,5,2), B[k,n] (5,4), C[a,n,b] (3,4,2),
 # C[a,n,b] = sum_k A[a,k,b]*B[k,n]; labels a=1,k=2,b=3,n=4.
 
@@ -77,33 +95,23 @@ end
 end
 
 # =====================================================================
-# Larger case: multiple output tiles (M and N exceed one register tile)
-# and multiple K panels, checked against a plain matrix-multiply reference.
+# Larger cases: M/N beyond one register tile, K beyond one panel.
 # =====================================================================
 
 @testset "driver: larger case, multiple output tiles and multiple K panels" begin
     Random.seed!(20260908)
-    # Small kernel shape to force several output tiles from modest M/N.
-    kernel = ScalarKernel(Val(4), Val(3), Float64)
+    kernel = ScalarKernel(Val(4), Val(3), Float64)  # small shape: several tiles from modest M/N
 
     Ma, Ka, Na = 11, 13, 7 # deliberately not multiples of MR=4/NR=3/panel size
     Amat = randn(Ma, Ka)
     Bmat = randn(Ka, Na)
     Cmat = zeros(Ma, Na)
-    Cref = Amat * Bmat
 
-    Av = StridedView(Amat) # indA: m=1, k=2
-    Bv = StridedView(Bmat) # indB: k=2, n=3
-    Cv = StridedView(Cmat) # indC: m=1, n=3
-    indA = (1, 2)
-    indB = (2, 3)
-    indC = (1, 3)
-
-    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, kc = 5)
+    plan = _mm_plan(Cmat, Amat, Bmat; kernel = kernel, kc = 5)
     @test plan.blocking.kc == 5 # forces multiple K panels since Ka=13 > 5
     execute!(plan, 1.0, 0.0)
 
-    @test Cmat ≈ Cref
+    @test Cmat ≈ Amat * Bmat
 end
 
 @testset "driver: nontrivial alpha/beta across multiple K panels, beta applied once" begin
@@ -115,22 +123,17 @@ end
     Cstart = randn(Ma, Na)
     Cmat = copy(Cstart)
 
-    Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
-    indA, indB, indC = (1, 2), (2, 3), (1, 3)
-
     alpha, beta = 2.5, 0.75
-    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, kc = 3)
+    plan = _mm_plan(Cmat, Amat, Bmat; kernel = kernel, kc = 3)
     @test plan.blocking.kc == 3
     execute!(plan, alpha, beta)
 
-    expected = alpha .* (Amat * Bmat) .+ beta .* Cstart
-    @test Cmat ≈ expected
+    @test Cmat ≈ alpha .* (Amat * Bmat) .+ beta .* Cstart
 end
 
 # =====================================================================
 # Whole-contraction short-circuits: K=0 and alpha=0. Neither may read A/B;
-# verified with NaN/Inf-poisoned A/B, mirroring the padding/beta=0 pattern
-# already used in test_phase2_integration.jl / test_kernel.jl.
+# verified with NaN/Inf-poisoned A/B.
 # =====================================================================
 
 @testset "driver: K=0 short-circuit applies beta once, never reads A/B" begin
@@ -193,31 +196,21 @@ end
     Cmat = zeros(3, 5)
     Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
 
-    # Mismatched shared-label length: indB's axis 1 given label 2 (shared
-    # with A's axis 2, length 4), but Bmat's axis1 length is 4 -- construct a
-    # genuine mismatch by using a different-length B.
-    Bmat_bad = randn(6, 5) # k axis length 6 != A's k length 4
-    Bv_bad = StridedView(Bmat_bad)
+    # Mismatched shared-label length: B's k axis is 6, A's is 4.
+    Bv_bad = StridedView(randn(6, 5))
     @test_throws DimensionMismatch contract!(Cv, 1.0, Av, (1, 2), Bv_bad, (2, 3), 0.0, (1, 3))
 
-    # Diagonal: repeated label within indA.
-    Asq = randn(4, 4)
-    Avsq = StridedView(Asq)
+    # Diagonal: repeated label within indA, then within indC.
+    Avsq = StridedView(randn(4, 4))
     @test_throws ArgumentError contract!(Cv, 1.0, Avsq, (1, 1), Bv, (2, 3), 0.0, (1, 3))
-
-    # Diagonal: repeated label within indC.
     @test_throws ArgumentError contract!(Cv, 1.0, Av, (1, 2), Bv, (2, 3), 0.0, (1, 1, 3)[1:2])
 
     # Label in indC absent from both indA and indB.
     @test_throws ArgumentError contract!(Cv, 1.0, Av, (1, 2), Bv, (2, 3), 0.0, (1, 9))
 
-    # Label present only in indA (not in indB or indC): dangling.
+    # Dangling label: only in indA, then only in indB. Distinct code paths
+    # (the A loop vs. the B loop in _classify_labels).
     @test_throws ArgumentError contract!(Cv, 1.0, Av, (1, 2), Bv, (5, 3), 0.0, (1, 3))
-
-    # Label present only in indB (not in indA or indC): dangling. This is a
-    # structurally distinct code path from the indA-only case above (the B
-    # loop in _classify_labels, not the A loop) and was not previously
-    # exercised (Phase 4 review coverage note).
     @test_throws ArgumentError contract!(Cv, 1.0, Av, (1, 2), Bv, (2, 9), 0.0, (1, 3))
 
     # Label present in all three (batch-like), unsupported this milestone.
@@ -225,9 +218,7 @@ end
 end
 
 # =====================================================================
-# Planning vs execution: measurable separately, and allocation behavior of
-# execution alone (with a reused plan) vs a cold contract! call that
-# includes planning.
+# Planning vs execution as separate, separately measurable steps.
 # =====================================================================
 
 @testset "driver: planning and execution are separately timable; execution allocation" begin
@@ -240,74 +231,41 @@ end
     Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
     indA, indB, indC = (1, 2), (2, 3), (1, 3)
 
-    # Planning is a distinct, separately callable/measurable step.
     plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, kc = 4)
     planning_allocs = @allocated plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, kc = 4)
-    @test planning_allocs > 0 # planning does construct AxisGroups/buffers: expected to allocate
+    @test planning_allocs > 0 # planning constructs AxisGroups/buffers
 
-    # Warm up execute! once (compilation), then measure steady-state
-    # allocation of *execution alone*, reusing the same plan/workspace.
-    execute!(plan, 1.0, 0.0)
-    fill!(Cmat, 0.0)
-    exec_allocs = @allocated execute!(plan, 1.0, 0.0)
-
+    # Execution alone, on the reused plan/workspace. This is measured
+    # independently of planning; it is NOT asserted to be smaller (a
+    # multi-tile case pays per-tile costs the one-shot planning does not).
+    exec_allocs = _steady_allocs!(execute!, plan, Cmat)
     @test Cmat ≈ Amat * Bmat
-
-    # Report honestly (docs/decisions.md Phase 2b finding #5: pack_a!/pack_b!
-    # are known to allocate ~80B/call in steady state even with concrete
-    # buffers, root cause not isolated there; this driver calls pack_a!/
-    # pack_b! once per (output tile, K panel) unchanged, so exec_allocs
-    # scales with tile-count x panel-count and is NOT expected to be smaller
-    # than the one-shot planning allocation for a case with several tiles/
-    # panels, as this one deliberately has). The point of this test is that
-    # execution-alone allocation is measured independently of planning (a
-    # reused `plan` triggers no further AxisGroup/buffer construction), not
-    # that it is zero or smaller -- do not conflate the two numbers.
     @test exec_allocs >= 0
     @test planning_allocs >= 0
 
-    # A cold contract! call performs planning AND execution every time (no
-    # plan is cached across calls), so it must allocate at least as much as
-    # planning alone -- this is exactly what a reused plan avoids paying
-    # repeatedly.
+    # A cold contract! plans AND executes every time, so it must allocate at
+    # least as much as planning alone -- exactly what a reused plan avoids.
     fill!(Cmat, 0.0)
     cold_allocs = @allocated contract!(Cv, 1.0, Av, indA, Bv, indB, 0.0, indC)
     @test cold_allocs >= planning_allocs
 end
 
 @testset "driver: execution allocation through SIMDKernel is not worse than ScalarKernel" begin
-    # Phase 4 review: the SIMD worker only benchmarked a single execute_tile!
-    # call directly, never through the driver's own tiling/dispatch loop.
-    # Assert here (not just spot-check once) that going through execute!
-    # with a SIMDKernel doesn't introduce driver-induced boxing/allocation
-    # beyond what pack_a!/pack_b! already contribute (the same deferred
-    # ~80B/call finding applies to both kernels equally, scaled by tile x
-    # panel count) -- i.e. no *additional* per-call allocation specific to
-    # SIMDKernel dispatch through the driver.
+    # The SIMD kernel was originally benchmarked only through a bare
+    # execute_tile! call; assert that driving it through execute!'s own
+    # dispatch loop adds no SIMD-specific allocation over the scalar path.
     Random.seed!(99)
     Ma, Ka, Na = 9, 10, 8
     Amat = randn(Ma, Ka)
     Bmat = randn(Ka, Na)
-    indA, indB, indC = (1, 2), (2, 3), (1, 3)
-    Av, Bv = StridedView(Amat), StridedView(Bmat)
 
     Cmat_s = zeros(Ma, Na)
-    plan_s = plan_contract(
-        StridedView(Cmat_s), Av, indA, Bv, indB, indC;
-        kernel = ScalarKernel(Val(4), Val(3), Float64), kc = 4
-    )
-    execute!(plan_s, 1.0, 0.0)
-    fill!(Cmat_s, 0.0)
-    scalar_exec_allocs = @allocated execute!(plan_s, 1.0, 0.0)
+    plan_s = _mm_plan(Cmat_s, Amat, Bmat; kernel = ScalarKernel(Val(4), Val(3), Float64), kc = 4)
+    scalar_exec_allocs = _steady_allocs!(execute!, plan_s, Cmat_s)
 
     Cmat_v = zeros(Ma, Na)
-    plan_v = plan_contract(
-        StridedView(Cmat_v), Av, indA, Bv, indB, indC;
-        kernel = SIMDKernel(Val(4), Val(3), Float64), kc = 4
-    )
-    execute!(plan_v, 1.0, 0.0)
-    fill!(Cmat_v, 0.0)
-    simd_exec_allocs = @allocated execute!(plan_v, 1.0, 0.0)
+    plan_v = _mm_plan(Cmat_v, Amat, Bmat; kernel = SIMDKernel(Val(4), Val(3), Float64), kc = 4)
+    simd_exec_allocs = _steady_allocs!(execute!, plan_v, Cmat_v)
 
     @test Cmat_s ≈ Amat * Bmat
     @test Cmat_v ≈ Amat * Bmat
@@ -351,7 +309,7 @@ end
     @test_throws ArgumentError plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, nc = -3)
 
     # mc=5 with MR=4 rounds up to 8, then clamps to roundup(Ma=9,4)=12 -> 8.
-    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, mc = 5, kc = 100, nc = 100)
+    plan = _mm_plan(Cmat, Amat, Bmat; kernel = kernel, mc = 5, kc = 100, nc = 100)
     @test plan.blocking.mc == 8
     @test plan.blocking.kc == 10  # clamped to Qk
     @test plan.blocking.nc == 9   # NR=3: roundup(8,3)=9, requested 100 clamped down to that
@@ -367,15 +325,11 @@ end
     Ma, Ka, Na = 13, 6, 5 # Ma spans several MR=4 slivers across several mc=4 blocks
     Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
     Cmat = zeros(Ma, Na)
-    Cref = Amat * Bmat
 
-    Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
-    indA, indB, indC = (1, 2), (2, 3), (1, 3)
-
-    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, mc = 4)
+    plan = _mm_plan(Cmat, Amat, Bmat; kernel = kernel, mc = 4)
     @test plan.blocking.mc == 4 # exactly one sliver per M block: forces several ic iterations
     execute!(plan, 1.0, 0.0)
-    @test Cmat ≈ Cref
+    @test Cmat ≈ Amat * Bmat
 end
 
 @testset "driver: forced multiple M blocks, non-multiple of MR (mc = 2*MR+1)" begin
@@ -384,15 +338,11 @@ end
     Ma, Ka, Na = 23, 7, 5
     Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
     Cmat = zeros(Ma, Na)
-    Cref = Amat * Bmat
 
-    Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
-    indA, indB, indC = (1, 2), (2, 3), (1, 3)
-
-    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, mc = 2 * 4 + 1)
-    @test plan.blocking.mc == 12 # rounds 9 up to a multiple of MR=4 -> 12 (3 slivers/block, tail sliver partial)
+    plan = _mm_plan(Cmat, Amat, Bmat; kernel = kernel, mc = 2 * 4 + 1)
+    @test plan.blocking.mc == 12 # rounds 9 up to a multiple of MR=4 (3 slivers/block, tail partial)
     execute!(plan, 1.0, 0.0)
-    @test Cmat ≈ Cref
+    @test Cmat ≈ Amat * Bmat
 end
 
 @testset "driver: forced multiple N blocks (nc = NR exactly, non-multiple)" begin
@@ -401,15 +351,11 @@ end
     Ma, Ka, Na = 9, 6, 17
     Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
     Cmat = zeros(Ma, Na)
-    Cref = Amat * Bmat
 
-    Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
-    indA, indB, indC = (1, 2), (2, 3), (1, 3)
-
-    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, nc = 2 * 3 + 1)
-    @test plan.blocking.nc == 9 # rounds 7 up to a multiple of NR=3 -> 9
+    plan = _mm_plan(Cmat, Amat, Bmat; kernel = kernel, nc = 2 * 3 + 1)
+    @test plan.blocking.nc == 9 # rounds 7 up to a multiple of NR=3
     execute!(plan, 1.0, 0.0)
-    @test Cmat ≈ Cref
+    @test Cmat ≈ Amat * Bmat
 end
 
 @testset "driver: multiple M, N and K blocks simultaneously, nontrivial alpha/beta" begin
@@ -420,24 +366,19 @@ end
     Cstart = randn(Ma, Na)
     Cmat = copy(Cstart)
 
-    Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
-    indA, indB, indC = (1, 2), (2, 3), (1, 3)
-
     alpha, beta = 1.75, -0.5
-    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, mc = 8, kc = 6, nc = 7)
+    plan = _mm_plan(Cmat, Amat, Bmat; kernel = kernel, mc = 8, kc = 6, nc = 7)
     @test plan.blocking.mc == 8
     @test plan.blocking.kc == 6
     @test plan.blocking.nc == 9 # roundup(7,3)
 
     execute!(plan, alpha, beta)
-    expected = alpha .* (Amat * Bmat) .+ beta .* Cstart
-    @test Cmat ≈ expected
+    @test Cmat ≈ alpha .* (Amat * Bmat) .+ beta .* Cstart
 end
 
 # =====================================================================
-# execute! vs. execute_tilewise!: agree on multi-block shapes. Both operate
-# on the SAME ContractPlan/buffers, so run one at a time on a freshly-zeroed
-# (or freshly-copied) C between calls.
+# execute! vs. execute_tilewise! on multi-block shapes. Each gets its own
+# plan, so neither can be affected by the other's buffers.
 # =====================================================================
 
 @testset "execute! and execute_tilewise! agree on multi-block shapes" begin
@@ -454,21 +395,12 @@ end
         Bmat = randn(case.Ka, case.Na)
         Cstart = randn(case.Ma, case.Na)
 
-        Av, Bv = StridedView(Amat), StridedView(Bmat)
-        indA, indB, indC = (1, 2), (2, 3), (1, 3)
-
         Cmat_macro = copy(Cstart)
-        plan_macro = plan_contract(
-            StridedView(Cmat_macro), Av, indA, Bv, indB, indC;
-            kernel = kernel, mc = case.mc, kc = case.kc, nc = case.nc
-        )
+        plan_macro = _mm_plan(Cmat_macro, Amat, Bmat; kernel = kernel, mc = case.mc, kc = case.kc, nc = case.nc)
         execute!(plan_macro, case.alpha, case.beta)
 
         Cmat_tw = copy(Cstart)
-        plan_tw = plan_contract(
-            StridedView(Cmat_tw), Av, indA, Bv, indB, indC;
-            kernel = kernel, mc = case.mc, kc = case.kc, nc = case.nc
-        )
+        plan_tw = _mm_plan(Cmat_tw, Amat, Bmat; kernel = kernel, mc = case.mc, kc = case.kc, nc = case.nc)
         execute_tilewise!(plan_tw, case.alpha, case.beta)
 
         @test Cmat_macro ≈ Cmat_tw
@@ -476,49 +408,39 @@ end
 end
 
 # =====================================================================
-# Allocation targets (docs/decisions.md Phase A binding requirement): the
-# macro-blocking execute! must close the previously-diagnosed QSTile-UnionAll
-# boxing bug. SIMDKernel: 0 B on Julia >= 1.11 (older Julia doesn't keep the
-# Vec-tuple accumulator register-resident; see test_simd_kernel.jl's own
-# skip). ScalarKernel: bounded, not zero -- its `zero_accumulator` is a
-# spec-accepted `Matrix{T}` allocation (176 B/call), so the bound scales with
-# the number of execute_tile! calls (micro-tiles x K-blocks).
+# Allocation targets (docs/decisions.md, Phase A binding requirement): the
+# macro-blocking execute! must close the QSTile-UnionAll boxing bug.
+# SIMDKernel: 0 B on Julia >= 1.11 (older Julia doesn't keep the Vec-tuple
+# accumulator register-resident; see test_simd_kernel.jl's own skip).
+# ScalarKernel: bounded, not zero -- its zero_accumulator is a spec-accepted
+# Matrix{T} allocation (176 B per execute_tile! call).
 # =====================================================================
 
 @testset "execute! allocation: SIMDKernel is zero, ScalarKernel is bounded" begin
     Random.seed!(321)
     Ma, Ka, Na = 19, 23, 17
     mc, kc, nc = 8, 6, 7
+    MRk, NRk = 4, 3
     Amat = randn(Ma, Ka)
     Bmat = randn(Ka, Na)
-    Av, Bv = StridedView(Amat), StridedView(Bmat)
-    indA, indB, indC = (1, 2), (2, 3), (1, 3)
 
-    MRk, NRk = 4, 3
-    mtiles = cld(Ma, MRk)
-    ntiles = cld(Na, NRk)
-    kblocks = cld(Ka, kc)
-    ntiles_total = mtiles * ntiles * kblocks
+    tile_calls = cld(Ma, MRk) * cld(Na, NRk) * cld(Ka, kc)
 
     Cmat_s = zeros(Ma, Na)
-    plan_s = plan_contract(
-        StridedView(Cmat_s), Av, indA, Bv, indB, indC;
+    plan_s = _mm_plan(
+        Cmat_s, Amat, Bmat;
         kernel = ScalarKernel(Val(MRk), Val(NRk), Float64), mc = mc, kc = kc, nc = nc
     )
-    execute!(plan_s, 1.0, 0.0) # warm up (compile)
-    fill!(Cmat_s, 0.0)
-    scalar_allocs = @allocated execute!(plan_s, 1.0, 0.0)
+    scalar_allocs = _steady_allocs!(execute!, plan_s, Cmat_s)
     @test Cmat_s ≈ Amat * Bmat
-    @test scalar_allocs <= 176 * ntiles_total + 1
+    @test scalar_allocs <= 176 * tile_calls + 1
 
     Cmat_v = zeros(Ma, Na)
-    plan_v = plan_contract(
-        StridedView(Cmat_v), Av, indA, Bv, indB, indC;
+    plan_v = _mm_plan(
+        Cmat_v, Amat, Bmat;
         kernel = SIMDKernel(Val(MRk), Val(NRk), Float64), mc = mc, kc = kc, nc = nc
     )
-    execute!(plan_v, 1.0, 0.0) # warm up (compile)
-    fill!(Cmat_v, 0.0)
-    simd_allocs = @allocated execute!(plan_v, 1.0, 0.0)
+    simd_allocs = _steady_allocs!(execute!, plan_v, Cmat_v)
     @test Cmat_v ≈ Amat * Bmat
     @test simd_allocs == 0 skip = (VERSION < v"1.11")
 end

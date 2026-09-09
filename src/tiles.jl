@@ -72,18 +72,7 @@ function checked_axis_offset(ax::Axis, t::Int)
 end
 
 """
-    axis_from_descriptor(descriptor::BlockDescriptor, buffer::Vector{Int}) -> Union{AffineAxis,ScatterAxis}
-
-Build the axis matching a [`BlockDescriptor`](@ref): `AffineAxis` when
-regular, else a `ScatterAxis` viewing `buffer[1:descriptor.count]` (borrowed,
-not copied). Call once per block classification, not per element. Forwards
-to [`axis_from_descriptor(descriptor, buffer, first)`](@ref) with `first = 0`.
-"""
-axis_from_descriptor(descriptor::BlockDescriptor, buffer::Vector{Int}) =
-    axis_from_descriptor(descriptor, buffer, 0)
-
-"""
-    axis_from_descriptor(descriptor::BlockDescriptor, buffer::Vector{Int}, first::Int) -> Union{AffineAxis,ScatterAxis}
+    axis_from_descriptor(descriptor::BlockDescriptor, buffer::Vector{Int}, first::Int = 0) -> Union{AffineAxis,ScatterAxis}
 
 Build the axis matching a [`BlockDescriptor`](@ref) classified from
 `buffer[first+1 : first+descriptor.count]` (zero-based `first`): `AffineAxis`
@@ -97,6 +86,9 @@ function axis_from_descriptor(descriptor::BlockDescriptor, buffer::Vector{Int}, 
         return ScatterAxis(view(buffer, (first + 1):(first + descriptor.count)), descriptor.count)
     end
 end
+
+axis_from_descriptor(descriptor::BlockDescriptor, buffer::Vector{Int}) =
+    axis_from_descriptor(descriptor, buffer, 0)
 
 """
     QSTile{S,R,C}

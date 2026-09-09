@@ -1,26 +1,8 @@
-# Independent oracle/property tests for the macro-blocking `execute!` rewrite
-# (docs/decisions.md, "Macro-blocking milestone" section). Written against
-# the FROZEN signatures recorded there:
-#
-#   plan_contract(C, A, indA, B, indB, indC; kernel=default, mc=nothing,
-#                 kc=nothing, nc=nothing) -> ContractPlan
-#   struct Blocking; mc::Int; kc::Int; nc::Int; end
-#   default_blocking(kernel) -> Blocking
-#   execute!(plan, alpha, beta)                       # macro-blocking rewrite
-#   QuasiStrided.execute_tilewise!(plan, alpha, beta)  # old tile-by-tile oracle (unexported)
-#
-# None of `plan_contract`, `execute!`, `ContractPlan`, `Blocking`,
-# `default_blocking`, `execute_tilewise!` are exported, so every use below is
-# fully qualified as `QuasiStrided.<name>` -- this also avoids colliding with
-# the unqualified `const plan_contract = QuasiStrided.plan_contract`-style
-# bindings that test_driver.jl introduces into the same top-level scope when
-# both files are `include`d from test/runtests.jl.
-#
-# This file cannot run successfully until the concurrent Macro-C driver
-# rewrite (worktree QuasiStrided.jl-macro-c1, branch macro-blocking-driver)
-# lands: `Blocking`/`default_blocking`/the new `execute!`/`execute_tilewise!`
-# do not exist yet in this checkout. It is written and syntax-checked, not
-# executed, per the oracle-worker task instructions.
+# Independent oracle/property tests for the macro-blocking `execute!`
+# (docs/decisions.md, "Macro-blocking milestone"). Nothing under test is
+# exported, and test_driver.jl introduces unqualified `plan_contract`/
+# `execute!` bindings into the same top-level scope, so every use here is
+# written as `QuasiStrided.<name>` to avoid colliding with those.
 
 using Test
 using Random
@@ -30,20 +12,25 @@ using StridedViews: StridedView, offset
 # Shared helpers
 # =====================================================================
 
-# Kernel constructors x (MR,NR) shapes x element types exercised throughout.
-# Two shapes per the task spec: (Val(4),Val(3)) and (Val(8),Val(6)).
 const _MACRO_KERNEL_CTORS = (ScalarKernel, SIMDKernel)
 const _MACRO_SHAPES = ((Val(4), Val(3)), (Val(8), Val(6)))
 const _MACRO_ELTYPES = (Float64, Float32)
 
+# Plan for the dense matmul C[m,n] = sum_k A[m,k]*B[k,n], the shape most
+# testsets below use.
+function _dense_plan(Cmat, Amat, Bmat, kernel, mc, kc, nc)
+    return QuasiStrided.plan_contract(
+        StridedView(Cmat), StridedView(Amat), (1, 2), StridedView(Bmat), (2, 3), (1, 3);
+        kernel = kernel, mc = mc, kc = kc, nc = nc
+    )
+end
+
 """
     _random_macro_case(rng, ctor, shape, T)
 
-Build one randomized dense-matmul case: shapes `(Ma,Ka,Na)` in 1:37, block
-sizes `(mc,kc,nc)` in 1:13 (small on purpose, to force multiple blocks in
-each dimension even for small operand shapes), plus random alpha/beta and a
-random starting C. Returns a NamedTuple with everything needed to both run
-the driver and independently compute the expected dense-matmul result.
+One randomized dense-matmul case: shapes in 1:37 against block sizes in 1:13
+(small on purpose, to force multiple blocks in every dimension), plus random
+alpha/beta and a random starting C.
 """
 function _random_macro_case(rng::MersenneTwister, ctor, shape, ::Type{T}) where {T}
     Ma = rand(rng, 1:37)
@@ -61,26 +48,16 @@ function _random_macro_case(rng::MersenneTwister, ctor, shape, ::Type{T}) where 
     return (; Ma, Ka, Na, mc, kc, nc, kernel, alpha, beta, Amat, Bmat, Cstart, T)
 end
 
-"""
-    _macro_random_cases(seed) -> Vector
-
-A handful of `_random_macro_case`s per (kernel ctor, shape, eltype) combo,
-built off a single fixed-seed RNG stream so the *same* sequence of cases is
-reproduced whenever this is called with the same seed (used to keep testset
-1 and testset 6 -- "execute! vs execute_tilewise!" on the exact same cases
--- in lockstep without duplicating the RNG draws inline in two places).
-"""
-# SIMDKernel requires mr(kernel) to be a multiple of its lane width, which is
-# type-dependent (_default_lanewidth: 4 for Float64, 8 for Float32) -- so
-# (Val(4),Val(3)) is not a valid SIMDKernel/Float32 combo (4 is not a
-# multiple of 8). Filter to the combos each (ctor, T) can actually construct,
-# rather than the full cartesian product.
+# SIMDKernel needs mr(kernel) to be a multiple of its type-dependent lane
+# width (4 for Float64, 8 for Float32), so (Val(4),Val(3)) is not a
+# constructible SIMDKernel/Float32 combo.
+_valtype(::Val{N}) where {N} = N
 function _valid_shapes(ctor, ::Type{T}) where {T}
     ctor !== SIMDKernel && return _MACRO_SHAPES
     return Tuple(s for s in _MACRO_SHAPES if _valtype(s[1]) % QuasiStrided._default_lanewidth(T) == 0)
 end
-_valtype(::Val{N}) where {N} = N
 
+# Fixed-seed case stream, so testsets 1 and 6 run the *same* cases.
 function _macro_random_cases(seed::Integer; per_combo::Int = 5)
     rng = MersenneTwister(seed)
     cases = Any[]
@@ -92,15 +69,9 @@ function _macro_random_cases(seed::Integer; per_combo::Int = 5)
     return cases
 end
 
-# Tolerance rationale (reused across testsets): random dense matmul entries
-# accumulate Ka terms of order 1, and both operands *and* the M/N/K block
-# partition change how those Ka terms are summed (different grouping ->
-# different rounding, still mathematically exact in infinite precision). A
-# textbook conditioning bound for such a sum scales like Ka*eps(T) relative
-# to the entry magnitude (~sqrt(Ka) for a sum of Ka iid unit-variance
-# products); we use a generous multiple of that to absorb both the summation
-# reordering and BLIS-style accumulate-in-different-order effects, without
-# being so loose it would hide a real bug.
+# Both operands and the M/N/K block partition change how the Ka terms of each
+# output entry are summed, so agreement is only up to summation-reordering
+# rounding: a generous multiple of the textbook Ka*eps(T) bound.
 _macro_rtol(::Type{T}, Ka::Integer) where {T} = 50 * max(Ka, 1) * eps(T)
 
 # =====================================================================
@@ -109,12 +80,9 @@ _macro_rtol(::Type{T}, Ka::Integer) where {T} = 50 * max(Ka, 1) * eps(T)
 
 @testset "macro driver: randomized agreement vs. dense matmul" begin
     for case in _macro_random_cases(0x5A17_D817)
-        (; Ma, Ka, Na, mc, kc, nc, kernel, alpha, beta, Amat, Bmat, Cstart, T) = case
+        (; Ka, mc, kc, nc, kernel, alpha, beta, Amat, Bmat, Cstart, T) = case
         Cmat = copy(Cstart)
-        Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
-        indA, indB, indC = (1, 2), (2, 3), (1, 3)
-
-        plan = QuasiStrided.plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, mc = mc, kc = kc, nc = nc)
+        plan = _dense_plan(Cmat, Amat, Bmat, kernel, mc, kc, nc)
         QuasiStrided.execute!(plan, alpha, beta)
 
         expected = alpha .* (Amat * Bmat) .+ beta .* Cstart
@@ -123,33 +91,28 @@ _macro_rtol(::Type{T}, Ka::Integer) where {T} = 50 * max(Ka, 1) * eps(T)
 end
 
 # =====================================================================
-# 2. 3-index tensor fixture with real StridedViews: permutation, sliced
-#    (non-zero-offset) destination, negative stride, zero-stride broadcast.
-# Reference computed with plain nested for loops over logical indices,
-# indexing the StridedViews directly -- plan_contract/execute! is never
-# consulted while building the reference.
+# 2. 3-index tensor fixture with real StridedViews: permuted A, zero-stride
+# broadcast, negative-stride B, sliced (nonzero-offset) C. The reference is
+# built by plain nested loops over the views, never via the driver.
 # =====================================================================
 
 @testset "macro driver: 3-index StridedViews fixture (permuted/sliced/negative/zero-stride)" begin
     a_n, k_n, b_n, n_n = 7, 11, 5, 9
 
-    # A[a,k,b]: genuinely independent of b (zero stride on the b axis), then
-    # presented to the driver as a permuted view (k,b,a) axis order.
+    # A[a,k,b]: genuinely independent of b (zero stride there), presented as a
+    # permuted (k,b,a) view. Labels: a=1, k=2, b=3, n=4.
     A2 = randn(a_n, k_n)
-    Araw = StridedView(vec(A2), (a_n, k_n, b_n), (1, a_n, 0), 0)  # Araw[a,k,b] == A2[a,k]
-    Aperm = permutedims(Araw, (2, 3, 1))                          # Aperm[k,b,a] == A2[a,k]
-    indA = (2, 3, 1)  # labels: axis1=k(2), axis2=b(3), axis3=a(1) (matches the a=1,k=2,b=3,n=4 convention)
+    Araw = StridedView(vec(A2), (a_n, k_n, b_n), (1, a_n, 0), 0)
+    Aperm = permutedims(Araw, (2, 3, 1))
+    indA = (2, 3, 1)
 
-    # B[k,n]: negative stride along k (Bneg[k,n] == Bfull[k_n - k + 1, n] for
-    # the underlying flat data, i.e. a reversed-row view), built manually
-    # per the strided_integration.jl idiom for negative-stride views.
+    # B[k,n]: reversed-row view (negative stride along k).
     Bdata = randn(k_n * n_n)
     Bneg = StridedView(Bdata, (k_n, n_n), (-1, k_n), k_n - 1)
     indB = (2, 4)
 
-    # C[a,n,b]: sliced destination with a nonzero base offset, embedded in a
-    # larger backing array, with a nontrivial starting value (to exercise
-    # beta on this same fixture).
+    # C[a,n,b]: sliced out of a larger array, nonzero base offset, nonzero
+    # starting value (so beta is exercised on this fixture too).
     Cbig = randn(a_n + 2, n_n + 3, b_n + 1)
     Csub = view(Cbig, 2:(a_n + 1), 2:(n_n + 1), 1:b_n)
     Cv = StridedView(Csub)
@@ -158,9 +121,6 @@ end
 
     Cstart = copy(Csub)
 
-    # Independent reference: plain nested loops over logical (a,k,b,n)
-    # indices, indexing Aperm/Bneg/Cstart directly (never via AxisGroup,
-    # BlockDescriptor, plan_contract, or execute!).
     alpha, beta = 1.3, 0.6
     Cref = zeros(a_n, n_n, b_n)
     for bb in 1:b_n, nn in 1:n_n, aa in 1:a_n
@@ -175,10 +135,7 @@ end
     plan = QuasiStrided.plan_contract(Cv, Aperm, indA, Bneg, indB, indC; kernel = kernel, mc = 3, kc = 4, nc = 3)
     QuasiStrided.execute!(plan, alpha, beta)
 
-    # rtol scaled by k_n*eps(Float64): same summation-reordering rationale as
-    # _macro_rtol, spelled out inline since this fixture builds Cref by hand
-    # rather than through _random_macro_case.
-    @test isapprox(Array(Csub), Cref; rtol = 50 * k_n * eps(Float64))
+    @test isapprox(Array(Csub), Cref; rtol = _macro_rtol(Float64, k_n))
 end
 
 # =====================================================================
@@ -189,34 +146,30 @@ end
     rng = MersenneTwister(0xBE7A_0001)
     kernel = ScalarKernel(Val(4), Val(3), Float64)
     Ma, Ka, Na = 11, 10, 9
-    mc = kc = nc = 4  # ceil(11/4)=3, ceil(10/4)=3, ceil(9/4)=3 blocks: >= 2 in each dimension
+    mc = kc = nc = 4  # 3 blocks in each dimension
 
     Amat = randn(rng, Ma, Ka)
     Bmat = randn(rng, Ka, Na)
     Cstart = randn(rng, Ma, Na)
     Cmat = copy(Cstart)
-    Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
-    indA, indB, indC = (1, 2), (2, 3), (1, 3)
 
     alpha, beta = 2.5, 0.75
-    plan = QuasiStrided.plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, mc = mc, kc = kc, nc = nc)
-    QuasiStrided.execute!(plan, alpha, beta)
+    QuasiStrided.execute!(_dense_plan(Cmat, Amat, Bmat, kernel, mc, kc, nc), alpha, beta)
 
     expected = alpha .* (Amat * Bmat) .+ beta .* Cstart
     @test isapprox(Cmat, expected; rtol = _macro_rtol(Float64, Ka))
 
     @testset "beta=0 with NaN-filled starting C: never read, result finite and correct" begin
         Cmat2 = fill(NaN, Ma, Na)
-        Cv2 = StridedView(Cmat2)
-        plan2 = QuasiStrided.plan_contract(Cv2, Av, indA, Bv, indB, indC; kernel = kernel, mc = mc, kc = kc, nc = nc)
-        QuasiStrided.execute!(plan2, alpha, 0.0)
+        QuasiStrided.execute!(_dense_plan(Cmat2, Amat, Bmat, kernel, mc, kc, nc), alpha, 0.0)
         @test all(isfinite, Cmat2)
         @test isapprox(Cmat2, alpha .* (Amat * Bmat); rtol = _macro_rtol(Float64, Ka))
     end
 end
 
 # =====================================================================
-# 4. Short-circuits: alpha=0 (never reads poisoned A/B) and K=0 (ditto).
+# 4. Short-circuits: alpha=0 and K=0 must never read poisoned A/B. Tested
+# exactly, not approximately: the only arithmetic that may happen is C*beta.
 # =====================================================================
 
 @testset "macro driver: short-circuits never read poisoned A/B" begin
@@ -224,34 +177,21 @@ end
 
     @testset "alpha=0" begin
         Ma, Ka, Na = 11, 10, 9
-        Apoison = fill(NaN, Ma, Ka)
-        Bpoison = fill(Inf, Ka, Na)
         Cstart = randn(Ma, Na)
         Cmat = copy(Cstart)
-        Av, Bv, Cv = StridedView(Apoison), StridedView(Bpoison), StridedView(Cmat)
-        indA, indB, indC = (1, 2), (2, 3), (1, 3)
-
         beta = 1.25
-        plan = QuasiStrided.plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, mc = 4, kc = 4, nc = 4)
+        plan = _dense_plan(Cmat, fill(NaN, Ma, Ka), fill(Inf, Ka, Na), kernel, 4, 4, 4)
         QuasiStrided.execute!(plan, 0.0, beta)
-        # Exact (not approximate): the only arithmetic that should occur is
-        # scaling C by beta, which is the same single floating-point
-        # operation performed on the LHS and RHS here.
         @test Cmat == beta .* Cstart
         @test all(isfinite, Cmat)
     end
 
     @testset "K=0 (empty contracted axis)" begin
         Ma, Na = 5, 4
-        Apoison = fill(NaN, Ma, 0)  # K axis length 0
-        Bpoison = fill(Inf, 0, Na)
         Cstart = randn(Ma, Na)
         Cmat = copy(Cstart)
-        Av, Bv, Cv = StridedView(Apoison), StridedView(Bpoison), StridedView(Cmat)
-        indA, indB, indC = (1, 2), (2, 3), (1, 3)
-
         beta = 0.5
-        plan = QuasiStrided.plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, mc = 4, kc = 4, nc = 4)
+        plan = _dense_plan(Cmat, fill(NaN, Ma, 0), fill(Inf, 0, Na), kernel, 4, 4, 4)
         QuasiStrided.execute!(plan, 1.0, beta)
         @test Cmat == beta .* Cstart
         @test all(isfinite, Cmat)
@@ -259,26 +199,15 @@ end
 end
 
 # =====================================================================
-# 5. Staleness / buffer-poisoning: packed-panel reuse is the macro-blocking-
-# specific new risk (the old tile-by-tile driver packed one sliver per tile
-# and never reused a buffer across output tiles). Written defensively: the
-# real ContractPlan's field names are owned by the concurrent Macro-C
-# implementation and are not available here, so this discovers candidate
-# scratch-buffer fields generically via `fieldnames`/`eltype` rather than
-# hardcoding names. Only Vector{<:Integer} fields (index/offset buffers) and
-# Vector{<:AbstractFloat} fields whose name contains "pack" are poisoned --
-# deliberately NOT every AbstractFloat vector, to avoid ever poisoning a
-# field that might alias C's own output storage.
+# 5. Staleness: packed-panel reuse is the macro-blocking-specific risk (the
+# old driver packed one sliver per tile and reused nothing across tiles).
+# Buffers are discovered by name/eltype rather than hardcoded: only
+# Vector{<:Integer} fields and "pack"-named float vectors are poisoned, so
+# nothing that could alias C's own storage is ever touched.
 # =====================================================================
 
-"""
-    _poison_plan_scratch_buffers!(plan) -> Vector{Symbol}
-
-Best-effort, generic buffer poisoning. Returns the field names it actually
-poisoned, so the test can report (rather than silently pass) if the real
-`ContractPlan` exposes no field matching the heuristic -- see the note at
-the call site below.
-"""
+# Returns the fields it poisoned, so the test can warn rather than silently
+# pass if no field matches the heuristic.
 function _poison_plan_scratch_buffers!(plan)
     poisoned = Symbol[]
     for fname in fieldnames(typeof(plan))
@@ -304,15 +233,12 @@ end
     Bmat = randn(rng, Ka, Na)
     Cstart = randn(rng, Ma, Na)
     Cmat = copy(Cstart)
-    Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
-    indA, indB, indC = (1, 2), (2, 3), (1, 3)
 
-    plan = QuasiStrided.plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, mc = mc, kc = kc, nc = nc)
+    plan = _dense_plan(Cmat, Amat, Bmat, kernel, mc, kc, nc)
     poisoned = _poison_plan_scratch_buffers!(plan)
     if isempty(poisoned)
-        @warn "macro driver staleness test: no plan field matched the packed/index-buffer heuristic; " *
-            "field names were $(fieldnames(typeof(plan))). The main process should add a targeted " *
-            "poisoning branch for the real scratch-buffer field name(s) at integration time."
+        @warn "macro driver staleness test: no plan field matched the packed/index-buffer " *
+            "heuristic; fields were $(fieldnames(typeof(plan)))."
     end
 
     alpha, beta = 2.5, 0.75
@@ -320,10 +246,8 @@ end
     expected = alpha .* (Amat * Bmat) .+ beta .* Cstart
     @test isapprox(Cmat, expected; rtol = _macro_rtol(Float64, Ka))
 
-    # Poison again and execute a *second* time on the same (reused) plan, to
-    # specifically target reuse-across-calls staleness (as opposed to reuse
-    # only within the many blocks of a single execute! call, already
-    # exercised above).
+    # Again on the same (reused) plan: targets staleness across calls, as
+    # opposed to across the blocks of one call.
     _poison_plan_scratch_buffers!(plan)
     copyto!(Cmat, Cstart)
     QuasiStrided.execute!(plan, alpha, beta)
@@ -331,37 +255,21 @@ end
 end
 
 # =====================================================================
-# 6. execute! vs execute_tilewise! agreement, on the same randomized cases
-# as testset 1 (same seed -> same case sequence).
+# 6. execute! vs execute_tilewise!, on testset 1's exact cases (same seed).
+# The two agree only to within summation-order rounding: same arithmetic,
+# different block/tile iteration order.
 # =====================================================================
 
 @testset "macro driver: execute! agrees with execute_tilewise! (old driver oracle)" begin
     for case in _macro_random_cases(0x5A17_D817)
-        (; Ma, Ka, Na, mc, kc, nc, kernel, alpha, beta, Amat, Bmat, Cstart, T) = case
+        (; Ka, mc, kc, nc, kernel, alpha, beta, Amat, Bmat, Cstart, T) = case
 
         Cmat_macro = copy(Cstart)
-        Av, Bv = StridedView(Amat), StridedView(Bmat)
-        indA, indB, indC = (1, 2), (2, 3), (1, 3)
-        plan_macro = QuasiStrided.plan_contract(
-            StridedView(Cmat_macro), Av, indA, Bv, indB, indC;
-            kernel = kernel, mc = mc, kc = kc, nc = nc
-        )
-        QuasiStrided.execute!(plan_macro, alpha, beta)
+        QuasiStrided.execute!(_dense_plan(Cmat_macro, Amat, Bmat, kernel, mc, kc, nc), alpha, beta)
 
         Cmat_tw = copy(Cstart)
-        plan_tw = QuasiStrided.plan_contract(
-            StridedView(Cmat_tw), Av, indA, Bv, indB, indC;
-            kernel = kernel, mc = mc, kc = kc, nc = nc
-        )
-        QuasiStrided.execute_tilewise!(plan_tw, alpha, beta)
+        QuasiStrided.execute_tilewise!(_dense_plan(Cmat_tw, Amat, Bmat, kernel, mc, kc, nc), alpha, beta)
 
-        # Both are implementations of the same contraction, agreeing only to
-        # within summation-order rounding (same rationale/scale as
-        # _macro_rtol) -- not bit-identical, per docs/decisions.md's runtime-
-        # switches note that reordering work is bitwise identical only when
-        # the *arithmetic* performed is unchanged, which holds here (both
-        # drivers use the same kernel/complex-method-equivalent, only the
-        # block/tile iteration order differs).
         @test isapprox(Cmat_macro, Cmat_tw; rtol = _macro_rtol(T, Ka))
     end
 end
@@ -389,26 +297,16 @@ end
     Ma, Ka, Na = 9, 7, 6
     Amat = randn(rng, Ma, Ka)
     Bmat = randn(rng, Ka, Na)
-    indA, indB, indC = (1, 2), (2, 3), (1, 3)
-    Av, Bv = StridedView(Amat), StridedView(Bmat)
 
     @testset "mc/kc/nc each larger than the corresponding Q: must clamp, not error" begin
         Cmat = zeros(Ma, Na)
-        plan = QuasiStrided.plan_contract(
-            StridedView(Cmat), Av, indA, Bv, indB, indC;
-            kernel = kernel, mc = 10_000, kc = 10_000, nc = 10_000
-        )
-        QuasiStrided.execute!(plan, 1.0, 0.0)
+        QuasiStrided.execute!(_dense_plan(Cmat, Amat, Bmat, kernel, 10_000, 10_000, 10_000), 1.0, 0.0)
         @test isapprox(Cmat, Amat * Bmat; rtol = _macro_rtol(Float64, Ka))
     end
 
     @testset "mc=nc=1: many single-row/single-column blocks" begin
         Cmat = zeros(Ma, Na)
-        plan = QuasiStrided.plan_contract(
-            StridedView(Cmat), Av, indA, Bv, indB, indC;
-            kernel = kernel, mc = 1, kc = 3, nc = 1
-        )
-        QuasiStrided.execute!(plan, 1.0, 0.0)
+        QuasiStrided.execute!(_dense_plan(Cmat, Amat, Bmat, kernel, 1, 3, 1), 1.0, 0.0)
         @test isapprox(Cmat, Amat * Bmat; rtol = _macro_rtol(Float64, Ka))
     end
 
@@ -416,43 +314,28 @@ end
         Cmat = randn(rng, Ma, Na)
         Cstart = copy(Cmat)
         alpha, beta = 1.7, 0.3
-        plan = QuasiStrided.plan_contract(
-            StridedView(Cmat), Av, indA, Bv, indB, indC;
-            kernel = kernel, mc = 4, kc = 1, nc = 4
-        )
-        QuasiStrided.execute!(plan, alpha, beta)
+        QuasiStrided.execute!(_dense_plan(Cmat, Amat, Bmat, kernel, 4, 1, 4), alpha, beta)
         expected = alpha .* (Amat * Bmat) .+ beta .* Cstart
         @test isapprox(Cmat, expected; rtol = _macro_rtol(Float64, Ka))
     end
 end
 
 # =====================================================================
-# 8. Irregular (ScatterAxis) slivers at nonzero offset within a macro
-# block (Phase D Fable review, should-fix 1). `describe_block`/`_axis_of`
-# are called at every sliver boundary with the sliver's offset *within
-# its block's buffer* as `first` -- for a dense 2-index matmul (all
-# other testsets here) that offset always lands on a `regular` (affine)
-# classification, because a single-label AxisGroup map never has an
-# internal "carry" boundary to break the constant-stride sequence. This
-# fixture uses a 2-label M group (labels a,q) where A's own map is
-# naturally contiguous (q-stride == a_n * a-stride, satisfying the fold
-# condition even across an a-boundary) but C's map is deliberately padded
-# so it does NOT satisfy that condition -- forcing `describe_block` to
-# return `regular=false` (a `ScatterAxis`) for the C-side sliver that
-# straddles the a/q boundary, with `first > 0` (it's the *second* sliver
-# of its macro block). `_axis_of` is the single helper used identically
-# for the M, N, and K sides (driver.jl:126-129), so exercising it here
-# with a real regular=false/first>0 combination exercises the same code
-# path the N/K sides share.
+# 8. Irregular (ScatterAxis) sliver at nonzero offset within a macro block
+# (Phase D review, should-fix 1). Every other testset here uses a
+# single-label M/N/K group, which `describe_block` always classifies
+# regular -- one dimension has no internal carry boundary to break the
+# constant stride. This fixture uses a 2-label M group (a,q) where A's map
+# folds across the a/q boundary but C's, deliberately padded, does not, so
+# the C-side sliver at first>0 really is classified irregular. `_axis_of`
+# is the one helper all three sides share, so this covers N and K too.
 # =====================================================================
 
 @testset "macro driver: irregular sliver at nonzero offset (multi-label M group)" begin
     a_n, q_n, k_n, n_n = 7, 2, 5, 3   # M = (a,q), a fastest; length 14
     pad = 3                            # breaks C's fold condition (a_n+pad != a_n)
 
-    # A[a,q,k]: dense, naturally contiguous (a-stride=1, q-stride=a_n) --
-    # A's own M-map is affine even across an a-boundary.
-    Amat = randn(a_n, q_n, k_n)
+    Amat = randn(a_n, q_n, k_n)        # dense: a-stride 1, q-stride a_n
     Av = StridedView(Amat)
     indA = (1, 2, 3)
 
@@ -460,15 +343,14 @@ end
     Bv = StridedView(Bmat)
     indB = (3, 4)
 
-    # C[a,q,n]: embedded with a gap in the q dimension (q-stride = a_n+pad,
-    # not a_n) so C's M-map fails the fold condition at every a-boundary.
+    # C[a,q,n] with a gap in q (q-stride = a_n+pad), so C's M-map fails the
+    # fold condition at every a-boundary.
     Cbig = randn(a_n + pad, q_n, n_n)
     Csub = view(Cbig, 1:a_n, :, :)
     Cv = StridedView(Csub)
     indC = (1, 2, 4)
     Cstart = copy(Csub)
 
-    # Independent reference: plain nested loops over logical indices.
     alpha, beta = 1.7, -0.4
     Cref = zeros(a_n, q_n, n_n)
     for nn in 1:n_n, qq in 1:q_n, aa in 1:a_n
@@ -480,17 +362,15 @@ end
     end
 
     kernel = ScalarKernel(Val(4), Val(3), Float64)
-    # mc=8 gives the first ic block (mblock=8) two MR=4 slivers: rfirst=0
-    # (coords 0:3, a=0..3,q=0 -- no boundary) and rfirst=4 (coords 4:7 ==
-    # a=4,5,6,q=0 then a=0,q=1 -- crosses the a/q boundary, the case this
-    # testset targets). The second (tail) ic block, mblock=6, exercises a
-    # further rfirst=4 sliver (regular, no crossing) -- included for
-    # tail-block coverage, not because it's irregular.
+    # mc=8 gives the first ic block two MR=4 slivers; the second (rfirst=4,
+    # coords a=4,5,6,q=0 then a=0,q=1) crosses the a/q boundary -- the
+    # irregular-at-nonzero-offset case. The 6-wide tail block adds tail
+    # coverage.
     plan = QuasiStrided.plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, mc = 8, kc = 5, nc = 3)
     QuasiStrided.execute!(plan, alpha, beta)
-    @test isapprox(Array(Csub), Cref; rtol = 50 * k_n * eps(Float64))
+    @test isapprox(Array(Csub), Cref; rtol = _macro_rtol(Float64, k_n))
 
-    # execute! vs execute_tilewise! agreement on the same irregular fixture.
+    # execute! vs execute_tilewise! on the same irregular fixture.
     Cbig_tw = randn(a_n + pad, q_n, n_n)
     Cbig_tw[1:a_n, :, :] .= Cstart
     Csub_tw = view(Cbig_tw, 1:a_n, :, :)
@@ -499,5 +379,5 @@ end
         kernel = kernel, mc = 8, kc = 5, nc = 3
     )
     QuasiStrided.execute_tilewise!(plan_tw, alpha, beta)
-    @test isapprox(Array(Csub_tw), Array(Csub); rtol = 50 * k_n * eps(Float64))
+    @test isapprox(Array(Csub_tw), Array(Csub); rtol = _macro_rtol(Float64, k_n))
 end

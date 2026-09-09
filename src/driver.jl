@@ -1,12 +1,10 @@
 # contract!'s frozen signature/label semantics: see docs/decisions.md.
-# Planning (label resolution, AxisGroup/buffer construction) is split from
-# execution (the tiling loop) so a ContractPlan can be built once and reused:
+# Planning (labels, AxisGroups, buffers) is split from execution so a
+# ContractPlan can be built once and reused:
 #   plan_contract(...) -> ContractPlan; execute!(plan, alpha, beta); contract! = both.
-#
-# execute! implements a BLIS five-loop (NC/KC/MC) macro-blocking nest with
-# packed-panel reuse (docs/decisions.md, "Macro-blocking milestone"). The
-# pre-macro-blocking tile-by-tile driver is kept, unexported, as
-# `execute_tilewise!` -- an independent correctness oracle for the nest below.
+# execute! is a BLIS five-loop (NC/KC/MC) nest with packed-panel reuse; the
+# pre-macro-blocking tile-by-tile driver is kept unexported as
+# `execute_tilewise!`, an independent correctness oracle for it.
 
 # Classify every label in indA ∪ indB ∪ indC into M/N/K. Returns
 # (mlabels, nlabels, klabels) in indA/indB appearance order. Per (inA,inB,inC):
@@ -110,37 +108,26 @@ end
 
 _default_kernel(::Type{T}) where {T} = ScalarKernel(Val(8), Val(6), T)
 
-# ----------------------------------------------------------------------------
-# Phase A binding requirement (docs/decisions.md): a Union{AffineAxis,
-# ScatterAxis} value must never flow into a QSTile-producing call that is
-# then passed on to further type-unstable code inside the hot loop. The
-# fix is a function barrier: branch on `descriptor.regular` to build a
-# concretely-typed axis, then immediately call a `where {R<:Axis, C<:Axis}`
-# method with it. Julia specializes that method per concrete (R,C)
-# combination that's actually invoked, so QSTile's own type parameters are
-# always fully resolved *inside* the specialized method -- never left as a
-# partially-applied UnionAll. Each helper below performs exactly one such
-# hop and does no further type-unstable dispatch itself.
-# ----------------------------------------------------------------------------
-
+# LOAD-BEARING (Phase A binding requirement, docs/decisions.md): a
+# Union{AffineAxis,ScatterAxis} must never flow into a QSTile that is then
+# passed on to further type-unstable code. `_axis_of` produces the union;
+# every consumer below is a `where {R<:Axis, C<:Axis}` barrier method that
+# Julia specializes per concrete (R,C), so QSTile is never left as a
+# partially-applied UnionAll (which boxes). Do not collapse these helpers
+# into their call sites, and do not let a union cross any other boundary.
 @inline function _axis_of(d::BlockDescriptor, buffer::Vector{Int}, first::Int)
     return d.regular ? AffineAxis(d.base, d.stride, d.count) :
         ScatterAxis(view(buffer, (first + 1):(first + d.count)), d.count)
 end
 
-@inline function _pack_a_sliver!(
-        packed::AbstractVector{T}, storage::S, base::Int,
+# `pack!` is pack_a! or pack_b! (a plain function, specialized on, never a
+# closure); A and B differ only in which of rows/cols is the k axis, which
+# the caller has already resolved.
+@inline function _pack_sliver!(
+        pack!::PF, packed::AbstractVector{T}, storage::S, base::Int,
         rows::R, cols::C, kernel
-    ) where {T, S, R <: Axis, C <: Axis}
-    pack_a!(packed, SourceTile(storage, base, rows, cols), kernel, identity)
-    return nothing
-end
-
-@inline function _pack_b_sliver!(
-        packed::AbstractVector{T}, storage::S, base::Int,
-        rows::R, cols::C, kernel
-    ) where {T, S, R <: Axis, C <: Axis}
-    pack_b!(packed, SourceTile(storage, base, rows, cols), kernel, identity)
+    ) where {PF, T, S, R <: Axis, C <: Axis}
+    pack!(packed, SourceTile(storage, base, rows, cols), kernel, identity)
     return nothing
 end
 
@@ -154,28 +141,43 @@ end
     return nothing
 end
 
-@inline function _scale_micro_tile!(storage::S, base::Int, rows::R, cols::C, beta) where {S, R <: Axis, C <: Axis}
+@inline function _scale_micro_tile!(
+        storage::S, base::Int, rows::R, cols::C, beta
+    ) where {S, R <: Axis, C <: Axis}
     destination = DestinationTile(storage, base, rows, cols)
     scale_tile!(destination, beta)
     return nothing
 end
 
-# Sliver `s`'s region within a shared packed-panel buffer, at the CURRENT
-# block's actual depth `kc_len` (which may be < the buffer's max per-sliver
-# capacity on a tail K block: the buffer is sized for `kc_eff`, the largest
-# depth any block ever uses). Called identically from the packing step and
-# the consuming (execute_tile!) step for a given (jc,pc,ic) iteration, so the
-# two always agree on where sliver `s` lives.
+# Sliver `s`'s region within a shared packed panel, at the CURRENT block's
+# depth `kc_len` (< the buffer's per-sliver capacity on a tail K block, since
+# the buffer is sized for kc_eff). Used by both the packing and the consuming
+# step of a (jc,pc,ic) iteration, so the two cannot disagree.
 @inline function _sliver_range(reg_tile::Int, kc_len::Int, s::Int)
     stride = reg_tile * kc_len
     lo = s * stride + 1
     return lo:(lo + stride - 1)
 end
 
+# Classify each register sliver of a just-filled macro block. Shared by the
+# N side (jc: B/C) and the M side (ic: A/C), which are structurally identical.
+@inline function _classify_slivers!(
+        desc1::Vector{BlockDescriptor}, desc2::Vector{BlockDescriptor},
+        buf1::Vector{Int}, buf2::Vector{Int},
+        blocklen::Int, reg_tile::Int, nslivers::Int
+    )
+    for s in 0:(nslivers - 1)
+        sfirst = s * reg_tile
+        scount = min(reg_tile, blocklen - sfirst)
+        desc1[s + 1] = describe_block(buf1, sfirst, scount)
+        desc2[s + 1] = describe_block(buf2, sfirst, scount)
+    end
+    return nothing
+end
+
 # Apply beta once to every element of C at MR x NR granularity, without
-# reading A or B. Shared by execute!'s and execute_tilewise!'s Qk==0/alpha==0
-# short-circuit; uses the tw_* (MR/NR-sized) buffers since no macro blocking
-# is needed for a beta-only pass.
+# reading A or B. Shared by both drivers' Qk==0/alpha==0 short-circuit; uses
+# the tw_* (MR/NR-sized) buffers, since a beta-only pass needs no blocking.
 function _scale_all_of_C!(plan, betaT::T, MRk::Int, NRk::Int, Qm::Int, Qn::Int) where {T}
     m_bufs = (plan.tw_m_buf_A, plan.tw_m_buf_C)
     n_bufs = (plan.tw_n_buf_B, plan.tw_n_buf_C)
@@ -202,19 +204,9 @@ end
 
 Reusable plan/workspace from [`plan_contract`](@ref): resolved M/N/K
 `AxisGroup`s, kernel, operand storage/base, the effective [`Blocking`](@ref),
-and every buffer [`execute!`](@ref)/[`execute_tilewise!`](@ref) need --
-sized once here, never (re)allocated there.
-
-Field layout (implementation detail, not part of the frozen interface):
-`m_buf_*`/`n_buf_*`/`k_buf_*` are macro-block-sized offset buffers (one
-`fill_offsets!` call per `jc`/`pc`/`ic` block, reused for every sliver inside
-it); `m_desc_*`/`n_desc_*` are per-sliver `BlockDescriptor` tables classified
-from those buffers via the 3-arg `describe_block` (one classification per
-sliver, no buffer refill); `packed_a`/`packed_b` hold every A/B sliver of the
-current macro panel contiguously (`cld(mc,MRk)`/`cld(nc,NRk)` slivers at
-`kc`-eff depth). `execute_tilewise!` (the correctness oracle) uses its own,
-separate `tw_*` buffers/panels, sized off `mr`/`nr`/`blocking.kc` only, so it
-shares no mutable state with the macro-blocking buffers above.
+and every buffer [`execute!`](@ref)/[`execute_tilewise!`](@ref) need -- sized
+once here, never (re)allocated there. Field layout is an implementation
+detail, not part of the frozen interface; see the comments below.
 """
 struct ContractPlan{T, Kern, GM <: AxisGroup, GN <: AxisGroup, GK <: AxisGroup, SA, SB, SC}
     kernel::Kern
@@ -229,7 +221,8 @@ struct ContractPlan{T, Kern, GM <: AxisGroup, GN <: AxisGroup, GK <: AxisGroup, 
     Cstorage::SC
     Cbase::Int
 
-    # Macro-block-sized offset buffers (refilled once per jc/pc/ic block).
+    # Macro-block-sized offset buffers: one fill_offsets! per jc/pc/ic block,
+    # reused by every sliver inside it.
     m_buf_A::Vector{Int}
     m_buf_C::Vector{Int}
     n_buf_B::Vector{Int}
@@ -237,8 +230,8 @@ struct ContractPlan{T, Kern, GM <: AxisGroup, GN <: AxisGroup, GK <: AxisGroup, 
     k_buf_A::Vector{Int}
     k_buf_B::Vector{Int}
 
-    # Per-sliver descriptor tables (classified from the buffers above via the
-    # 3-arg describe_block; reused across the pc/ic loops for a given jc/ic).
+    # Per-sliver descriptors classified from the buffers above (3-arg
+    # describe_block), reused across the pc/ic loops of a given jc/ic.
     m_desc_A::Vector{BlockDescriptor}
     m_desc_C::Vector{BlockDescriptor}
     n_desc_B::Vector{BlockDescriptor}
@@ -249,6 +242,8 @@ struct ContractPlan{T, Kern, GM <: AxisGroup, GN <: AxisGroup, GK <: AxisGroup, 
     packed_b::Vector{T}
 
     # execute_tilewise!'s own small buffers (MR/NR/blocking.kc-sized).
+    # Deliberately NOT shared with the macro buffers above: the oracle must
+    # have no mutable state in common with the code it checks.
     tw_m_buf_A::Vector{Int}
     tw_m_buf_C::Vector{Int}
     tw_n_buf_B::Vector{Int}
@@ -267,15 +262,13 @@ end
                   mc = nothing, kc = nothing, nc = nothing) -> ContractPlan
 
 Planning phase of [`contract!`](@ref): resolves labels into M/N/K
-`AxisGroup`s, validates matched axis lengths and matching eltypes, and
-preallocates every buffer [`execute!`](@ref) needs. `mc`/`kc`/`nc` are the
-macro-blocking factors (see [`Blocking`](@ref)); a `nothing` keyword uses the
-corresponding field of `default_blocking(kernel)`. Each is validated `>= 1`
-(`ArgumentError` otherwise, via `Blocking`'s own constructor), then rounded/
-clamped into the *effective* blocking actually stored on the returned plan:
-`mc`/`nc` round up to a whole `mr(kernel)`/`nr(kernel)` multiple and are then
-capped at the contraction's own M/N extent (also rounded up to a register-
-tile multiple); `kc` is capped at the contraction's own K extent. Throws
+`AxisGroup`s, validates matched axis lengths and eltypes, and preallocates
+every buffer [`execute!`](@ref) needs. `mc`/`kc`/`nc` are the macro-blocking
+factors (see [`Blocking`](@ref)); a `nothing` keyword takes the corresponding
+field of `default_blocking(kernel)`. Each must be `>= 1`, and is then rounded
+and clamped into the *effective* blocking stored on the plan: `mc`/`nc` round
+up to a whole `mr(kernel)`/`nr(kernel)` multiple, then cap at the M/N extent
+(likewise rounded up); `kc` caps at the K extent. Throws
 `ArgumentError`/`DimensionMismatch` on invalid input.
 """
 function plan_contract(
@@ -318,10 +311,9 @@ function plan_contract(
     mc_rounded = _roundup(requested.mc, MRk)
     nc_rounded = _roundup(requested.nc, NRk)
 
-    # Qm/Qn/Qk == 0 short-circuits before any block loop ever reads these
-    # values; the register-tile-sized floor here just keeps `Blocking`'s
-    # own >=1 invariant and every buffer well-formed (never reached by a
-    # loop bound in that case).
+    # On an empty extent both drivers short-circuit before reading these, so
+    # the floor here only keeps Blocking's >=1 invariant and the buffers
+    # well-formed.
     mc_eff = Qm == 0 ? MRk : min(mc_rounded, _roundup(Qm, MRk))
     nc_eff = Qn == 0 ? NRk : min(nc_rounded, _roundup(Qn, NRk))
     kc_eff = Qk == 0 ? 1 : min(requested.kc, Qk)
@@ -379,14 +371,12 @@ end
 Execution phase of [`contract!`](@ref): a BLIS five-loop macro-blocking nest
 over `plan.blocking` (`nc`/loop 5, `kc`/loop 4, `mc`/loop 3), packing the
 whole B panel once per `(jc,pc)` and the whole A panel once per `(jc,pc,ic)`,
-then running `execute_tile!` over every micro-tile in that `(jc,pc,ic)` block
-(loops 2/1). `beta` applies exactly once per output element (only on the
-first K block, `pc == 0`; later K blocks accumulate with `beta = one(T)`).
-Empty output is a no-op; empty K or `alpha == 0` applies `beta` once without
-reading `A`/`B`. No buffer is (re)allocated here. Returns `plan.Cstorage`.
-
-See [`execute_tilewise!`](@ref) for the independent tile-by-tile oracle this
-is checked against.
+then running `execute_tile!` over every micro-tile of that block (loops 2/1).
+`beta` applies exactly once per output element (on the first K block only;
+later ones accumulate with `beta = one(T)`). Empty output is a no-op; empty K
+or `alpha == 0` applies `beta` once without reading `A`/`B`. Allocation-free.
+Returns `plan.Cstorage`. See [`execute_tilewise!`](@ref) for the independent
+tile-by-tile oracle this is checked against.
 """
 function execute!(plan::ContractPlan{T}, alpha::Number, beta::Number) where {T}
     alphaT = convert(T, alpha)
@@ -403,9 +393,8 @@ function execute!(plan::ContractPlan{T}, alpha::Number, beta::Number) where {T}
     # Empty output: no-op, nothing read or written at all.
     (Qm == 0 || Qn == 0) && return plan.Cstorage
 
+    # Nothing to contract: beta-only pass, A and B never read.
     if Qk == 0 || iszero(alphaT)
-        # Whole-contraction short-circuit: apply beta once to all of C,
-        # never reading A or B (no packing at all).
         _scale_all_of_C!(plan, betaT, MRk, NRk, Qm, Qn)
         return plan.Cstorage
     end
@@ -420,12 +409,10 @@ function execute!(plan::ContractPlan{T}, alpha::Number, beta::Number) where {T}
         nblock = min(nc_eff, Qn - jc)
         n_slivers = cld(nblock, NRk)
         fill_offsets!((plan.n_buf_B, plan.n_buf_C), plan.ngroup, jc, nblock)
-        for s in 0:(n_slivers - 1)
-            sfirst = s * NRk
-            scount = min(NRk, nblock - sfirst)
-            plan.n_desc_B[s + 1] = describe_block(plan.n_buf_B, sfirst, scount)
-            plan.n_desc_C[s + 1] = describe_block(plan.n_buf_C, sfirst, scount)
-        end
+        _classify_slivers!(
+            plan.n_desc_B, plan.n_desc_C, plan.n_buf_B, plan.n_buf_C,
+            nblock, NRk, n_slivers
+        )
 
         # --- loop 4: pc over K in steps of kc_eff ---
         pc = 0
@@ -445,7 +432,7 @@ function execute!(plan::ContractPlan{T}, alpha::Number, beta::Number) where {T}
                 sfirst = s * NRk
                 colsB = _axis_of(plan.n_desc_B[s + 1], plan.n_buf_B, sfirst)
                 bview = view(plan.packed_b, _sliver_range(NRk, kblock, s))
-                _pack_b_sliver!(bview, plan.Bstorage, plan.Bbase, rowsB_k, colsB, kernel)
+                _pack_sliver!(pack_b!, bview, plan.Bstorage, plan.Bbase, rowsB_k, colsB, kernel)
             end
 
             # --- loop 3: ic over M in steps of mc_eff ---
@@ -454,19 +441,17 @@ function execute!(plan::ContractPlan{T}, alpha::Number, beta::Number) where {T}
                 mblock = min(mc_eff, Qm - ic)
                 m_slivers = cld(mblock, MRk)
                 fill_offsets!((plan.m_buf_A, plan.m_buf_C), plan.mgroup, ic, mblock)
-                for r in 0:(m_slivers - 1)
-                    rfirst = r * MRk
-                    rcount = min(MRk, mblock - rfirst)
-                    plan.m_desc_A[r + 1] = describe_block(plan.m_buf_A, rfirst, rcount)
-                    plan.m_desc_C[r + 1] = describe_block(plan.m_buf_C, rfirst, rcount)
-                end
+                _classify_slivers!(
+                    plan.m_desc_A, plan.m_desc_C, plan.m_buf_A, plan.m_buf_C,
+                    mblock, MRk, m_slivers
+                )
 
                 # Pack the whole A panel for this (jc, pc, ic): every M-sliver.
                 for r in 0:(m_slivers - 1)
                     rfirst = r * MRk
                     rowsA = _axis_of(plan.m_desc_A[r + 1], plan.m_buf_A, rfirst)
                     aview = view(plan.packed_a, _sliver_range(MRk, kblock, r))
-                    _pack_a_sliver!(aview, plan.Astorage, plan.Abase, rowsA, colsA_k, kernel)
+                    _pack_sliver!(pack_a!, aview, plan.Astorage, plan.Abase, rowsA, colsA_k, kernel)
                 end
 
                 # --- loop 2: jr over N-slivers; loop 1: ir over M-slivers ---
@@ -502,15 +487,13 @@ end
     execute_tilewise!(plan::ContractPlan, alpha::Number, beta::Number)
 
 Unexported. The pre-macro-blocking driver, kept as the independent
-correctness oracle for [`execute!`](@ref)'s five-loop macro-blocking nest
-(docs/decisions.md, "Macro-blocking milestone", item 5): tiles M/N in steps
-of `mr(plan.kernel)`/`nr(plan.kernel)`, and for each output tile, K in one or
-more `plan.blocking.kc`-sized panels (the same role the removed `kc_panel`
-keyword played), packing then calling `execute_tile!` with `beta` on the
-first panel and `one(T)` on later ones. Uses its own small `tw_*` buffers on
-`plan` (sized off `mr`/`nr`/`plan.blocking.kc` only, never the macro `mc`/
-`nc` blocks), so it shares no mutable state with `execute!`'s macro buffers.
-No buffer is (re)allocated here.
+correctness oracle for [`execute!`](@ref) (docs/decisions.md,
+"Macro-blocking milestone", item 5): tiles M/N in steps of
+`mr(plan.kernel)`/`nr(plan.kernel)` and, per output tile, K in
+`plan.blocking.kc`-sized panels, packing one sliver per tile and calling
+`execute_tile!` with `beta` on the first panel and `one(T)` on later ones.
+Uses only its own `tw_*` buffers, so it shares no mutable state with
+`execute!`. Allocation-free.
 """
 function execute_tilewise!(plan::ContractPlan{T}, alpha::Number, beta::Number) where {T}
     alphaT = convert(T, alpha)
@@ -558,8 +541,8 @@ function execute_tilewise!(plan::ContractPlan{T}, alpha::Number, beta::Number) w
                 colsK_A = _axis_of(dK_A, plan.tw_k_buf_A, 0)
                 rowsK_B = _axis_of(dK_B, plan.tw_k_buf_B, 0)
 
-                _pack_a_sliver!(plan.tw_packed_a, plan.Astorage, plan.Abase, rowsA, colsK_A, kernel)
-                _pack_b_sliver!(plan.tw_packed_b, plan.Bstorage, plan.Bbase, rowsK_B, colsB, kernel)
+                _pack_sliver!(pack_a!, plan.tw_packed_a, plan.Astorage, plan.Abase, rowsA, colsK_A, kernel)
+                _pack_sliver!(pack_b!, plan.tw_packed_b, plan.Bstorage, plan.Bbase, rowsK_B, colsB, kernel)
 
                 beta_eff = firstpanel ? betaT : one(T)
                 _execute_micro_tile!(

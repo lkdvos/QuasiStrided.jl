@@ -216,22 +216,13 @@ struct BlockDescriptor
 end
 
 """
+    describe_block(buffer::Vector{Int}, first::Int, count::Int)::BlockDescriptor
     describe_block(buffer::Vector{Int}, count::Int)::BlockDescriptor
 
-Classify `buffer[1:count]` (read-only) as empty/singleton/affine/irregular
-(overflow-checked adjacent differences; a non-representable diff is
-irregular). Throws `ArgumentError`/`DimensionMismatch` for bad `count`.
-Forwards to [`describe_block(buffer, first, count)`](@ref) with `first = 0`.
-"""
-describe_block(buffer::Vector{Int}, count::Int) = describe_block(buffer, 0, count)
-
-"""
-    describe_block(buffer::Vector{Int}, first::Int, count::Int)::BlockDescriptor
-
-Classify `buffer[first+1 : first+count]` (zero-based `first`, read-only) as
-empty/singleton/affine/irregular (overflow-checked adjacent differences; a
-non-representable diff is irregular). Throws `ArgumentError`/
-`DimensionMismatch` for bad `first`/`count`.
+Classify `buffer[first+1 : first+count]` (zero-based `first`, defaulting to
+0; read-only) as empty/singleton/affine/irregular (overflow-checked adjacent
+differences; a non-representable diff is irregular). Throws
+`ArgumentError`/`DimensionMismatch` for bad `first`/`count`.
 """
 function describe_block(buffer::Vector{Int}, first::Int, count::Int)
     first >= 0 || throw(ArgumentError("first must be nonnegative, got $first"))
@@ -258,6 +249,8 @@ function describe_block(buffer::Vector{Int}, first::Int, count::Int)
 
     return BlockDescriptor(base, stride, count, true)
 end
+
+describe_block(buffer::Vector{Int}, count::Int) = describe_block(buffer, 0, count)
 
 """
     block_descriptors!(buffers::NTuple{P,Vector{Int}}, g::AxisGroup{D,P}, first::Int, count::Int)

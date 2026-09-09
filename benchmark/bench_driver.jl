@@ -1,24 +1,15 @@
-# benchmark/bench_driver.jl
+# Phase E block-size sweep (docs/decisions.md, "Macro-blocking milestone").
+# Times `execute!` over a grid of shapes x (mc,kc,nc) for
+# ScalarKernel/SIMDKernel x Float64/Float32, against `execute_tilewise!` and
+# a `LinearAlgebra.mul!` line, and reports a geomean ranking. No cache model
+# or probing by design -- just measured grid points.
 #
-# Phase E benchmark sweep (docs/decisions.md, "Macro-blocking milestone" ->
-# Block-size policy / Phase E). Measures `execute!` (the new BLIS five-loop
-# macro-blocking driver) against `execute_tilewise!` (the old per-tile
-# driver, kept unexported as the correctness oracle) and a
-# `LinearAlgebra.mul!` reference point across a grid of shapes and
-# `(mc,kc,nc)` blocking factors, for `ScalarKernel`/`SIMDKernel` x
-# `Float64`/`Float32`. The `mul!` line is a reference point (BLAS doing a
-# plain dense matmul on the same M/K/N), not a target this package competes
-# with -- do not read a "slower than mul!" ratio as a problem.
+# `mul!` is BLAS on a plain dense matmul of the same M/K/N: a reference
+# point, NOT a target -- a "slower than mul!" ratio is not a problem.
 #
-# Usage:
 #   julia --project=. benchmark/bench_driver.jl
 #
-# Writes raw results + PROVENANCE.txt to
-# benchmark/results/<hostname>-<yyyy-mm-dd>/.
-#
-# What this script deliberately does NOT do (see docs/decisions.md,
-# "Block-size policy"): no cache-probing or analytical model. It just times
-# hardcoded grid points and reports a geomean ranking.
+# writes results + PROVENANCE.txt to benchmark/results/<hostname>-<date>/.
 
 using QuasiStrided
 using QuasiStrided: execute_tilewise!
@@ -29,9 +20,7 @@ using Random
 using Dates
 using Printf
 
-# ----------------------------------------------------------------------
 # Single-core measurement discipline (this project's standing rule).
-# ----------------------------------------------------------------------
 LinearAlgebra.BLAS.set_num_threads(1)
 const NTHREADS = Threads.nthreads()
 const BLAS_THREADS = LinearAlgebra.BLAS.get_num_threads()
@@ -41,10 +30,7 @@ if NTHREADS != 1
         "below should not be trusted as the reference-machine numbers."
 end
 
-# ----------------------------------------------------------------------
-# Timing helper: warm up once (discarded), then `reps` timed calls,
-# median (not mean) reported, per the project's measurement discipline.
-# ----------------------------------------------------------------------
+# Warm up once (discarded), then `reps` timed calls; median, not mean.
 function median_time_s(f!::Function; reps::Int = 5)
     f!()  # warm-up, discarded
     ts = Vector{Float64}(undef, reps)
@@ -57,9 +43,7 @@ function median_time_s(f!::Function; reps::Int = 5)
     return median(ts)
 end
 
-# ----------------------------------------------------------------------
 # Shapes.
-# ----------------------------------------------------------------------
 struct ShapeSpec
     name::String
     Ma::Int
@@ -67,9 +51,6 @@ struct ShapeSpec
     Na::Int
 end
 
-# A first trial run showed 256^3 at ~5ms/execute! call on this machine
-# (scalar kernel), so 512^3 (~40ms) comfortably fits the grid sweep too --
-# included below rather than skipped.
 const MAIN_SHAPES = [
     ShapeSpec("64^3", 64, 64, 64),
     ShapeSpec("128^3", 128, 128, 128),
@@ -90,10 +71,8 @@ function build_plain(::Type{T}, spec::ShapeSpec, rng) where {T}
         Amat = Amat, Bmat = Bmat, Cmat = Cmat)
 end
 
-# 3-index / scattered-C-row fixture, adapted from
-# test/test_macro_driver.jl's "3-index StridedViews fixture"
-# (permuted A, negative-stride B, sliced-with-offset C), sized up per the
-# task spec (a~64, k~64, b~16, n~64).
+# 3-index / scattered-C fixture (permuted A, negative-stride B,
+# sliced-with-offset C), sized up from test/test_macro_driver.jl's version.
 function build_scattered(::Type{T}, rng) where {T}
     a_n, k_n, b_n, n_n = 64, 64, 16, 64
     A2 = randn(rng, T, a_n, k_n)
@@ -110,18 +89,8 @@ function build_scattered(::Type{T}, rng) where {T}
     return (Av = Aperm, indA = indA, Bv = Bneg, indB = indB, Cv = Cv, indC = indC)
 end
 
-# ----------------------------------------------------------------------
-# (mc,kc,nc) grids. A first trial run of a reduced 9-point corners+center
-# grid finished this whole script in ~24s on this machine, so the full
-# task-spec grid fits comfortably: Float64 uses the spec's exact
-# kc in {128,256,512} x mc in {64,128,256,512} x nc in {768,1536,3072} (36
-# combos -- the spec text says "27" but lists 4 mc values against 3 kc/nc
-# values, which multiplies to 36, not 27; using the literal sets rather
-# than guessing which one was the typo). Float32 uses an analogous grid
-# scaled ~1.5x (Float32 packs more per cache line, so it can profitably use
-# larger blocks): kc in {192,384,768}, mc in {96,192,384,768},
-# nc in {1152,2304,4608} (36 combos).
-# ----------------------------------------------------------------------
+# (mc,kc,nc) grids, 36 combos each. Float32's is Float64's scaled ~1.5x:
+# it packs more per cache line, so it can profitably use larger blocks.
 function full_grid(mcs, kcs, ncs)
     combos = Tuple{Int, Int, Int}[]
     for kc in kcs, mc in mcs, nc in ncs
@@ -139,9 +108,7 @@ grid_for(::Type{Float32}) = GRID_F32
 const KERNEL_CTORS = (ScalarKernel = ScalarKernel, SIMDKernel = SIMDKernel)
 const DTYPES = (Float64, Float32)
 
-# ----------------------------------------------------------------------
 # Header.
-# ----------------------------------------------------------------------
 function print_header(io::IO)
     println(io, "# QuasiStrided.jl benchmark/bench_driver.jl")
     println(io, "cpu = ", Sys.CPU_NAME)
@@ -159,9 +126,7 @@ function print_header(io::IO)
 end
 print_header(stdout)
 
-# ----------------------------------------------------------------------
 # Output location.
-# ----------------------------------------------------------------------
 const OUTDIR = joinpath(
     @__DIR__, "results", "$(gethostname())-$(Dates.format(now(), "yyyy-mm-dd"))"
 )
@@ -186,10 +151,8 @@ function log_row(kernel_name, T, shapename, Ma, Ka, Na, method, mc, kc, nc, reps
     flush(csv_io)
 end
 
-# ----------------------------------------------------------------------
 # Canary: a small, fixed case run at the start / middle / end of the sweep
 # (A, B, A' pattern) to catch drift (thermal throttling, background load).
-# ----------------------------------------------------------------------
 const CANARY_SHAPE = ShapeSpec("canary_64^3", 64, 64, 64)
 const CANARY_COMBO = (128, 256, 1536)
 
@@ -206,12 +169,9 @@ function run_canary(rng, label::String)
     return t
 end
 
-# ----------------------------------------------------------------------
 # Main grid sweep over the small/medium shapes.
-# ----------------------------------------------------------------------
 rng = MersenneTwister(0xB3_C4_0001)
 
-results = Dict{Tuple{String, DataType, Int}, Float64}()  # (kernel,dtype,combo_idx)->geomean ratio, filled later
 raw_execute = Vector{NamedTuple}()  # for ranking
 
 canary_results = Float64[]
@@ -266,10 +226,8 @@ end
 
 push!(canary_results, run_canary(rng, "B (middle)"))
 
-# ----------------------------------------------------------------------
 # mul! reference line (once per dtype/shape -- it doesn't depend on
 # kernel/blocking at all).
-# ----------------------------------------------------------------------
 for T in DTYPES
     for spec in MAIN_SHAPES
         fx = build_plain(T, spec, rng)
@@ -278,11 +236,9 @@ for T in DTYPES
     end
 end
 
-# ----------------------------------------------------------------------
 # Extra shapes (large cuboid + scattered-C fixture): only at each dtype's
 # center combo, both kernels, to check the grid-derived winner generalizes
 # without paying for the full grid at these more expensive shapes.
-# ----------------------------------------------------------------------
 for (kname, kctor) in pairs(KERNEL_CTORS)
     for T in DTYPES
         kernel = kctor(Val(8), Val(6), T)
@@ -338,9 +294,7 @@ end
 push!(canary_results, run_canary(rng, "A' (end)"))
 close(csv_io)
 
-# ----------------------------------------------------------------------
 # Canary spread report.
-# ----------------------------------------------------------------------
 canary_spread = (maximum(canary_results) - minimum(canary_results)) / minimum(canary_results)
 open(CANARY_PATH, "w") do io
     println(io, "label,median_seconds")
@@ -351,13 +305,11 @@ open(CANARY_PATH, "w") do io
 end
 println("canary spread (max-min)/min = ", @sprintf("%.4f", canary_spread))
 
-# ----------------------------------------------------------------------
 # Ranking: geomean ratio of execute! time across all (kernel,shape) pairs
 # in the main grid, per dtype, at each (mc,kc,nc) combo. Each shape/kernel
 # time is first normalized by that (kernel,dtype,shape)'s own minimum
 # across the combo grid, so shapes of very different absolute cost weigh
 # equally in the geomean.
-# ----------------------------------------------------------------------
 function rank_combos(raw, T::DataType)
     rows = filter(r -> r.dtype == T, raw)
     # minimum time per (kernel,shape) across all combos
@@ -412,9 +364,7 @@ open(SUMMARY_PATH, "w") do io
 end
 println(read(SUMMARY_PATH, String))
 
-# ----------------------------------------------------------------------
 # Provenance.
-# ----------------------------------------------------------------------
 commit = try
     strip(read(`git -C $(joinpath(@__DIR__, "..")) rev-parse HEAD`, String))
 catch

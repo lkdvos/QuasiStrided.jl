@@ -26,8 +26,8 @@ end
 """
     pack_a!(packed::AbstractVector{T}, source::QSTile, kernel::KernelDescriptor{MR,NR,T}, transform) -> packed
 
-Pack an A source tile into `packed` (reused buffer, e.g. a `Vector{T}` or a
-`SubArray` panel sliver) at `packed_a_offset(kernel, i, p) == i +
+Pack an A source tile into `packed` (a reused `Vector{T}`, or a `SubArray`
+sliver of a macro panel) at `packed_a_offset(kernel, i, p) == i +
 mr(kernel)*p`. `source` has `0 <= m <= mr(kernel)` rows and `kc =
 ncols(source)` columns; `packed` needs `length >= packed_a_length(kernel,
 kc)`. Row `i < m` writes `convert(T, transform(A[i,p]))`; padding rows (`i >=
@@ -69,8 +69,8 @@ end
 """
     pack_b!(packed::AbstractVector{T}, source::QSTile, kernel::KernelDescriptor{MR,NR,T}, transform) -> packed
 
-Pack a B source tile into `packed` (reused buffer, e.g. a `Vector{T}` or a
-`SubArray` panel sliver) at `packed_b_offset(kernel, j, p) == j +
+Pack a B source tile into `packed` (a reused `Vector{T}`, or a `SubArray`
+sliver of a macro panel) at `packed_b_offset(kernel, j, p) == j +
 nr(kernel)*p` (not column-major). `source` has `kc = nrows(source)` rows and
 `0 <= n <= nr(kernel)` columns; `packed` needs `length >=
 packed_b_length(kernel, kc)`. Column `j < n` writes `convert(T,
