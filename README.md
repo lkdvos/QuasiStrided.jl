@@ -8,8 +8,9 @@ A native-Julia dense tensor contraction engine for `StridedView`s
 fixed-shape microkernels, in the style of block-scatter-matrix tensor
 contraction (BSMTC, Matthews arXiv:1607.00291).
 
-**First-milestone status**: not registered, not yet performance-tuned beyond
-a scalar reference and one SIMD kernel candidate. See "Status" below.
+**Status**: not registered. Includes a BLIS five-loop (`NC`/`KC`/`MC`)
+macro-blocking driver with packed-panel reuse, on top of a scalar reference
+and one SIMD kernel candidate. See "Status" below.
 
 ## Install
 
@@ -51,7 +52,7 @@ execute!(plan, 1.0, 0.0)
 | Tiles | `AffineAxis`, `ScatterAxis`, `SourceTile`, `DestinationTile`, `axis_from_descriptor`, `nrows`, `ncols` |
 | Packing | `pack_a!`, `pack_b!` |
 | Kernels | `ScalarKernel`, `SIMDKernel`, `zero_accumulator`, `accumulate`, `scale_tile!`, `store_tile!`, `execute_tile!` |
-| Driver | `contract!`, `plan_contract`, `execute!`, `ContractPlan` |
+| Driver | `contract!`, `plan_contract`, `execute!`, `ContractPlan`, `Blocking`, `default_blocking` |
 
 Every exported name has a docstring. `docs/decisions.md` is the authoritative
 record of every frozen interface and why; read it before changing any public
@@ -59,7 +60,7 @@ signature.
 
 ## Status
 
-Implemented and tested (`Pkg.test()`: **12630/12630**, Julia 1.12.6, Xeon
+Implemented and tested (`Pkg.test()`: **12903/12903**, Julia 1.12.6, Xeon
 Gold 6244 / Cascade Lake):
 
 - Grouped-axis (block-scatter) indexing with an independent oracle, overflow
@@ -70,17 +71,25 @@ Gold 6244 / Cascade Lake):
   register-resident and zero-allocation (`@code_llvm`/`@allocated`);
   **3.9-6.3x faster than scalar** across K-depths 1-256, swappable in the
   driver with no driver changes.
-- A serial `contract!` driver: arbitrary free/reduction axis labeling, output
-  tiling, multiple K panels with beta applied exactly once.
-- Two independent review passes (Fable-model + Sonnet-High), findings
-  triaged and fixed, disposition in `docs/decisions.md`.
+- A BLIS five-loop (`NC`/`KC`/`MC`) macro-blocking `execute!`, packing a
+  reusable B panel per `(jc,pc)` block and a reusable A panel per
+  `(jc,pc,ic)` block, **1.66x-10.5x faster than the pre-macro-blocking
+  tile-by-tile driver** (kept, unexported, as `execute_tilewise!`, the
+  correctness oracle it's checked against) across the measured shape/kernel
+  grid — single machine, see `docs/decisions.md`'s Phase E section for the
+  full sweep and provenance. `Blocking`/`default_blocking` expose tunable,
+  measured (not modeled/probed) `mc`/`kc`/`nc` defaults.
+- Zero steady-state allocation for `SIMDKernel` through the full driver
+  (Julia >= 1.11; the earlier undiagnosed residual allocation was
+  root-caused and closed by this rewrite — see `docs/decisions.md`).
+- Three independent review passes (two Fable-model, one Sonnet-High),
+  findings triaged and fixed, disposition in `docs/decisions.md`.
 
 **Not implemented** (deliberately, this milestone): einsum string parsing;
 batch axes, diagonals, or isolated reductions; a separate beta-addend tensor;
-cache-blocked macro-kernel tuning, autotuning, or CPU-dispatch tables;
-threading; GPU execution; complex-arithmetic methods (planar/1m/3m); K
-padding. See the companion design specs for the full deferred list.
-
-**Known open item**: `execute!`'s driver loop has a small, not yet
-diagnosed, non-zero steady-state allocation (both kernels' own packing and
-arithmetic are independently zero-allocation) — see `STATUS.md`.
+autotuning across shapes, CPU-dispatch tables, or cache-probing/analytical
+block-size derivation (the current defaults are hardcoded per-dtype
+constants measured on one machine, by design — see `docs/decisions.md`'s
+"Block-size policy"); threading; GPU execution; complex-arithmetic methods
+(planar/1m/3m); K padding. See the companion design specs and
+`docs/decisions.md` for the full deferred list.

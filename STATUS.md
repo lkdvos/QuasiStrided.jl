@@ -8,9 +8,9 @@ detail belongs in `docs/decisions.md`.
 ## Integrated revision
 
 Local git repo at `/mnt/home/ldevos/Projects/QuasiStrided.jl`, `main` branch,
-HEAD `5d50a53` ("Phase 4: review since Phase 2b, close 2 coverage gaps,
-driver benchmarks"). No remote; not published, registered, or pushed, per
-handoff §2/§8.
+HEAD `f9beb3d` ("Fix Phase F review findings: stale docstring and
+mislabeled bench CSV") — the macro-blocking milestone's closing commit.
+Published (see "Published" below).
 
 ## Environment
 
@@ -46,11 +46,10 @@ handoff §2/§8.
       test). Driver-level benchmark taken (planning vs. steady-state
       execution cost). README.md finished. This file is the closing record.
 
-**Final test count: `Pkg.test("QuasiStrided")` → 12627/12627 passing.**
-
 Full narrative for every decision, integration reconciliation, and review
 disposition is in `docs/decisions.md` — that file, not this one, is
-authoritative for *why*. This file is only *what phase, what count*.
+authoritative for *why*. This file is only *what phase, what count*. (Test
+count as of this milestone's close: see the macro-blocking section below.)
 
 ## What works, measured
 
@@ -74,17 +73,12 @@ authoritative for *why*. This file is only *what phase, what count*.
   dispatch. Zero allocation now confirmed for both direct-`KernelDescriptor`
   and `ScalarKernel`/`SIMDKernel`-forwarding call paths. Full account in
   `docs/decisions.md`'s Phase 2b finding 5.
-- **New, smaller, open item**: `execute!` through the driver still allocates
-  (~10.7 KB scalar / ~5.9 KB SIMD for a small multi-tile/multi-panel case;
-  down from ~15/~10.2 KB before the fix above, since packing no longer
-  contributes). `ScalarKernel`'s 176 B/call `zero_accumulator` is
-  spec-accepted (a `Matrix{T}`, explicitly fine for the scalar reference);
-  the rest is somewhere in `src/driver.jl`'s own tiling loop, not yet
-  diagnosed. This is the next thing to pick up if continuing performance
-  work — scope a fresh bounded diagnosis task to `src/driver.jl` the same
-  way the packing one was scoped to `src/packing.jl`.
-- No cache-blocked macro-kernel, autotuning, threading, or GPU path — all
-  explicitly deferred per the handoff, not gaps in this milestone's scope.
+- **RESOLVED by the macro-blocking milestone below**: `execute!`'s
+  ~10.7 KB scalar / ~5.9 KB SIMD residual allocation was root-caused (Phase
+  A) and closed as a side effect of the macro-blocking rewrite (Phase C) —
+  see that section below and `docs/decisions.md`.
+- No autotuning, threading, or GPU path — still explicitly deferred, not
+  gaps in scope. Cache-blocked macro-kernel is now implemented (see below).
 
 ## Published
 
@@ -103,16 +97,17 @@ by marking the two allocation assertions `skip=(VERSION < v"1.11")` in
 gap stays visible rather than hidden. `julia = "1.10"` compat is otherwise
 honored (all 13026 correctness assertions pass on 1.10).
 
-## Macro-blocking milestone (in progress)
+## Macro-blocking milestone — complete
 
-Opened 2026-09-08. Goal: replace `execute!`'s tile-by-tile loop with a
-BLIS five-loop (`NC`/`KC`/`MC`) macro-blocking nest with packed-panel reuse.
-Full design and orchestration plan recorded in the session's plan file;
-narrative decisions in `docs/decisions.md`'s "Macro-blocking milestone"
-section (frozen interfaces, block-size policy, allocation root-cause).
+Opened and closed 2026-09-08. Goal: replace `execute!`'s tile-by-tile loop
+with a BLIS five-loop (`NC`/`KC`/`MC`) macro-blocking nest with
+packed-panel reuse. Full design and orchestration plan recorded in the
+session's plan file; narrative decisions in `docs/decisions.md`'s
+"Macro-blocking milestone" section (frozen interfaces, block-size policy,
+allocation root-cause, Phase D/E/F dispositions).
 
-`fable_review_macro_used: true` (launched at Phase D; disposition to be
-recorded in `docs/decisions.md` once triaged).
+`fable_review_macro_used: true` — spent, do not relaunch for this
+milestone. Disposition recorded in `docs/decisions.md`'s "Phase D" section.
 
 - [x] **Phase A** (scout + diagnose): interface/CPU inventory done; the
       residual `execute!` allocation noted below (~10.7 KB scalar / ~5.9 KB
@@ -152,10 +147,25 @@ recorded in `docs/decisions.md` once triaged).
       in `docs/decisions.md` ("Phase E") and
       `benchmark/results/ccqlin038.flatironinstitute.org-2026-09-08/`.
       `Pkg.test()` after the constant swap: 12903/12903 passing.
-- [ ] Phase F (final review, docs, CI, merge)
+- [x] **Phase F** (final review, docs, CI, merge): Sonnet-High review of
+      everything since Phase D — no blocking findings; two should-fix
+      items (a stale "provisional" docstring in `src/blocking.jl` after
+      Phase E's constants landed, and a committed benchmark CSV whose
+      `reps` column was mislabeled `5` instead of the actual `9` used)
+      fixed and verified; independently re-derived and confirmed the
+      Phase D should-fix test's core claim (`describe_block` returns
+      `regular=false` at `first=4` for the intended fixture) rather than
+      trusting the prior write-up. README/STATUS/`docs/decisions.md`
+      updated to describe the shipped macro-blocking driver and measured
+      defaults. `Pkg.test()`: 12903/12903 passing.
+
+**Final test count: `Pkg.test("QuasiStrided")` → 12903/12903 passing.**
 
 ## Next task
 
-Continue the macro-blocking milestone above (Phase B next). Otherwise, a
-future session extending scope should start by reading `docs/decisions.md`
-in full, then the two specs' "Deferred work"/"Deferred extensions" sections.
+None outstanding for the macro-blocking milestone's scope. Deferred items
+for a future session (see README "Not implemented" and
+`docs/decisions.md`'s "Explicitly deferred" note): threading (state is
+already organized to not preclude it — see `docs/decisions.md`'s Phase D
+finding 4), autotuning across shapes, GPU, complex-arithmetic methods, K
+padding, orientation swap. Start by reading `docs/decisions.md` in full.
