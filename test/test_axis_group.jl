@@ -24,16 +24,16 @@ Enumerate every valid q in 0:Q-1 (Q = prod(lengths)) via `CartesianIndices`
 and compute each map's offset directly from coordinates and strides. Never
 touches AxisGroup.
 """
-function oracle_all_offsets(lengths::NTuple{D,Int}, strides::NTuple{P,NTuple{D,Int}}) where {D,P}
+function oracle_all_offsets(lengths::NTuple{D, Int}, strides::NTuple{P, NTuple{D, Int}}) where {D, P}
     if D == 0
         # Q = 1 (empty product), single coordinate (), all offsets zero.
         return [ntuple(_ -> 0, P)]
     end
     if any(==(0), lengths)
-        return NTuple{P,Int}[]
+        return NTuple{P, Int}[]
     end
     idxs = CartesianIndices(lengths)
-    out = Vector{NTuple{P,Int}}(undef, length(idxs))
+    out = Vector{NTuple{P, Int}}(undef, length(idxs))
     for (li, ci) in enumerate(idxs)
         x = Tuple(ci) .- 1 # zero-based coordinates
         out[li] = ntuple(P) do p
@@ -53,7 +53,7 @@ end
 Single-coordinate version of `oracle_all_offsets`, via direct indexing into
 `CartesianIndices` (not via any AxisGroup method).
 """
-function oracle_offset(lengths::NTuple{D,Int}, strides::NTuple{P,NTuple{D,Int}}, q::Int) where {D,P}
+function oracle_offset(lengths::NTuple{D, Int}, strides::NTuple{P, NTuple{D, Int}}, q::Int) where {D, P}
     if D == 0
         return ntuple(_ -> 0, P)
     end
@@ -200,7 +200,7 @@ end
     @test d2.regular == false
     @test buf2 == [0, 1, 2, 10, 11, 12]
     @test oracle_all_offsets((3, 2), ((1, 3), (1, 10))) ==
-          [(o1, o2) for (o1, o2) in zip([0, 1, 2, 3, 4, 5], [0, 1, 2, 10, 11, 12])]
+        [(o1, o2) for (o1, o2) in zip([0, 1, 2, 3, 4, 5], [0, 1, 2, 10, 11, 12])]
 
     Gn = normalize_group(G)
     @test axis_length(Gn) == 6

@@ -7,8 +7,10 @@
 # (mlabels, nlabels, klabels) in indA/indB appearance order. Per (inA,inB,inC):
 #   (T,F,T)->M  (F,T,T)->N  (T,T,F)->K  everything else -> ArgumentError
 # (labeled in C only, present in all three, or dangling in just A or B).
-function _classify_labels(indA::NTuple{NA,Int}, indB::NTuple{NB,Int},
-                           indC::NTuple{NC,Int}) where {NA,NB,NC}
+function _classify_labels(
+        indA::NTuple{NA, Int}, indB::NTuple{NB, Int},
+        indC::NTuple{NC, Int}
+    ) where {NA, NB, NC}
     allunique(indA) ||
         throw(ArgumentError("indA has a repeated label (diagonal), not supported: $indA"))
     allunique(indB) ||
@@ -26,17 +28,23 @@ function _classify_labels(indA::NTuple{NA,Int}, indB::NTuple{NB,Int},
         inB = lbl in setB
         inC = lbl in setC
         if inB && inC
-            throw(ArgumentError(
-                "label $lbl appears in indA, indB, and indC: labels present in all " *
-                "three operands (batch-like) are out of scope for this milestone"))
+            throw(
+                ArgumentError(
+                    "label $lbl appears in indA, indB, and indC: labels present in all " *
+                        "three operands (batch-like) are out of scope for this milestone"
+                )
+            )
         elseif inB && !inC
             push!(klabels, lbl)
         elseif !inB && inC
             push!(mlabels, lbl)
         else
-            throw(ArgumentError(
-                "label $lbl appears only in indA (not in indB or indC): not a valid " *
-                "free (M) or contracted (K) label"))
+            throw(
+                ArgumentError(
+                    "label $lbl appears only in indA (not in indB or indC): not a valid " *
+                        "free (M) or contracted (K) label"
+                )
+            )
         end
     end
 
@@ -51,9 +59,12 @@ function _classify_labels(indA::NTuple{NA,Int}, indB::NTuple{NB,Int},
         elseif !inA && inC
             push!(nlabels, lbl)
         else
-            throw(ArgumentError(
-                "label $lbl appears only in indB (not in indA or indC): not a valid " *
-                "free (N) or contracted (K) label"))
+            throw(
+                ArgumentError(
+                    "label $lbl appears only in indB (not in indA or indC): not a valid " *
+                        "free (N) or contracted (K) label"
+                )
+            )
         end
     end
 
@@ -69,17 +80,22 @@ end
 
 # Build the two-map AxisGroup for one of M/N/K: (v1,v2) is (A,C)/(B,C)/(A,B).
 # Raises DimensionMismatch on a matched-label length mismatch.
-function _build_pair_group(labels::Vector{Int},
-                            ind1::NTuple, v1::StridedView,
-                            ind2::NTuple, v2::StridedView)
+function _build_pair_group(
+        labels::Vector{Int},
+        ind1::NTuple, v1::StridedView,
+        ind2::NTuple, v2::StridedView
+    )
     D = length(labels)
     pos1 = ntuple(d -> findfirst(==(labels[d]), ind1)::Int, D)
     pos2 = ntuple(d -> findfirst(==(labels[d]), ind2)::Int, D)
     lens = ntuple(D) do d
         l1 = size(v1, pos1[d])
         l2 = size(v2, pos2[d])
-        l1 == l2 || throw(DimensionMismatch(
-            "label $(labels[d]) has mismatched axis length: $l1 vs $l2"))
+        l1 == l2 || throw(
+            DimensionMismatch(
+                "label $(labels[d]) has mismatched axis length: $l1 vs $l2"
+            )
+        )
         l1
     end
     s1 = ntuple(d -> Base.strides(v1)[pos1[d]], D)
@@ -96,7 +112,7 @@ Reusable plan/workspace from [`plan_contract`](@ref): resolved M/N/K
 `AxisGroup`s, kernel, operand storage/base, `kc_panel`, and every buffer
 [`execute!`](@ref) needs — sized once here, never (re)allocated there.
 """
-struct ContractPlan{T,Kern,GM<:AxisGroup,GN<:AxisGroup,GK<:AxisGroup,SA,SB,SC}
+struct ContractPlan{T, Kern, GM <: AxisGroup, GN <: AxisGroup, GK <: AxisGroup, SA, SB, SC}
     kernel::Kern
     mgroup::GM
     ngroup::GN
@@ -131,11 +147,13 @@ preallocates every buffer [`execute!`](@ref) needs. `kc_panel` defaults to
 one panel covering the whole contraction; pass a smaller value to force
 multiple K panels. Throws `ArgumentError`/`DimensionMismatch` on invalid input.
 """
-function plan_contract(C::StridedView, A::StridedView, indA::NTuple{NA,Int},
-                        B::StridedView, indB::NTuple{NB,Int},
-                        indC::NTuple{NC,Int};
-                        kernel = _default_kernel(eltype(C)),
-                        kc_panel::Int = typemax(Int)) where {NA,NB,NC}
+function plan_contract(
+        C::StridedView, A::StridedView, indA::NTuple{NA, Int},
+        B::StridedView, indB::NTuple{NB, Int},
+        indC::NTuple{NC, Int};
+        kernel = _default_kernel(eltype(C)),
+        kc_panel::Int = typemax(Int)
+    ) where {NA, NB, NC}
     T = eltype(C)
     eltype(A) === T ||
         throw(ArgumentError("eltype(A) = $(eltype(A)) does not match eltype(C) = $T"))
@@ -174,10 +192,12 @@ function plan_contract(C::StridedView, A::StridedView, indA::NTuple{NA,Int},
     packed_a = zeros(T, packed_a_length(kernel, kc_used))
     packed_b = zeros(T, packed_b_length(kernel, kc_used))
 
-    return ContractPlan(kernel, mgroup, ngroup, kgroup, kc_used,
-                         Astorage, Abase, Bstorage, Bbase, Cstorage, Cbase,
-                         m_buf_A, m_buf_C, n_buf_B, n_buf_C, k_buf_A, k_buf_B,
-                         packed_a, packed_b)
+    return ContractPlan(
+        kernel, mgroup, ngroup, kgroup, kc_used,
+        Astorage, Abase, Bstorage, Bbase, Cstorage, Cbase,
+        m_buf_A, m_buf_C, n_buf_B, n_buf_C, k_buf_A, k_buf_B,
+        packed_a, packed_b
+    )
 end
 
 """
@@ -263,8 +283,10 @@ function execute!(plan::ContractPlan{T}, alpha::Number, beta::Number) where {T}
                 pack_b!(plan.packed_b, source_B, kernel, identity)
 
                 beta_eff = firstpanel ? betaT : one(T)
-                execute_tile!(kernel, destination, plan.packed_a, plan.packed_b,
-                              kcount, alphaT, beta_eff)
+                execute_tile!(
+                    kernel, destination, plan.packed_a, plan.packed_b,
+                    kcount, alphaT, beta_eff
+                )
 
                 firstpanel = false
                 kfirst += kcount
@@ -294,11 +316,13 @@ Compute `C[indC] = alpha * sum_K A[indA] * B[indB] + beta * C[indC]`; see
 `execute!(plan_contract(C, A, indA, B, indB, indC), alpha, beta)` — use
 those directly to reuse a plan across calls. Returns `C`.
 """
-function contract!(C::StridedView, alpha::Number,
-                    A::StridedView, indA::NTuple{NA,Int},
-                    B::StridedView, indB::NTuple{NB,Int},
-                    beta::Number,
-                    indC::NTuple{NC,Int}) where {NA,NB,NC}
+function contract!(
+        C::StridedView, alpha::Number,
+        A::StridedView, indA::NTuple{NA, Int},
+        B::StridedView, indB::NTuple{NB, Int},
+        beta::Number,
+        indC::NTuple{NC, Int}
+    ) where {NA, NB, NC}
     plan = plan_contract(C, A, indA, B, indB, indC)
     execute!(plan, alpha, beta)
     return C

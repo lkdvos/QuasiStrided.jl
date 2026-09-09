@@ -9,7 +9,7 @@ using SIMD: Vec
     @testset "zero_accumulator" begin
         k = SIMDKernel(Val(8), Val(6), Float64)
         acc = zero_accumulator(k)
-        @test acc isa NTuple{12,Vec{4,Float64}}
+        @test acc isa NTuple{12, Vec{4, Float64}}
         @test all(v -> all(iszero, Tuple(v)), acc)
     end
 
@@ -100,7 +100,7 @@ using SIMD: Vec
             execute_tile!(ksimd, dst_simd, pa, pb, kc, alpha, beta)
             execute_tile!(kscalar, dst_scalar, pa, pb, kc, alpha, beta)
 
-            @test storage_simd ≈ storage_scalar atol=1e-10 rtol=1e-10
+            @test storage_simd ≈ storage_scalar atol = 1.0e-10 rtol = 1.0e-10
         end
     end
 
@@ -127,7 +127,7 @@ using SIMD: Vec
             execute_tile!(ksimd, dst_simd, pa, pb, kc, 1.7, 0.3)
             execute_tile!(kscalar, dst_scalar, pa, pb, kc, 1.7, 0.3)
 
-            @test storage_simd ≈ storage_scalar atol=1e-10 rtol=1e-10
+            @test storage_simd ≈ storage_scalar atol = 1.0e-10 rtol = 1.0e-10
             @test all(==(-123.0), storage_simd[1:pad])
             @test all(==(-123.0), storage_simd[(end - pad + 1):end])
         end

@@ -108,6 +108,7 @@ function check_view_axisgroup(v::StridedView, axes::NTuple{D, Int}) where {D}
         end
         @test par[b + relo + 1] == v[vidx...]
     end
+    return
 end
 
 @testset "Strided integration: permuted view" begin

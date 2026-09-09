@@ -36,7 +36,7 @@ using QuasiStrided: ScalarKernel, scale_tile!, QSTile, AffineAxis, ScatterAxis
         acc_init = [100.0 200.0; 300.0 400.0]
         acc = copy(acc_init)
         accumulate(k, acc, packed_a, packed_b, 1)
-        expected = acc_init .+ [1.0*3.0 1.0*4.0; 2.0*3.0 2.0*4.0]
+        expected = acc_init .+ [1.0 * 3.0 1.0 * 4.0; 2.0 * 3.0 2.0 * 4.0]
         @test acc == expected
 
         # Running two separate kc=1 accumulate calls must match one kc=2 call
@@ -55,7 +55,7 @@ using QuasiStrided: ScalarKernel, scale_tile!, QSTile, AffineAxis, ScatterAxis
     # --- destination helpers for the tests below ---
 
     # Storage with `pad` canary cells before and after the addressed region.
-    function canary_storage(len::Int; pad::Int=3, sentinel=-999.0)
+    function canary_storage(len::Int; pad::Int = 3, sentinel = -999.0)
         v = fill(sentinel, len + 2 * pad)
         return v, pad
     end
@@ -79,7 +79,7 @@ using QuasiStrided: ScalarKernel, scale_tile!, QSTile, AffineAxis, ScatterAxis
 
         expected = Amat * Bmat  # (MR, NR)
 
-        storage, pad = canary_storage(MR * NR; pad=4, sentinel=NaN)
+        storage, pad = canary_storage(MR * NR; pad = 4, sentinel = NaN)
         base = pad
         rows = AffineAxis(0, 1, MR)   # unit-stride rows, contiguous
         cols = AffineAxis(0, MR, NR)  # column-major within the tile
@@ -104,7 +104,7 @@ using QuasiStrided: ScalarKernel, scale_tile!, QSTile, AffineAxis, ScatterAxis
         acc = zero_accumulator(k)
         accumulate(k, acc, packed_a, packed_b, kc)
         # acc[i+1,j+1] = a[i]*b[j]
-        expected = [1.0*10 1.0*100; 2.0*10 2.0*100; 3.0*10 3.0*100]
+        expected = [1.0 * 10 1.0 * 100; 2.0 * 10 2.0 * 100; 3.0 * 10 3.0 * 100]
         @test acc == expected
 
         # Case 1: unit rows, unit cols but interleaved via a nonunit column stride.
@@ -141,7 +141,7 @@ using QuasiStrided: ScalarKernel, scale_tile!, QSTile, AffineAxis, ScatterAxis
         packed_b = [10.0, 100.0]
         acc = zero_accumulator(k)
         accumulate(k, acc, packed_a, packed_b, kc)
-        expected = [1.0*10 1.0*100; 2.0*10 2.0*100; 3.0*10 3.0*100]
+        expected = [1.0 * 10 1.0 * 100; 2.0 * 10 2.0 * 100; 3.0 * 10 3.0 * 100]
 
         row_offsets = [5, 40, 12]   # arbitrary, distinct, irregular
         col_offsets = [0, 200]
@@ -286,7 +286,7 @@ using QuasiStrided: ScalarKernel, scale_tile!, QSTile, AffineAxis, ScatterAxis
         expected = alpha .* (Amat * Bmat) .+ beta .* Cold
         for i in 0:(MR - 1), j in 0:(NR - 1)
             addr = i * NR + j
-            @test dest.storage[addr + 1] ≈ expected[i + 1, j + 1] atol=1e-10
+            @test dest.storage[addr + 1] ≈ expected[i + 1, j + 1] atol = 1.0e-10
         end
     end
 

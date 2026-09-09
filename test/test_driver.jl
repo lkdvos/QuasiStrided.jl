@@ -290,15 +290,19 @@ end
     Av, Bv = StridedView(Amat), StridedView(Bmat)
 
     Cmat_s = zeros(Ma, Na)
-    plan_s = plan_contract(StridedView(Cmat_s), Av, indA, Bv, indB, indC;
-                            kernel = ScalarKernel(Val(4), Val(3), Float64), kc_panel = 4)
+    plan_s = plan_contract(
+        StridedView(Cmat_s), Av, indA, Bv, indB, indC;
+        kernel = ScalarKernel(Val(4), Val(3), Float64), kc_panel = 4
+    )
     execute!(plan_s, 1.0, 0.0)
     fill!(Cmat_s, 0.0)
     scalar_exec_allocs = @allocated execute!(plan_s, 1.0, 0.0)
 
     Cmat_v = zeros(Ma, Na)
-    plan_v = plan_contract(StridedView(Cmat_v), Av, indA, Bv, indB, indC;
-                            kernel = SIMDKernel(Val(4), Val(3), Float64), kc_panel = 4)
+    plan_v = plan_contract(
+        StridedView(Cmat_v), Av, indA, Bv, indB, indC;
+        kernel = SIMDKernel(Val(4), Val(3), Float64), kc_panel = 4
+    )
     execute!(plan_v, 1.0, 0.0)
     fill!(Cmat_v, 0.0)
     simd_exec_allocs = @allocated execute!(plan_v, 1.0, 0.0)

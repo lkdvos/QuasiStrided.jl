@@ -25,20 +25,24 @@ Irregular addressing: local `t` (`0 <= t < count`) maps to `offsets[t+1]`.
 `offsets` is **borrowed** (not copied); caller keeps `offsets[1:count]` valid
 for the axis's lifetime. `count <= length(offsets)`.
 """
-struct ScatterAxis{V<:AbstractVector{Int}}
+struct ScatterAxis{V <: AbstractVector{Int}}
     offsets::V
     count::Int
 
-    function ScatterAxis(offsets::V, count::Int) where {V<:AbstractVector{Int}}
+    function ScatterAxis(offsets::V, count::Int) where {V <: AbstractVector{Int}}
         count >= 0 || throw(ArgumentError("ScatterAxis count must be nonnegative, got $count"))
         count <= length(offsets) ||
-            throw(DimensionMismatch("ScatterAxis: offsets has length $(length(offsets)), " *
-                                     "need at least count = $count"))
+            throw(
+            DimensionMismatch(
+                "ScatterAxis: offsets has length $(length(offsets)), " *
+                    "need at least count = $count"
+            )
+        )
         return new{V}(offsets, count)
     end
 end
 
-const Axis = Union{AffineAxis,ScatterAxis}
+const Axis = Union{AffineAxis, ScatterAxis}
 
 """
     axis_length(ax::Union{AffineAxis,ScatterAxis})::Int
@@ -55,7 +59,7 @@ Unchecked offset for `t`; caller ensures `0 <= t < axis_length(ax)` (see
 [`checked_axis_offset`](@ref)).
 """
 @inline axis_offset(ax::AffineAxis, t::Int) = ax.base + t * ax.stride
-@inline axis_offset(ax::ScatterAxis, t::Int) = @inbounds ax.offsets[t+1]
+@inline axis_offset(ax::ScatterAxis, t::Int) = @inbounds ax.offsets[t + 1]
 
 """
     checked_axis_offset(ax::Union{AffineAxis,ScatterAxis}, t::Int)::Int
@@ -92,7 +96,7 @@ at the call site). Fields: `storage` (typically `Vector{T}`), `base`
 `ScatterAxis`). Logical `(i,j)` addresses `base + row_offset(i) +
 col_offset(j)`, converted to storage via "address + 1" for `Vector`s.
 """
-struct QSTile{S,R<:Axis,C<:Axis}
+struct QSTile{S, R <: Axis, C <: Axis}
     storage::S
     base::Int
     rows::R
@@ -150,7 +154,7 @@ Unchecked read at logical `(i,j)`; caller ensures it's in range (see
 [`checked_tile_load`](@ref)).
 """
 @inline function tile_load(tile::QSTile, i::Int, j::Int)
-    return @inbounds tile.storage[tile_offset(tile, i, j)+1]
+    return @inbounds tile.storage[tile_offset(tile, i, j) + 1]
 end
 
 """
@@ -160,7 +164,7 @@ Bounds-checked read: validates `(i,j)`, then a non-`@inbounds` storage read.
 """
 function checked_tile_load(tile::QSTile, i::Int, j::Int)
     addr = checked_tile_offset(tile, i, j)
-    return tile.storage[addr+1]
+    return tile.storage[addr + 1]
 end
 
 """
@@ -170,7 +174,7 @@ Unchecked write of `v` at logical `(i,j)`; caller ensures it's in range (see
 [`checked_tile_store!`](@ref)).
 """
 @inline function tile_store!(tile::QSTile, i::Int, j::Int, v)
-    @inbounds tile.storage[tile_offset(tile, i, j)+1] = v
+    @inbounds tile.storage[tile_offset(tile, i, j) + 1] = v
     return tile
 end
 
@@ -181,7 +185,7 @@ Bounds-checked write: validates `(i,j)`, then a non-`@inbounds` storage write.
 """
 function checked_tile_store!(tile::QSTile, i::Int, j::Int, v)
     addr = checked_tile_offset(tile, i, j)
-    tile.storage[addr+1] = v
+    tile.storage[addr + 1] = v
     return tile
 end
 

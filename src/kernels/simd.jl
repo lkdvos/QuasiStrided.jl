@@ -17,16 +17,20 @@ Explicit-SIMD microkernel using `SIMD.Vec{W,T}` lanes. Wraps a
 column per K step. The 3-argument form defaults `W` via
 [`_default_lanewidth`](@ref).
 """
-struct SIMDKernel{MR,NR,T,W} <: DescriptorKernel{MR,NR,T}
-    descriptor::KernelDescriptor{MR,NR,T}
+struct SIMDKernel{MR, NR, T, W} <: DescriptorKernel{MR, NR, T}
+    descriptor::KernelDescriptor{MR, NR, T}
 
-    function SIMDKernel{MR,NR,T,W}(descriptor::KernelDescriptor{MR,NR,T}) where {MR,NR,T,W}
+    function SIMDKernel{MR, NR, T, W}(descriptor::KernelDescriptor{MR, NR, T}) where {MR, NR, T, W}
         W isa Int && W > 0 ||
             throw(ArgumentError("SIMDKernel requires an Int vector width W > 0, got W = $W"))
         mod(MR, W) == 0 ||
-            throw(ArgumentError("SIMDKernel requires mr(kernel) = $MR to be a multiple of " *
-                                 "the vector width W = $W"))
-        return new{MR,NR,T,W}(descriptor)
+            throw(
+            ArgumentError(
+                "SIMDKernel requires mr(kernel) = $MR to be a multiple of " *
+                    "the vector width W = $W"
+            )
+        )
+        return new{MR, NR, T, W}(descriptor)
     end
 end
 
@@ -39,10 +43,10 @@ Default `SIMD.Vec` lane count for `T` (one 256-bit register's worth): 4 for
 _default_lanewidth(::Type{Float64}) = 4
 _default_lanewidth(::Type{Float32}) = 8
 
-function SIMDKernel(::Val{MR}, ::Val{NR}, ::Type{T}, ::Val{W}) where {MR,NR,T,W}
-    return SIMDKernel{MR,NR,T,W}(KernelDescriptor(Val(MR), Val(NR), T))
+function SIMDKernel(::Val{MR}, ::Val{NR}, ::Type{T}, ::Val{W}) where {MR, NR, T, W}
+    return SIMDKernel{MR, NR, T, W}(KernelDescriptor(Val(MR), Val(NR), T))
 end
-function SIMDKernel(::Val{MR}, ::Val{NR}, ::Type{T}) where {MR,NR,T}
+function SIMDKernel(::Val{MR}, ::Val{NR}, ::Type{T}) where {MR, NR, T}
     return SIMDKernel(Val(MR), Val(NR), T, Val(_default_lanewidth(T)))
 end
 
@@ -51,7 +55,7 @@ end
 
 The kernel's `SIMD.Vec` lane width `W`.
 """
-lanewidth(::SIMDKernel{MR,NR,T,W}) where {MR,NR,T,W} = W
+lanewidth(::SIMDKernel{MR, NR, T, W}) where {MR, NR, T, W} = W
 
 """
     avecs_per_column(kernel::SIMDKernel) -> Int
@@ -59,7 +63,7 @@ lanewidth(::SIMDKernel{MR,NR,T,W}) where {MR,NR,T,W} = W
 `mr(kernel) ÷ lanewidth(kernel)`: the number of full-width A vectors (and
 thus accumulator vectors) per output column.
 """
-avecs_per_column(::SIMDKernel{MR,NR,T,W}) where {MR,NR,T,W} = MR ÷ W
+avecs_per_column(::SIMDKernel{MR, NR, T, W}) where {MR, NR, T, W} = MR ÷ W
 
 # ----------------------------------------------------------------------------
 # zero_accumulator, accumulate
@@ -75,34 +79,44 @@ ordinary heap array of accumulators is not the intended fast path"). Entry
 `0:NR-1`) lives at 1-based tuple position `v + (MR÷W)*j + 1`; physical row
 `i` of that vector is lane `i - v*W + 1` (1-based `SIMD.Vec` indexing).
 """
-function zero_accumulator(kernel::SIMDKernel{MR,NR,T,W}) where {MR,NR,T,W}
+function zero_accumulator(kernel::SIMDKernel{MR, NR, T, W}) where {MR, NR, T, W}
     NVECA = MR ÷ W
-    z = zero(Vec{W,T})
+    z = zero(Vec{W, T})
     return ntuple(_ -> z, Val(NVECA * NR))
 end
 
 # Fully unrolled, closure-free K-step body: one vector load per A row-vector,
 # one scalar load per B column, NVECA*NR FMAs, generated as straight-line code.
-@generated function _accumulate_step(kernel::SIMDKernel{MR,NR,T,W}, acc::NTuple{NV,Vec{W,T}},
-                                      packed_a::AbstractVector{T}, packed_b::AbstractVector{T},
-                                      p::Int) where {MR,NR,T,W,NV}
+@generated function _accumulate_step(
+        kernel::SIMDKernel{MR, NR, T, W}, acc::NTuple{NV, Vec{W, T}},
+        packed_a::AbstractVector{T}, packed_b::AbstractVector{T},
+        p::Int
+    ) where {MR, NR, T, W, NV}
     NVECA = MR ÷ W
     NVECA * NR == NV ||
-        throw(ArgumentError("_accumulate_step: accumulator length $NV does not match " *
-                             "(mr÷W)*nr = $(NVECA * NR) for MR=$MR, NR=$NR, W=$W"))
+        throw(
+        ArgumentError(
+            "_accumulate_step: accumulator length $NV does not match " *
+                "(mr÷W)*nr = $(NVECA * NR) for MR=$MR, NR=$NR, W=$W"
+        )
+    )
 
     avars = [Symbol(:a, v) for v in 0:(NVECA - 1)]
     bvars = [Symbol(:b, j) for j in 0:(NR - 1)]
 
-    load_a = [:( $(avars[v + 1]) = vload(Vec{$W,$T}, packed_a, packed_a_offset(kernel, $(v * W), p) + 1) )
-              for v in 0:(NVECA - 1)]
-    load_b = [:( $(bvars[j + 1]) = packed_b[packed_b_offset(kernel, $j, p) + 1] )
-              for j in 0:(NR - 1)]
+    load_a = [
+        :($(avars[v + 1]) = vload(Vec{$W, $T}, packed_a, packed_a_offset(kernel, $(v * W), p) + 1))
+            for v in 0:(NVECA - 1)
+    ]
+    load_b = [
+        :($(bvars[j + 1]) = packed_b[packed_b_offset(kernel, $j, p) + 1])
+            for j in 0:(NR - 1)
+    ]
 
     acc_exprs = Vector{Any}(undef, NV)
     for j in 0:(NR - 1), v in 0:(NVECA - 1)
         idx = v + NVECA * j + 1
-        acc_exprs[idx] = :( muladd($(avars[v + 1]), $(bvars[j + 1]), acc[$idx]) )
+        acc_exprs[idx] = :(muladd($(avars[v + 1]), $(bvars[j + 1]), acc[$idx]))
     end
 
     return quote
@@ -123,9 +137,11 @@ is a no-op), but **not bitwise identical** (FMA grouping/order differ —
 compare with a tolerance, never `==`). `packed_a` must support `SIMD.vload`
 (a `Vector{T}` or unit-range `view`); `packed_b` is read by scalar `getindex`.
 """
-function Base.accumulate(kernel::SIMDKernel{MR,NR,T,W}, acc::NTuple{NV,Vec{W,T}},
-                          packed_a::AbstractVector{T}, packed_b::AbstractVector{T},
-                          kc::Int) where {MR,NR,T,W,NV}
+function Base.accumulate(
+        kernel::SIMDKernel{MR, NR, T, W}, acc::NTuple{NV, Vec{W, T}},
+        packed_a::AbstractVector{T}, packed_b::AbstractVector{T},
+        kc::Int
+    ) where {MR, NR, T, W, NV}
     kc == 0 && return acc
     kc > 0 || throw(ArgumentError("accumulate requires kc >= 0, got kc = $kc"))
     @inbounds for p in 0:(kc - 1)
@@ -139,8 +155,10 @@ end
 _unit_stride_rows(ax::AffineAxis) = ax.stride == 1
 _unit_stride_rows(::ScatterAxis) = false
 
-@inline function _acc_lane(acc::NTuple{NV,Vec{W,T}}, v::Int, j::Int, lane1::Int,
-                            ::Val{NVECA}) where {NV,W,T,NVECA}
+@inline function _acc_lane(
+        acc::NTuple{NV, Vec{W, T}}, v::Int, j::Int, lane1::Int,
+        ::Val{NVECA}
+    ) where {NV, W, T, NVECA}
     return acc[v + NVECA * j + 1][lane1]
 end
 
@@ -154,8 +172,10 @@ the remainder, never over-reading past the valid rectangle). Otherwise
 falls back to the scalar path, one lane at a time. Empty destination is a
 no-op.
 """
-function store_tile!(destination::QSTile, acc::NTuple{NV,Vec{W,T}},
-                      alpha::T, beta::T, kernel::SIMDKernel{MR,NR,T,W}) where {MR,NR,T,W,NV}
+function store_tile!(
+        destination::QSTile, acc::NTuple{NV, Vec{W, T}},
+        alpha::T, beta::T, kernel::SIMDKernel{MR, NR, T, W}
+    ) where {MR, NR, T, W, NV}
     m = nrows(destination)
     n = ncols(destination)
     (m == 0 || n == 0) && return destination
@@ -181,9 +201,9 @@ function store_tile!(destination::QSTile, acc::NTuple{NV,Vec{W,T}},
                 if iszero(beta)
                     outvec = alpha * rvec
                 elseif isone(beta)
-                    outvec = muladd(alpha, rvec, vload(Vec{W,T}, storage, idx))
+                    outvec = muladd(alpha, rvec, vload(Vec{W, T}, storage, idx))
                 else
-                    outvec = muladd(alpha, rvec, beta * vload(Vec{W,T}, storage, idx))
+                    outvec = muladd(alpha, rvec, beta * vload(Vec{W, T}, storage, idx))
                 end
                 vstore(outvec, storage, idx)
             end
@@ -222,9 +242,11 @@ SIMD counterpart of `ScalarKernel`'s `execute_tile!`; same validation order
 and short-circuits. Numerically matches `ScalarKernel` only to within a
 tolerance (FMA grouping differs), never bitwise.
 """
-function execute_tile!(kernel::SIMDKernel{MR,NR,T,W}, destination::QSTile,
-                        packed_a::AbstractVector{T}, packed_b::AbstractVector{T},
-                        kc::Int, alpha, beta) where {MR,NR,T,W}
+function execute_tile!(
+        kernel::SIMDKernel{MR, NR, T, W}, destination::QSTile,
+        packed_a::AbstractVector{T}, packed_b::AbstractVector{T},
+        kc::Int, alpha, beta
+    ) where {MR, NR, T, W}
     m = nrows(destination)
     n = ncols(destination)
     m <= MR || throw(ArgumentError("destination valid row extent $m exceeds mr(kernel) = $MR"))
@@ -244,11 +266,19 @@ function execute_tile!(kernel::SIMDKernel{MR,NR,T,W}, destination::QSTile,
     end
 
     length(packed_a) >= packed_a_length(kernel, kc) ||
-        throw(DimensionMismatch("execute_tile!: packed_a has length $(length(packed_a)), " *
-                                 "need at least packed_a_length(kernel, kc=$kc) = $(packed_a_length(kernel, kc))"))
+        throw(
+        DimensionMismatch(
+            "execute_tile!: packed_a has length $(length(packed_a)), " *
+                "need at least packed_a_length(kernel, kc=$kc) = $(packed_a_length(kernel, kc))"
+        )
+    )
     length(packed_b) >= packed_b_length(kernel, kc) ||
-        throw(DimensionMismatch("execute_tile!: packed_b has length $(length(packed_b)), " *
-                                 "need at least packed_b_length(kernel, kc=$kc) = $(packed_b_length(kernel, kc))"))
+        throw(
+        DimensionMismatch(
+            "execute_tile!: packed_b has length $(length(packed_b)), " *
+                "need at least packed_b_length(kernel, kc=$kc) = $(packed_b_length(kernel, kc))"
+        )
+    )
 
     acc = zero_accumulator(kernel)
     acc = accumulate(kernel, acc, packed_a, packed_b, kc)

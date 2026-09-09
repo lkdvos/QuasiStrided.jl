@@ -45,8 +45,8 @@ end
     ax = ScatterAxis(offs, 5)
     @test axis_length(ax) == 5
     for t in 0:4
-        @test axis_offset(ax, t) == offs[t+1]
-        @test checked_axis_offset(ax, t) == offs[t+1]
+        @test axis_offset(ax, t) == offs[t + 1]
+        @test checked_axis_offset(ax, t) == offs[t + 1]
     end
     @test_throws BoundsError checked_axis_offset(ax, 5)
     @test_throws BoundsError checked_axis_offset(ax, -1)
@@ -154,7 +154,7 @@ end
     cols2 = AffineAxis(1, 2, 3) # 1,3,5
     t2 = DestinationTile(storage, 0, rows2, cols2)
     for i in 0:3, j in 0:2
-        expected = 0 + rowoffs[i+1] + (1 + j * 2)
+        expected = 0 + rowoffs[i + 1] + (1 + j * 2)
         @test tile_offset(t2, i, j) == expected
     end
 
@@ -164,7 +164,7 @@ end
     cols3 = ScatterAxis(coloffs, 3)
     t3 = SourceTile(storage, -1, rows3, cols3)
     for i in 0:1, j in 0:2
-        expected = -1 + (5 + i) + coloffs[j+1]
+        expected = -1 + (5 + i) + coloffs[j + 1]
         @test tile_offset(t3, i, j) == expected
     end
 
@@ -175,7 +175,7 @@ end
     cols4 = ScatterAxis(coloffs4, 2)
     t4 = SourceTile(storage, 50, rows4, cols4)
     for i in 0:2, j in 0:1
-        expected = 50 + rowoffs4[i+1] + coloffs4[j+1]
+        expected = 50 + rowoffs4[i + 1] + coloffs4[j + 1]
         @test tile_offset(t4, i, j) == expected
     end
 end
@@ -192,7 +192,7 @@ end
     end
     for i in 0:2, j in 0:1
         addr = 5 + (0 + i * 2) + (1 + j * 3)
-        @test storage[addr+1] == 1000.0 * i + j
+        @test storage[addr + 1] == 1000.0 * i + j
         @test tile_load(t, i, j) == 1000.0 * i + j
         @test checked_tile_load(t, i, j) == 1000.0 * i + j
     end
@@ -218,7 +218,7 @@ function _ref_matrix(storage::Vector{T}, base::Int, rowoffs::Vector{Int}, coloff
     k = length(coloffs)
     M = Matrix{T}(undef, m, k)
     for i in 1:m, p in 1:k
-        M[i, p] = storage[base+rowoffs[i]+coloffs[p]+1]
+        M[i, p] = storage[base + rowoffs[i] + coloffs[p] + 1]
     end
     return M
 end
@@ -252,22 +252,22 @@ _axis(offs::Vector{Int}) = ScatterAxis(offs, length(offs))
         m <= MR || continue
         source = SourceTile(storage, base, rows, cols)
         packed = fill(-999.0, packed_a_length(kernel, kc) + 8) # +8 suffix canary region
-        suffix_before = copy(packed[packed_a_length(kernel, kc)+1:end])
+        suffix_before = copy(packed[(packed_a_length(kernel, kc) + 1):end])
 
         pack_a!(packed, source, kernel, identity)
 
-        for p in 0:(kc-1), i in 0:(MR-1)
+        for p in 0:(kc - 1), i in 0:(MR - 1)
             off = packed_a_offset(kernel, i, p)
             if i < m
-                rowoff = rows isa AffineAxis ? rows.base + i * rows.stride : rows.offsets[i+1]
-                coloff = cols isa AffineAxis ? cols.base + p * cols.stride : cols.offsets[p+1]
-                expected = storage[base+rowoff+coloff+1]
-                @test packed[off+1] == expected
+                rowoff = rows isa AffineAxis ? rows.base + i * rows.stride : rows.offsets[i + 1]
+                coloff = cols isa AffineAxis ? cols.base + p * cols.stride : cols.offsets[p + 1]
+                expected = storage[base + rowoff + coloff + 1]
+                @test packed[off + 1] == expected
             else
-                @test packed[off+1] == 0.0
+                @test packed[off + 1] == 0.0
             end
         end
-        @test packed[packed_a_length(kernel, kc)+1:end] == suffix_before
+        @test packed[(packed_a_length(kernel, kc) + 1):end] == suffix_before
     end
 end
 
@@ -295,22 +295,22 @@ end
         n <= NR || continue
         source = SourceTile(storage, base, rows, cols)
         packed = fill(-999.0, packed_b_length(kernel, kc) + 8)
-        suffix_before = copy(packed[packed_b_length(kernel, kc)+1:end])
+        suffix_before = copy(packed[(packed_b_length(kernel, kc) + 1):end])
 
         pack_b!(packed, source, kernel, identity)
 
-        for p in 0:(kc-1), j in 0:(NR-1)
+        for p in 0:(kc - 1), j in 0:(NR - 1)
             off = packed_b_offset(kernel, j, p)
             if j < n
-                rowoff = rows isa AffineAxis ? rows.base + p * rows.stride : rows.offsets[p+1]
-                coloff = cols isa AffineAxis ? cols.base + j * cols.stride : cols.offsets[j+1]
-                expected = storage[base+rowoff+coloff+1]
-                @test packed[off+1] == expected
+                rowoff = rows isa AffineAxis ? rows.base + p * rows.stride : rows.offsets[p + 1]
+                coloff = cols isa AffineAxis ? cols.base + j * cols.stride : cols.offsets[j + 1]
+                expected = storage[base + rowoff + coloff + 1]
+                @test packed[off + 1] == expected
             else
-                @test packed[off+1] == 0.0
+                @test packed[off + 1] == 0.0
             end
         end
-        @test packed[packed_b_length(kernel, kc)+1:end] == suffix_before
+        @test packed[(packed_b_length(kernel, kc) + 1):end] == suffix_before
     end
 end
 
@@ -327,16 +327,16 @@ end
     # (i,p) so a transposition or offset-formula bug would show up as a
     # mismatch rather than an accidental match.
     storageA = zeros(Float64, MR * kc)
-    for i in 0:(MR-1), p in 0:(kc-1)
-        storageA[i*kc+p+1] = 100.0 * i + p # row-major (i,p) source layout
+    for i in 0:(MR - 1), p in 0:(kc - 1)
+        storageA[i * kc + p + 1] = 100.0 * i + p # row-major (i,p) source layout
     end
     rowsA = AffineAxis(0, kc, MR) # row i at base i*kc
     colsA = AffineAxis(0, 1, kc)  # col p at base p
     sourceA = SourceTile(storageA, 0, rowsA, colsA)
     packedA = zeros(Float64, packed_a_length(kernel, kc))
     pack_a!(packedA, sourceA, kernel, identity)
-    for i in 0:(MR-1), p in 0:(kc-1)
-        @test packedA[packed_a_offset(kernel, i, p)+1] == 100.0 * i + p
+    for i in 0:(MR - 1), p in 0:(kc - 1)
+        @test packedA[packed_a_offset(kernel, i, p) + 1] == 100.0 * i + p
     end
     # Physical layout check: packed_a_offset(i,p) = i + MR*p, so consecutive p
     # (fixed i) are MR apart, not 1 apart -- confirm directly.
@@ -345,16 +345,16 @@ end
 
     # B: value = 100*p + j (p = K step, j = column 0..NR-1).
     storageB = zeros(Float64, kc * NR)
-    for p in 0:(kc-1), j in 0:(NR-1)
-        storageB[p*NR+j+1] = 100.0 * p + j
+    for p in 0:(kc - 1), j in 0:(NR - 1)
+        storageB[p * NR + j + 1] = 100.0 * p + j
     end
     rowsB = AffineAxis(0, NR, kc) # row p at base p*NR
     colsB = AffineAxis(0, 1, NR)  # col j at base j
     sourceB = SourceTile(storageB, 0, rowsB, colsB)
     packedB = zeros(Float64, packed_b_length(kernel, kc))
     pack_b!(packedB, sourceB, kernel, identity)
-    for p in 0:(kc-1), j in 0:(NR-1)
-        @test packedB[packed_b_offset(kernel, j, p)+1] == 100.0 * p + j
+    for p in 0:(kc - 1), j in 0:(NR - 1)
+        @test packedB[packed_b_offset(kernel, j, p) + 1] == 100.0 * p + j
     end
     @test packed_b_offset(kernel, 1, 0) + NR == packed_b_offset(kernel, 1, 1)
 end
@@ -378,12 +378,12 @@ end
     source = SourceTile(storage, 0, rows, cols)
     packed = fill(-777.0, packed_a_length(kernel, kc)) # nonzero prefill to detect uninitialized padding
     pack_a!(packed, source, kernel, transform_nonzero_at_zero)
-    for p in 0:(kc-1), i in 0:(MR-1)
+    for p in 0:(kc - 1), i in 0:(MR - 1)
         off = packed_a_offset(kernel, i, p)
         if i < m
-            @test packed[off+1] == 1.0 + 1000.0
+            @test packed[off + 1] == 1.0 + 1000.0
         else
-            @test packed[off+1] == 0.0 # literal zero, not transform(0) == 1000
+            @test packed[off + 1] == 0.0 # literal zero, not transform(0) == 1000
         end
     end
 
@@ -394,12 +394,12 @@ end
     sourceB = SourceTile(storage, 0, rowsB, colsB)
     packedB = fill(-777.0, packed_b_length(kernel, kc))
     pack_b!(packedB, sourceB, kernel, transform_nonzero_at_zero)
-    for p in 0:(kc-1), j in 0:(NR-1)
+    for p in 0:(kc - 1), j in 0:(NR - 1)
         off = packed_b_offset(kernel, j, p)
         if j < n
-            @test packedB[off+1] == 1.0 + 1000.0
+            @test packedB[off + 1] == 1.0 + 1000.0
         else
-            @test packedB[off+1] == 0.0
+            @test packedB[off + 1] == 0.0
         end
     end
 end
@@ -463,18 +463,18 @@ end
     source = SourceTile(storage, 0, AffineAxis(0, 1, m), AffineAxis(0, 1, kc))
     packed = fill(123456.0, packed_a_length(kernel, kc)) # previously "used" nonzero buffer
     pack_a!(packed, source, kernel, identity)
-    for p in 0:(kc-1), i in 0:(MR-1)
+    for p in 0:(kc - 1), i in 0:(MR - 1)
         off = packed_a_offset(kernel, i, p)
-        @test packed[off+1] == (i < m ? 5.0 : 0.0)
+        @test packed[off + 1] == (i < m ? 5.0 : 0.0)
     end
 
     n = 1
     sourceB = SourceTile(storage, 0, AffineAxis(0, 1, kc), AffineAxis(0, 1, n))
     packedB = fill(654321.0, packed_b_length(kernel, kc))
     pack_b!(packedB, sourceB, kernel, identity)
-    for p in 0:(kc-1), j in 0:(NR-1)
+    for p in 0:(kc - 1), j in 0:(NR - 1)
         off = packed_b_offset(kernel, j, p)
-        @test packedB[off+1] == (j < n ? 5.0 : 0.0)
+        @test packedB[off + 1] == (j < n ? 5.0 : 0.0)
     end
 end
 
@@ -539,9 +539,9 @@ end
     source = SourceTile(storage, base, rows, cols)
     packed = zeros(Float64, packed_a_length(kernel, kc))
     pack_a!(packed, source, kernel, identity)
-    for p in 0:(kc-1), i in 0:(MR-1)
-        expected = storage[base+i*5+p+1]
-        @test packed[packed_a_offset(kernel, i, p)+1] == expected
+    for p in 0:(kc - 1), i in 0:(MR - 1)
+        expected = storage[base + i * 5 + p + 1]
+        @test packed[packed_a_offset(kernel, i, p) + 1] == expected
     end
 end
 
@@ -560,15 +560,15 @@ end
     source = SourceTile(storage, 0, AffineAxis(0, 1, MR), AffineAxis(0, 1, kc))
     packed = zeros(Float64, packed_a_length(kernel, kc))
     pack_a!(packed, source, kernel, negate)
-    for p in 0:(kc-1), i in 0:(MR-1)
-        @test packed[packed_a_offset(kernel, i, p)+1] == -storage[i+p+1]
+    for p in 0:(kc - 1), i in 0:(MR - 1)
+        @test packed[packed_a_offset(kernel, i, p) + 1] == -storage[i + p + 1]
     end
 
     sourceB = SourceTile(storage, 0, AffineAxis(0, 1, kc), AffineAxis(0, 1, NR))
     packedB = zeros(Float64, packed_b_length(kernel, kc))
     pack_b!(packedB, sourceB, kernel, negate)
-    for p in 0:(kc-1), j in 0:(NR-1)
-        @test packedB[packed_b_offset(kernel, j, p)+1] == -storage[p+j+1]
+    for p in 0:(kc - 1), j in 0:(NR - 1)
+        @test packedB[packed_b_offset(kernel, j, p) + 1] == -storage[p + j + 1]
     end
 end
 
@@ -586,8 +586,8 @@ end
     packed = zeros(Float32, packed_a_length(kernel, kc))
     pack_a!(packed, source, kernel, identity)
     @test eltype(packed) === Float32
-    for p in 0:(kc-1), i in 0:(MR-1)
-        @test packed[packed_a_offset(kernel, i, p)+1] == storage[i+p+1]
+    for p in 0:(kc - 1), i in 0:(MR - 1)
+        @test packed[packed_a_offset(kernel, i, p) + 1] == storage[i + p + 1]
     end
 end
 

@@ -7,18 +7,20 @@
 Shared logical coordinate enumeration over `D` dims (`lengths`) with `P`
 physical offset maps (`strides`, one `NTuple{D,Int}` per operand).
 """
-struct AxisGroup{D,P}
-    lengths::NTuple{D,Int}
-    strides::NTuple{P,NTuple{D,Int}}
+struct AxisGroup{D, P}
+    lengths::NTuple{D, Int}
+    strides::NTuple{P, NTuple{D, Int}}
 
-    function AxisGroup{D,P}(lengths::NTuple{D,Int},
-                            strides::NTuple{P,NTuple{D,Int}}) where {D,P}
+    function AxisGroup{D, P}(
+            lengths::NTuple{D, Int},
+            strides::NTuple{P, NTuple{D, Int}}
+        ) where {D, P}
         P >= 1 || throw(ArgumentError("AxisGroup requires at least one map (P >= 1), got P = $P"))
         for (d, L) in enumerate(lengths)
             L >= 0 || throw(ArgumentError("AxisGroup lengths must be nonnegative, got lengths[$d] = $L"))
         end
         _validate_axis_group_bounds(lengths, strides)
-        return new{D,P}(lengths, strides)
+        return new{D, P}(lengths, strides)
     end
 end
 
@@ -30,12 +32,12 @@ Construct a validated `AxisGroup` (axes kept in the order supplied; see
 invalid lengths or `P < 1`, `OverflowError` if the cardinality or any map's
 offset excursion doesn't fit `Int`.
 """
-AxisGroup(lengths::NTuple{D,Int}, strides::NTuple{P,NTuple{D,Int}}) where {D,P} =
-    AxisGroup{D,P}(lengths, strides)
+AxisGroup(lengths::NTuple{D, Int}, strides::NTuple{P, NTuple{D, Int}}) where {D, P} =
+    AxisGroup{D, P}(lengths, strides)
 
 # Q = prod(lengths); empty domain (any zero length) always gives Q = 0.
 # Int128 accumulation detects overflow without wrapping (validation-time only).
-function _checked_axis_length(lengths::NTuple{D,Int}) where {D}
+function _checked_axis_length(lengths::NTuple{D, Int}) where {D}
     any(==(0), lengths) && return 0
     q = one(Int128)
     for L in lengths
@@ -48,8 +50,10 @@ end
 
 # Validates cardinality and, per map, sum((L[d]-1)*abs(S[d])) <= typemax(Int),
 # all in Int128 so nothing (incl. abs(typemin(Int))) can silently wrap.
-function _validate_axis_group_bounds(lengths::NTuple{D,Int},
-                                      strides::NTuple{P,NTuple{D,Int}}) where {D,P}
+function _validate_axis_group_bounds(
+        lengths::NTuple{D, Int},
+        strides::NTuple{P, NTuple{D, Int}}
+    ) where {D, P}
     Q = _checked_axis_length(lengths)
     Q == 0 && return nothing
     for (p, S) in enumerate(strides)
@@ -58,9 +62,12 @@ function _validate_axis_group_bounds(lengths::NTuple{D,Int},
             L = lengths[d]  # >= 1 here, since Q > 0 implies no zero length.
             acc += Int128(L - 1) * abs(Int128(S[d]))
             acc > Int128(typemax(Int)) &&
-                throw(OverflowError(
+                throw(
+                OverflowError(
                     "AxisGroup map $p: sum((L[d]-1)*abs(S[d])) exceeds typemax(Int); " *
-                    "this layout is not representable under the conservative offset-range bound"))
+                        "this layout is not representable under the conservative offset-range bound"
+                )
+            )
         end
     end
     return nothing
@@ -73,7 +80,7 @@ Cardinality `Q = prod(lengths)` (already validated to fit `Int`).
 """
 axis_length(g::AxisGroup) = _unchecked_axis_length(g.lengths)
 
-@inline function _unchecked_axis_length(lengths::NTuple{D,Int}) where {D}
+@inline function _unchecked_axis_length(lengths::NTuple{D, Int}) where {D}
     q = 1
     for L in lengths
         q *= L
@@ -82,16 +89,16 @@ axis_length(g::AxisGroup) = _unchecked_axis_length(g.lengths)
 end
 
 # Type-stable, stack-allocated "replace element i of an NTuple{N,Int}".
-@inline _tupleset(t::NTuple{N,Int}, i::Int, v::Int) where {N} =
+@inline _tupleset(t::NTuple{N, Int}, i::Int, v::Int) where {N} =
     ntuple(j -> ifelse(j == i, v, t[j]), Val(N))
 
 # Lifted out of offsets/fill_offsets! to avoid closure-boxing an inline lambda
 # over loop-reassigned variables, which would allocate every call.
-@inline function _add_offsets(offs::NTuple{P,Int}, g::AxisGroup{D,P}, d::Int, x::Int) where {D,P}
+@inline function _add_offsets(offs::NTuple{P, Int}, g::AxisGroup{D, P}, d::Int, x::Int) where {D, P}
     return ntuple(p -> offs[p] + x * g.strides[p][d], Val(P))
 end
 
-@inline function _sub_reset_offsets(offs::NTuple{P,Int}, g::AxisGroup{D,P}, d::Int, Ld::Int) where {D,P}
+@inline function _sub_reset_offsets(offs::NTuple{P, Int}, g::AxisGroup{D, P}, d::Int, Ld::Int) where {D, P}
     return ntuple(p -> offs[p] - (Ld - 1) * g.strides[p][d], Val(P))
 end
 
@@ -101,7 +108,7 @@ end
 Decode logical coordinate `0 <= q < axis_length(g)` into the `P` relative
 element offsets via mixed-radix decode. Throws `BoundsError` if out of range.
 """
-function offsets(g::AxisGroup{D,P}, q::Int) where {D,P}
+function offsets(g::AxisGroup{D, P}, q::Int) where {D, P}
     Q = axis_length(g)
     (0 <= q < Q) || throw(BoundsError(g, q))
     r = q
@@ -126,8 +133,10 @@ Requires `count >= 0`, `0 <= first <= axis_length(g)`,
 `count <= axis_length(g) - first`, buffers long enough and pairwise distinct.
 Throws `ArgumentError`/`BoundsError`/`DimensionMismatch` accordingly; returns `buffers`.
 """
-function fill_offsets!(buffers::NTuple{P,Vector{Int}}, g::AxisGroup{D,P},
-                        first::Int, count::Int) where {D,P}
+function fill_offsets!(
+        buffers::NTuple{P, Vector{Int}}, g::AxisGroup{D, P},
+        first::Int, count::Int
+    ) where {D, P}
     Q = axis_length(g)
 
     count >= 0 || throw(ArgumentError("count must be nonnegative, got $count"))
@@ -140,7 +149,7 @@ function fill_offsets!(buffers::NTuple{P,Vector{Int}}, g::AxisGroup{D,P},
         length(buffers[p]) >= count ||
             throw(DimensionMismatch("buffer $p has length $(length(buffers[p])), need at least $count"))
     end
-    for i in 1:P, j in (i+1):P
+    for i in 1:P, j in (i + 1):P
         buffers[i] === buffers[j] &&
             throw(ArgumentError("buffers must be distinct Vector{Int} objects (buffers $i and $j alias)"))
     end
@@ -164,7 +173,7 @@ function fill_offsets!(buffers::NTuple{P,Vector{Int}}, g::AxisGroup{D,P},
     t = 0
     @inbounds while true
         for p in 1:P
-            buffers[p][t+1] = offs[p]
+            buffers[p][t + 1] = offs[p]
         end
         t += 1
         t == count && break
@@ -226,8 +235,8 @@ function describe_block(buffer::Vector{Int}, count::Int)
     @inbounds stride, overflowed = Base.Checked.sub_with_overflow(buffer[2], buffer[1])
     overflowed && return BlockDescriptor(base, 0, count, false)
 
-    @inbounds for t in 2:(count-1)
-        diff, ovf = Base.Checked.sub_with_overflow(buffer[t+1], buffer[t])
+    @inbounds for t in 2:(count - 1)
+        diff, ovf = Base.Checked.sub_with_overflow(buffer[t + 1], buffer[t])
         (ovf || diff != stride) && return BlockDescriptor(base, 0, count, false)
     end
 
@@ -240,8 +249,10 @@ end
 Fill `buffers` via [`fill_offsets!`](@ref) and classify each via
 [`describe_block`](@ref); returns `NTuple{P,BlockDescriptor}`.
 """
-function block_descriptors!(buffers::NTuple{P,Vector{Int}}, g::AxisGroup{D,P},
-                             first::Int, count::Int) where {D,P}
+function block_descriptors!(
+        buffers::NTuple{P, Vector{Int}}, g::AxisGroup{D, P},
+        first::Int, count::Int
+    ) where {D, P}
     fill_offsets!(buffers, g, first, count)
     return ntuple(p -> describe_block(buffers[p], count), Val(P))
 end
@@ -254,12 +265,12 @@ per-map offset sequence: drop singleton dims, then fold adjacent dims
 fastest-to-slowest wherever `next_stride[p] == current_length*current_stride[p]`
 holds for *every* map. Planning-time only (may allocate); never reorders axes.
 """
-function normalize_group(g::AxisGroup{D,P}) where {D,P}
+function normalize_group(g::AxisGroup{D, P}) where {D, P}
     Q = axis_length(g)
     Q == 0 && return g  # empty domain: leave untouched.
 
     # Step 2: drop singleton dimensions.
-    dims = Tuple{Int,NTuple{P,Int}}[]
+    dims = Tuple{Int, NTuple{P, Int}}[]
     for d in 1:D
         L = g.lengths[d]
         if L != 1
@@ -269,13 +280,13 @@ function normalize_group(g::AxisGroup{D,P}) where {D,P}
 
     # Step 5: all dimensions were singleton -> rank-zero group.
     if isempty(dims)
-        emptylengths = NTuple{0,Int}()
-        emptystrides = ntuple(_ -> NTuple{0,Int}(), P)
+        emptylengths = NTuple{0, Int}()
+        emptystrides = ntuple(_ -> NTuple{0, Int}(), P)
         return AxisGroup(emptylengths, emptystrides)
     end
 
     # Steps 3-4: fold adjacent dimensions fastest to slowest.
-    folded = Tuple{Int,NTuple{P,Int}}[]
+    folded = Tuple{Int, NTuple{P, Int}}[]
     curL, curS = dims[1]
     for i in 2:length(dims)
         nextL, nextS = dims[i]

@@ -9,11 +9,11 @@ Scalar reference microkernel for register-tile shape `(MR, NR)` and scalar
 type `T`. `zero_accumulator` returns an ordinary `Matrix{T}` of size
 `(MR, NR)`, indexed `acc[i+1, j+1]` for zero-based `(i, j)`.
 """
-struct ScalarKernel{MR,NR,T} <: DescriptorKernel{MR,NR,T}
-    descriptor::KernelDescriptor{MR,NR,T}
+struct ScalarKernel{MR, NR, T} <: DescriptorKernel{MR, NR, T}
+    descriptor::KernelDescriptor{MR, NR, T}
 end
 
-function ScalarKernel(::Val{MR}, ::Val{NR}, ::Type{T}) where {MR,NR,T}
+function ScalarKernel(::Val{MR}, ::Val{NR}, ::Type{T}) where {MR, NR, T}
     return ScalarKernel(KernelDescriptor(Val(MR), Val(NR), T))
 end
 
@@ -27,9 +27,9 @@ packed_a_length(k::DescriptorKernel, kc::Int) = packed_a_length(k.descriptor, kc
 packed_b_length(k::DescriptorKernel, kc::Int) = packed_b_length(k.descriptor, kc)
 
 # pack_a!/pack_b! dispatch on a bare KernelDescriptor; forward any wrapper.
-pack_a!(packed::Vector{T}, source::QSTile, kernel::DescriptorKernel{MR,NR,T}, transform::F) where {T,MR,NR,F} =
+pack_a!(packed::Vector{T}, source::QSTile, kernel::DescriptorKernel{MR, NR, T}, transform::F) where {T, MR, NR, F} =
     pack_a!(packed, source, kernel.descriptor, transform)
-pack_b!(packed::Vector{T}, source::QSTile, kernel::DescriptorKernel{MR,NR,T}, transform::F) where {T,MR,NR,F} =
+pack_b!(packed::Vector{T}, source::QSTile, kernel::DescriptorKernel{MR, NR, T}, transform::F) where {T, MR, NR, F} =
     pack_b!(packed, source, kernel.descriptor, transform)
 
 """
@@ -38,7 +38,7 @@ pack_b!(packed::Vector{T}, source::QSTile, kernel::DescriptorKernel{MR,NR,T}, tr
 Return a logical `MR`-by-`NR` zero accumulator tile, `acc[i+1,j+1] == 0`
 for every zero-based `(i,j)` in `0:MR-1 x 0:NR-1`.
 """
-function zero_accumulator(kernel::ScalarKernel{MR,NR,T}) where {MR,NR,T}
+function zero_accumulator(kernel::ScalarKernel{MR, NR, T}) where {MR, NR, T}
     return zeros(T, MR, NR)
 end
 
@@ -50,9 +50,11 @@ Extends `Base.accumulate` (avoids a name collision with the also-exported
 `acc[i,j] += sum_p Ap[i,p]*Bp[j,p]` in place over `kc` K-steps; `kc == 0`
 returns `acc` unchanged without reading the packed buffers.
 """
-function Base.accumulate(kernel::ScalarKernel{MR,NR,T}, acc::AbstractMatrix{T},
-                          packed_a::AbstractVector{T}, packed_b::AbstractVector{T},
-                          kc::Int) where {MR,NR,T}
+function Base.accumulate(
+        kernel::ScalarKernel{MR, NR, T}, acc::AbstractMatrix{T},
+        packed_a::AbstractVector{T}, packed_b::AbstractVector{T},
+        kc::Int
+    ) where {MR, NR, T}
     kc == 0 && return acc
     kc > 0 || throw(ArgumentError("accumulate requires kc >= 0, got kc = $kc"))
     @inbounds for p in 0:(kc - 1)
@@ -100,8 +102,10 @@ BLAS-like shortcuts: `alpha == 0` never reads `acc`; `beta == 0` never reads
 old `C`; `beta == 1` skips the multiplication. Padding lanes (`i>=m`/`j>=n`)
 are never read, so nonfinite padding in `acc` cannot propagate.
 """
-function store_tile!(destination::QSTile, acc::AbstractMatrix{T},
-                      alpha::T, beta::T, kernel::ScalarKernel) where {T}
+function store_tile!(
+        destination::QSTile, acc::AbstractMatrix{T},
+        alpha::T, beta::T, kernel::ScalarKernel
+    ) where {T}
     m = nrows(destination)
     n = ncols(destination)
     (m == 0 || n == 0) && return destination
@@ -138,9 +142,11 @@ Validates destination extent vs. kernel shape, storage bounds, and packed
 buffer sizes before any mutation. `kc == 0` or `alpha == 0` short-circuits
 to `beta` scaling only, without reading `packed_a`/`packed_b`.
 """
-function execute_tile!(kernel::ScalarKernel{MR,NR,T}, destination::QSTile,
-                        packed_a::AbstractVector{T}, packed_b::AbstractVector{T},
-                        kc::Int, alpha, beta) where {MR,NR,T}
+function execute_tile!(
+        kernel::ScalarKernel{MR, NR, T}, destination::QSTile,
+        packed_a::AbstractVector{T}, packed_b::AbstractVector{T},
+        kc::Int, alpha, beta
+    ) where {MR, NR, T}
     m = nrows(destination)
     n = ncols(destination)
     m <= MR || throw(ArgumentError("destination valid row extent $m exceeds mr(kernel) = $MR"))
@@ -160,11 +166,19 @@ function execute_tile!(kernel::ScalarKernel{MR,NR,T}, destination::QSTile,
     end
 
     length(packed_a) >= packed_a_length(kernel, kc) ||
-        throw(DimensionMismatch("execute_tile!: packed_a has length $(length(packed_a)), " *
-                                 "need at least packed_a_length(kernel, kc=$kc) = $(packed_a_length(kernel, kc))"))
+        throw(
+        DimensionMismatch(
+            "execute_tile!: packed_a has length $(length(packed_a)), " *
+                "need at least packed_a_length(kernel, kc=$kc) = $(packed_a_length(kernel, kc))"
+        )
+    )
     length(packed_b) >= packed_b_length(kernel, kc) ||
-        throw(DimensionMismatch("execute_tile!: packed_b has length $(length(packed_b)), " *
-                                 "need at least packed_b_length(kernel, kc=$kc) = $(packed_b_length(kernel, kc))"))
+        throw(
+        DimensionMismatch(
+            "execute_tile!: packed_b has length $(length(packed_b)), " *
+                "need at least packed_b_length(kernel, kc=$kc) = $(packed_b_length(kernel, kc))"
+        )
+    )
 
     acc = zero_accumulator(kernel)
     acc = accumulate(kernel, acc, packed_a, packed_b, kc)
