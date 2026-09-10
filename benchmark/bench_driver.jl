@@ -12,7 +12,8 @@
 # writes results + PROVENANCE.txt to benchmark/results/<hostname>-<date>/.
 
 using QuasiStrided
-using QuasiStrided: execute_tilewise!
+using QuasiStrided: execute_tilewise!, ScalarKernel, SIMDKernel, mr, nr, lanewidth,
+    plan_contract, execute!
 using StridedViews: StridedView
 using LinearAlgebra
 using Statistics: median

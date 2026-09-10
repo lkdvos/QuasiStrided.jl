@@ -2,18 +2,28 @@ using StridedViews: StridedView, offset
 
 # plan_contract/execute!/ContractPlan aren't exported (only contract! is);
 # execute_tilewise! is never exported at all (it's an internal oracle).
+# `test/runtests.jl` deliberately leaves these four out of its own
+# name-restoring `using QuasiStrided: ...` block, because a `const` may not
+# shadow an imported binding; the workspace API is reached as
+# `QuasiStrided.<name>` for the same reason.
 const plan_contract = QuasiStrided.plan_contract
 const execute! = QuasiStrided.execute!
 const ContractPlan = QuasiStrided.ContractPlan
 const execute_tilewise! = QuasiStrided.execute_tilewise!
 
+# TO names are always qualified (frozen import convention, docs/decisions.md);
+# a bare `using TensorOperations` collides with QuasiStrided's `scalartype`.
+import TensorOperations as TO
+
 # Plan for the dense matmul C[m,n] = sum_k A[m,k]*B[k,n], the shape most
-# testsets below use. (test_macro_driver.jl has its own copy: both files are
-# included into the same scope, so the names must differ.)
-function _mm_plan(Cmat, Amat, Bmat; kernel, mc = nothing, kc = nothing, nc = nothing)
+# testsets below use; every `plan_contract` keyword is forwarded verbatim, so
+# an omitted one takes plan_contract's own default. (test_macro_driver.jl has
+# its own copy: both files are included into the same scope, so the names must
+# differ.)
+function _mm_plan(Cmat, Amat, Bmat; kwargs...)
     return plan_contract(
         StridedView(Cmat), StridedView(Amat), (1, 2), StridedView(Bmat), (2, 3), (1, 3);
-        kernel = kernel, mc = mc, kc = kc, nc = nc
+        kwargs...
     )
 end
 
@@ -443,4 +453,324 @@ end
     simd_allocs = _steady_allocs!(execute!, plan_v, Cmat_v)
     @test Cmat_v ≈ Amat * Bmat
     @test simd_allocs == 0 skip = (VERSION < v"1.11")
+end
+
+# =====================================================================
+# ContractWorkspace, the `workspace`/`allocator`/`oracle` keywords, and the
+# SIMDKernel default (docs/decisions.md, "Amendment 1"/"Amendment 2").
+# =====================================================================
+
+_ws_lengths(ws) = map(f -> length(getfield(ws, f)), fieldnames(typeof(ws)))
+
+@testset "plan_contract: SIMDKernel is the engine-wide default kernel" begin
+    for T in (Float64, Float32)
+        Random.seed!(5150)
+        Amat, Bmat = randn(T, 9, 10), randn(T, 10, 8)
+        Cmat = zeros(T, 9, 8)
+        plan = _mm_plan(Cmat, Amat, Bmat)
+
+        # Amendment 2: SIMDKernel(Val(8), Val(6), T), not ScalarKernel.
+        @test plan.kernel isa QuasiStrided.SIMDKernel{8, 6, T}
+        execute!(plan, one(T), zero(T))
+        @test Cmat ≈ Amat * Bmat
+
+        # ... and `contract!`, which must never disagree with plan_contract
+        # about what "default" means.
+        Cmat2 = zeros(T, 9, 8)
+        contract!(
+            StridedView(Cmat2), one(T), StridedView(Amat), (1, 2),
+            StridedView(Bmat), (2, 3), zero(T), (1, 3)
+        )
+        @test Cmat2 == Cmat
+    end
+end
+
+@testset "ContractWorkspace: reuse across shapes is bitwise identical to fresh plans" begin
+    kernel = ScalarKernel(Val(4), Val(3), Float64)
+    mc, kc, nc = 8, 6, 7
+    alpha, beta = 1.75, -0.5
+
+    # Deliberately not monotone in size: the workspace is sized by the first
+    # (mid) shape, grown by the second (large) one, then reused oversized by
+    # every smaller one after it.
+    shapes = ((13, 11, 10), (23, 19, 17), (4, 3, 2), (9, 10, 8), (1, 1, 1), (16, 5, 6))
+
+    ws = nothing
+    lengths_before = nothing
+    for (idx, (Ma, Ka, Na)) in enumerate(shapes)
+        Random.seed!(31_000 + idx)
+        Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
+        Cstart = randn(Ma, Na)
+
+        Cfresh = copy(Cstart)
+        execute!(_mm_plan(Cfresh, Amat, Bmat; kernel = kernel, mc = mc, kc = kc, nc = nc), alpha, beta)
+
+        Creuse = copy(Cstart)
+        plan = _mm_plan(
+            Creuse, Amat, Bmat;
+            kernel = kernel, mc = mc, kc = kc, nc = nc, workspace = ws
+        )
+        execute!(plan, alpha, beta)
+
+        # Bitwise, not approximate: reuse must not perturb the arithmetic.
+        @test Creuse == Cfresh
+
+        if ws !== nothing
+            @test plan.workspace === ws               # reserve!d in place, not rebuilt
+            @test all(_ws_lengths(ws) .>= lengths_before)  # grow-only, never shrunk
+        end
+        ws = plan.workspace
+        lengths_before = _ws_lengths(ws)
+    end
+
+    # Wrong-eltype workspaces are rejected rather than silently rebuilt.
+    Amat32, Bmat32, Cmat32 = randn(Float32, 4, 4), randn(Float32, 4, 4), zeros(Float32, 4, 4)
+    @test_throws ArgumentError _mm_plan(
+        Cmat32, Amat32, Bmat32;
+        kernel = ScalarKernel(Val(4), Val(3), Float32), workspace = ws
+    )
+end
+
+@testset "ContractWorkspace: an oversized reused buffer is not read beyond its live region" begin
+    kernel = ScalarKernel(Val(4), Val(3), Float64)
+    mc, kc, nc = 8, 6, 7
+    alpha, beta = 2.5, -0.75
+
+    # Size the workspace on a large contraction ...
+    Random.seed!(606)
+    Abig, Bbig = randn(23, 19), randn(19, 17)
+    Cbig = zeros(23, 17)
+    big = _mm_plan(Cbig, Abig, Bbig; kernel = kernel, mc = mc, kc = kc, nc = nc)
+    execute!(big, 1.0, 0.0)
+    ws = big.workspace
+
+    # ... then run a much smaller one on it.
+    Ma, Ka, Na = 5, 4, 3
+    Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
+    Cstart = randn(Ma, Na)
+
+    Cref = copy(Cstart)
+    execute!(_mm_plan(Cref, Amat, Bmat; kernel = kernel, mc = mc, kc = kc, nc = nc), alpha, beta)
+
+    # Poison every slot of every reused buffer. A packed slot read without
+    # having been written this call turns the output into NaN; an offset or
+    # descriptor read outside the live region addresses far outside the
+    # operand and is rejected by checked_tile_storage_bounds.
+    fill!(ws.packed_a, NaN)
+    fill!(ws.packed_b, NaN)
+    for buf in (ws.m_buf_A, ws.m_buf_C, ws.n_buf_B, ws.n_buf_C, ws.k_buf_A, ws.k_buf_B)
+        fill!(buf, typemin(Int) ÷ 4)
+    end
+    poison = BlockDescriptor(typemin(Int) ÷ 4, 0, 1, true)
+    for desc in (ws.m_desc_A, ws.m_desc_C, ws.n_desc_B, ws.n_desc_C)
+        fill!(desc, poison)
+    end
+
+    lengths_before = _ws_lengths(ws)
+    Cpoisoned = copy(Cstart)
+    plan = _mm_plan(
+        Cpoisoned, Amat, Bmat;
+        kernel = kernel, mc = mc, kc = kc, nc = nc, workspace = ws
+    )
+    # Nothing was regrown, so this really did run on the oversized buffers.
+    @test _ws_lengths(ws) == lengths_before
+    @test length(ws.packed_a) > cld(Ma, 4) * 4 * min(kc, Ka)
+    @test length(ws.packed_b) > cld(Na, 3) * 3 * min(kc, Ka)
+
+    execute!(plan, alpha, beta)
+    @test all(isfinite, Cpoisoned)
+    @test Cpoisoned == Cref
+end
+
+@testset "plan_contract: oracle = false skips execute_tilewise!'s buffers" begin
+    Random.seed!(909)
+    kernel = ScalarKernel(Val(4), Val(3), Float64)
+    Ma, Ka, Na = 9, 10, 8
+    Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
+
+    Cmat = zeros(Ma, Na)
+    plan = _mm_plan(Cmat, Amat, Bmat; kernel = kernel, kc = 4, oracle = false)
+    ws = plan.workspace
+
+    @test isempty(ws.tw_packed_a)
+    @test isempty(ws.tw_packed_b)
+    @test isempty(ws.tw_k_buf_A)
+    @test isempty(ws.tw_k_buf_B)
+    # The MR/NR-sized ones are NOT oracle-only: _scale_all_of_C!, the beta-only
+    # pass of both drivers, uses them.
+    @test length(ws.tw_m_buf_A) == 4
+    @test length(ws.tw_n_buf_C) == 3
+
+    execute!(plan, 1.0, 0.0)
+    @test Cmat ≈ Amat * Bmat
+
+    # The beta-only short-circuit still works without the oracle buffers.
+    Cstart = randn(Ma, Na)
+    Cbeta = copy(Cstart)
+    execute!(_mm_plan(Cbeta, Amat, Bmat; kernel = kernel, oracle = false), 0.0, 0.5)
+    @test Cbeta ≈ 0.5 .* Cstart
+
+    # ... but the oracle itself refuses to run rather than reading empty buffers.
+    @test_throws ArgumentError execute_tilewise!(plan, 1.0, 0.0)
+
+    # Reusing the same workspace with oracle = true grows them back.
+    Ctw = zeros(Ma, Na)
+    plan_tw = _mm_plan(Ctw, Amat, Bmat; kernel = kernel, kc = 4, workspace = ws, oracle = true)
+    @test plan_tw.workspace === ws
+    @test !isempty(ws.tw_packed_a)
+    execute_tilewise!(plan_tw, 1.0, 0.0)
+    @test Ctw ≈ Amat * Bmat
+end
+
+@testset "plan_contract: explicit allocators size the packed panels exactly once" begin
+    Random.seed!(1717)
+    kernel = SIMDKernel(Val(4), Val(3), Float64)
+    Ma, Ka, Na = 19, 23, 17
+    mc, kc, nc = 8, 6, 7
+    Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
+
+    Cdefault = zeros(Ma, Na)
+    default_plan = _mm_plan(Cdefault, Amat, Bmat; kernel = kernel, mc = mc, kc = kc, nc = nc)
+    execute!(default_plan, 1.5, 0.0)
+    @test default_plan.workspace.packed_a isa Vector{Float64}
+
+    for allocator in (TO.ManualAllocator(), TO.BufferAllocator())
+        checkpoint = TO.allocator_checkpoint!(allocator)
+
+        Cmat = zeros(Ma, Na)
+        plan = _mm_plan(
+            Cmat, Amat, Bmat;
+            kernel = kernel, mc = mc, kc = kc, nc = nc,
+            allocator = allocator, oracle = false
+        )
+        ws = plan.workspace
+
+        # Concretely typed instance, exact sizing, no oracle buffers.
+        @test isconcretetype(typeof(ws))
+        @test all(isconcretetype, fieldtypes(typeof(ws)))
+        @test length(ws.packed_a) == cld(plan.blocking.mc, 4) * 4 * plan.blocking.kc
+        @test length(ws.packed_b) == cld(plan.blocking.nc, 3) * 3 * plan.blocking.kc
+        @test isempty(ws.tw_packed_a)
+        # Offset buffers are Val(false) requests: a plain Vector{Int} from
+        # every allocator, because fill_offsets!/describe_block are frozen on
+        # that concrete type.
+        @test ws.m_buf_A isa Vector{Int}
+        @test ws.k_buf_B isa Vector{Int}
+
+        execute!(plan, 1.5, 0.0)
+        @test Cmat == Cdefault  # same blocking, so bitwise identical
+
+        QuasiStrided.release!(ws, allocator)
+        TO.allocator_reset!(allocator, checkpoint)
+    end
+
+    # A PtrArray-backed workspace is not reserve!-able at all: the grow-upward
+    # discipline and allocator-owned temporaries are mutually exclusive
+    # (docs/decisions.md, "Verified allocator behavior", fact 3).
+    manual = TO.ManualAllocator()
+    Cmanual = zeros(Ma, Na)
+    manual_plan = _mm_plan(
+        Cmanual, Amat, Bmat;
+        kernel = kernel, mc = mc, kc = kc, nc = nc, allocator = manual, oracle = false
+    )
+    @test_throws MethodError QuasiStrided.reserve!(
+        manual_plan.workspace, kernel, manual_plan.blocking, false
+    )
+    QuasiStrided.release!(manual_plan.workspace, manual)
+
+    # An explicit allocator and a reusable workspace are contradictory.
+    @test_throws ArgumentError _mm_plan(
+        zeros(Ma, Na), Amat, Bmat;
+        kernel = kernel, allocator = TO.ManualAllocator(),
+        workspace = default_plan.workspace
+    )
+end
+
+# =====================================================================
+# Type-stability regression: `ContractWorkspace`'s `VT` parameter must not
+# reintroduce the boxing bug of docs/decisions.md's "Phase A findings".
+# =====================================================================
+
+_ws_union_members(t) = t isa Union ?
+    (_ws_union_members(t.a)..., _ws_union_members(t.b)...) : (t,)
+
+# Every type inference assigned in `f(argtypes...)`'s unoptimized typed IR that
+# is a QSTile or ContractWorkspace and is *not* concrete, directly or as a
+# union member. `Union{}` is a `throw` branch's result type, not an instability.
+function _ws_nonconcrete_types(f, argtypes)
+    bad = Any[]
+    for (ci, rt) in Base.code_typed(f, argtypes; optimize = false)
+        types = Any[rt]
+        ci.slottypes isa Vector && append!(types, ci.slottypes)
+        ci.ssavaluetypes isa Vector && append!(types, ci.ssavaluetypes)
+        for t in types
+            t isa Type || continue
+            for m in _ws_union_members(t)
+                (m isa Type && m !== Union{}) || continue
+                if (m <: QuasiStrided.QSTile || m <: QuasiStrided.ContractWorkspace) &&
+                        !isconcretetype(m)
+                    push!(bad, t)
+                    break
+                end
+            end
+        end
+    end
+    return unique(bad)
+end
+
+@testset "plan_contract/execute!: no union-typed or partially-applied tile/workspace types" begin
+    Random.seed!(2468)
+    Ma, Ka, Na = 19, 23, 17
+    Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
+    Cmat = zeros(Ma, Na)
+    Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
+    plan = _mm_plan(Cmat, Amat, Bmat; mc = 8, kc = 6, nc = 7)
+
+    # Every *instance* is concretely typed, and no field is a Union or a bare
+    # AbstractVector (the frozen prohibition; VT is a where-bound parameter
+    # resolved at construction, like ScatterAxis{V}).
+    @test isconcretetype(typeof(plan))
+    @test isconcretetype(typeof(plan.workspace))
+    @test all(isconcretetype, fieldtypes(typeof(plan.workspace)))
+    @test !any(t -> t isa Union, fieldtypes(typeof(plan.workspace)))
+    @test fieldtype(typeof(plan), :workspace) === typeof(plan.workspace)
+    @test typeof(plan.workspace) === QuasiStrided.ContractWorkspace{Float64, Vector{Float64}}
+
+    plan_argtypes = (
+        typeof(Cv), typeof(Av), NTuple{2, Int}, typeof(Bv), NTuple{2, Int}, NTuple{2, Int},
+    )
+    @test isempty(_ws_nonconcrete_types(plan_contract, plan_argtypes))
+    @test isempty(_ws_nonconcrete_types(execute!, (typeof(plan), Float64, Float64)))
+    @test isempty(_ws_nonconcrete_types(execute_tilewise!, (typeof(plan), Float64, Float64)))
+    @test isconcretetype(only(Base.return_types(execute!, (typeof(plan), Float64, Float64))))
+end
+
+# =====================================================================
+# Zero steady-state allocation on the default (DefaultAllocator) path, with
+# the default kernel. SIMDKernel's accumulator is not kept register-resident
+# by Julia 1.10's compiler (docs/decisions.md, Amendment 2's caveat), so this
+# is skipped there exactly as test/test_simd_kernel.jl skips its own -- never
+# weakened or deleted.
+# =====================================================================
+
+@testset "execute! on the default allocator path is allocation-free" begin
+    Random.seed!(1123)
+    Ma, Ka, Na = 19, 23, 17
+    Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
+
+    # Everything at its default: default kernel, default blocking, fresh
+    # DefaultAllocator-backed workspace.
+    Cmat = zeros(Ma, Na)
+    plan = _mm_plan(Cmat, Amat, Bmat)
+    allocs = _steady_allocs!(execute!, plan, Cmat)
+    @test Cmat ≈ Amat * Bmat
+    @test allocs == 0 skip = (VERSION < v"1.11")
+
+    # ... and through a reused workspace, which is the shape the backend path
+    # takes on every call.
+    Cmat2 = zeros(Ma, Na)
+    plan2 = _mm_plan(Cmat2, Amat, Bmat; workspace = plan.workspace, oracle = false)
+    allocs2 = _steady_allocs!(execute!, plan2, Cmat2)
+    @test Cmat2 ≈ Amat * Bmat
+    @test allocs2 == 0 skip = (VERSION < v"1.11")
 end

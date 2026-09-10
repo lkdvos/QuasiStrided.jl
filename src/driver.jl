@@ -5,6 +5,12 @@
 # execute! is a BLIS five-loop (NC/KC/MC) nest with packed-panel reuse; the
 # pre-macro-blocking tile-by-tile driver is kept unexported as
 # `execute_tilewise!`, an independent correctness oracle for it.
+# The buffers themselves live in a separate, reusable `ContractWorkspace`
+# (src/workspace.jl; docs/decisions.md, "Amendment 1").
+
+# Frozen module-import convention (docs/decisions.md): TO names are always
+# qualified; a bare `using TensorOperations` would collide on `scalartype`.
+import TensorOperations as TO
 
 # Classify every label in indA ∪ indB ∪ indC into M/N/K. Returns
 # (mlabels, nlabels, klabels) in indA/indB appearance order. Per (inA,inB,inC):
@@ -106,15 +112,15 @@ function _build_pair_group(
     return AxisGroup(lens, (s1, s2))
 end
 
-_default_kernel(::Type{T}) where {T} = ScalarKernel(Val(8), Val(6), T)
+# Engine-wide default kernel, everywhere (docs/decisions.md, "Amendment 2").
+_default_kernel(::Type{T}) where {T} = SIMDKernel(Val(8), Val(6), T)
 
-# LOAD-BEARING (Phase A binding requirement, docs/decisions.md): a
-# Union{AffineAxis,ScatterAxis} must never flow into a QSTile that is then
-# passed on to further type-unstable code. `_axis_of` produces the union;
-# every consumer below is a `where {R<:Axis, C<:Axis}` barrier method that
-# Julia specializes per concrete (R,C), so QSTile is never left as a
-# partially-applied UnionAll (which boxes). Do not collapse these helpers
-# into their call sites, and do not let a union cross any other boundary.
+# LOAD-BEARING (docs/decisions.md, macro-blocking Phase A findings): `_axis_of`
+# produces a Union{AffineAxis,ScatterAxis}, and each consumer below is a
+# `where {R<:Axis, C<:Axis}` barrier method that Julia specializes per concrete
+# (R,C), so no partially-applied (boxing) QSTile is ever built. Do not collapse
+# these helpers into their call sites, and do not let a union cross any other
+# boundary.
 @inline function _axis_of(d::BlockDescriptor, buffer::Vector{Int}, first::Int)
     return d.regular ? AffineAxis(d.base, d.stride, d.count) :
         ScatterAxis(view(buffer, (first + 1):(first + d.count)), d.count)
@@ -178,19 +184,22 @@ end
 # Apply beta once to every element of C at MR x NR granularity, without
 # reading A or B. Shared by both drivers' Qk==0/alpha==0 short-circuit; uses
 # the tw_* (MR/NR-sized) buffers, since a beta-only pass needs no blocking.
+# That is why those four buffers -- unlike the kc-sized tw_k_buf_*/tw_packed_*
+# ones -- are allocated even under `oracle = false`: they are not oracle-only.
 function _scale_all_of_C!(plan, betaT::T, MRk::Int, NRk::Int, Qm::Int, Qn::Int) where {T}
-    m_bufs = (plan.tw_m_buf_A, plan.tw_m_buf_C)
-    n_bufs = (plan.tw_n_buf_B, plan.tw_n_buf_C)
+    ws = plan.workspace
+    m_bufs = (ws.tw_m_buf_A, ws.tw_m_buf_C)
+    n_bufs = (ws.tw_n_buf_B, ws.tw_n_buf_C)
     mfirst = 0
     while mfirst < Qm
         mcount = min(MRk, Qm - mfirst)
         (_, dM_C) = block_descriptors!(m_bufs, plan.mgroup, mfirst, mcount)
-        rowsC = _axis_of(dM_C, plan.tw_m_buf_C, 0)
+        rowsC = _axis_of(dM_C, ws.tw_m_buf_C, 0)
         nfirst = 0
         while nfirst < Qn
             ncount = min(NRk, Qn - nfirst)
             (_, dN_C) = block_descriptors!(n_bufs, plan.ngroup, nfirst, ncount)
-            colsC = _axis_of(dN_C, plan.tw_n_buf_C, 0)
+            colsC = _axis_of(dN_C, ws.tw_n_buf_C, 0)
             _scale_micro_tile!(plan.Cstorage, plan.Cbase, rowsC, colsC, betaT)
             nfirst += ncount
         end
@@ -202,13 +211,20 @@ end
 """
     ContractPlan
 
-Reusable plan/workspace from [`plan_contract`](@ref): resolved M/N/K
-`AxisGroup`s, kernel, operand storage/base, the effective [`Blocking`](@ref),
-and every buffer [`execute!`](@ref)/[`execute_tilewise!`](@ref) need -- sized
-once here, never (re)allocated there. Field layout is an implementation
-detail, not part of the frozen interface; see the comments below.
+Reusable plan from [`plan_contract`](@ref): resolved M/N/K `AxisGroup`s,
+kernel, operand storage/base, the effective [`Blocking`](@ref), and the
+[`ContractWorkspace`](@ref) holding every buffer
+[`execute!`](@ref)/[`execute_tilewise!`](@ref) need -- sized once during
+planning, never (re)allocated during execution. `VT` is the workspace's
+packed-panel vector type (`Vector{T}` on the default allocator path), a
+`where`-bound parameter resolved at construction, so every plan instance is
+concretely typed. Field layout is an implementation detail, not part of the
+frozen interface.
 """
-struct ContractPlan{T, Kern, GM <: AxisGroup, GN <: AxisGroup, GK <: AxisGroup, SA, SB, SC}
+struct ContractPlan{
+        T, Kern, GM <: AxisGroup, GN <: AxisGroup, GK <: AxisGroup, SA, SB, SC,
+        VT <: AbstractVector{T},
+    }
     kernel::Kern
     mgroup::GM
     ngroup::GN
@@ -221,45 +237,19 @@ struct ContractPlan{T, Kern, GM <: AxisGroup, GN <: AxisGroup, GK <: AxisGroup, 
     Cstorage::SC
     Cbase::Int
 
-    # Macro-block-sized offset buffers: one fill_offsets! per jc/pc/ic block,
-    # reused by every sliver inside it.
-    m_buf_A::Vector{Int}
-    m_buf_C::Vector{Int}
-    n_buf_B::Vector{Int}
-    n_buf_C::Vector{Int}
-    k_buf_A::Vector{Int}
-    k_buf_B::Vector{Int}
-
-    # Per-sliver descriptors classified from the buffers above (3-arg
-    # describe_block), reused across the pc/ic loops of a given jc/ic.
-    m_desc_A::Vector{BlockDescriptor}
-    m_desc_C::Vector{BlockDescriptor}
-    n_desc_B::Vector{BlockDescriptor}
-    n_desc_C::Vector{BlockDescriptor}
-
-    # Packed macro-panel buffers: cld(mc,MRk)/cld(nc,NRk) slivers at kc-eff depth.
-    packed_a::Vector{T}
-    packed_b::Vector{T}
-
-    # execute_tilewise!'s own small buffers (MR/NR/blocking.kc-sized).
-    # Deliberately NOT shared with the macro buffers above: the oracle must
-    # have no mutable state in common with the code it checks.
-    tw_m_buf_A::Vector{Int}
-    tw_m_buf_C::Vector{Int}
-    tw_n_buf_B::Vector{Int}
-    tw_n_buf_C::Vector{Int}
-    tw_k_buf_A::Vector{Int}
-    tw_k_buf_B::Vector{Int}
-    tw_packed_a::Vector{T}
-    tw_packed_b::Vector{T}
+    # Every buffer both drivers use (docs/decisions.md, "Amendment 1").
+    workspace::ContractWorkspace{T, VT}
 end
 
 """
     plan_contract(C::StridedView, A::StridedView, indA::NTuple{NA,Int},
                   B::StridedView, indB::NTuple{NB,Int},
                   indC::NTuple{NC,Int};
-                  kernel = ScalarKernel(Val(8), Val(6), eltype(C)),
-                  mc = nothing, kc = nothing, nc = nothing) -> ContractPlan
+                  kernel = SIMDKernel(Val(8), Val(6), eltype(C)),
+                  mc = nothing, kc = nothing, nc = nothing,
+                  workspace = nothing,
+                  allocator = TensorOperations.DefaultAllocator(),
+                  oracle = true) -> ContractPlan
 
 Planning phase of [`contract!`](@ref): resolves labels into M/N/K
 `AxisGroup`s, validates matched axis lengths and eltypes, and preallocates
@@ -270,6 +260,19 @@ and clamped into the *effective* blocking stored on the plan: `mc`/`nc` round
 up to a whole `mr(kernel)`/`nr(kernel)` multiple, then cap at the M/N extent
 (likewise rounded up); `kc` caps at the K extent. Throws
 `ArgumentError`/`DimensionMismatch` on invalid input.
+
+Buffers (docs/decisions.md, "Amendment 1"):
+
+  * `workspace = nothing` builds a fresh [`ContractWorkspace`](@ref); passing
+    an existing one reuses it, grown as needed by [`reserve!`](@ref), even
+    across differently shaped contractions.
+  * `allocator` is a TensorOperations allocator. `DefaultAllocator` gives a
+    plain, GC-owned, `reserve!`-able `ContractWorkspace{T,Vector{T}}`; any
+    other one sizes the packed panels exactly once via
+    `TensorOperations.tensoralloc`, forbids `workspace` as well, and leaves
+    [`release!`](@ref) to the caller.
+  * `oracle = false` skips `execute_tilewise!`'s own buffers entirely, making
+    that oracle unavailable for this plan. `execute!` is unaffected.
 """
 function plan_contract(
         C::StridedView, A::StridedView, indA::NTuple{NA, Int},
@@ -278,7 +281,10 @@ function plan_contract(
         kernel = _default_kernel(eltype(C)),
         mc::Union{Int, Nothing} = nothing,
         kc::Union{Int, Nothing} = nothing,
-        nc::Union{Int, Nothing} = nothing
+        nc::Union{Int, Nothing} = nothing,
+        workspace::Union{Nothing, ContractWorkspace} = nothing,
+        allocator = TO.DefaultAllocator(),
+        oracle::Bool = true
     ) where {NA, NB, NC}
     T = eltype(C)
     eltype(A) === T ||
@@ -327,41 +333,62 @@ function plan_contract(
     Cstorage = parent(C)
     Cbase = offset(C)
 
-    m_slivers_max = cld(mc_eff, MRk)
-    n_slivers_max = cld(nc_eff, NRk)
-
-    m_buf_A = zeros(Int, mc_eff)
-    m_buf_C = zeros(Int, mc_eff)
-    n_buf_B = zeros(Int, nc_eff)
-    n_buf_C = zeros(Int, nc_eff)
-    k_buf_A = zeros(Int, kc_eff)
-    k_buf_B = zeros(Int, kc_eff)
-
-    m_desc_A = Vector{BlockDescriptor}(undef, m_slivers_max)
-    m_desc_C = Vector{BlockDescriptor}(undef, m_slivers_max)
-    n_desc_B = Vector{BlockDescriptor}(undef, n_slivers_max)
-    n_desc_C = Vector{BlockDescriptor}(undef, n_slivers_max)
-
-    packed_a = zeros(T, m_slivers_max * packed_a_length(kernel, kc_eff))
-    packed_b = zeros(T, n_slivers_max * packed_b_length(kernel, kc_eff))
-
-    tw_m_buf_A = zeros(Int, MRk)
-    tw_m_buf_C = zeros(Int, MRk)
-    tw_n_buf_B = zeros(Int, NRk)
-    tw_n_buf_C = zeros(Int, NRk)
-    tw_k_buf_A = zeros(Int, kc_eff)
-    tw_k_buf_B = zeros(Int, kc_eff)
-    tw_packed_a = zeros(T, packed_a_length(kernel, kc_eff))
-    tw_packed_b = zeros(T, packed_b_length(kernel, kc_eff))
+    # Buffers are `undef`-initialized, not zeroed; see `ContractWorkspace`.
+    ws = _resolve_workspace(T, workspace, kernel, blocking, oracle, allocator)
 
     return ContractPlan(
         kernel, mgroup, ngroup, kgroup, blocking,
-        Astorage, Abase, Bstorage, Bbase, Cstorage, Cbase,
-        m_buf_A, m_buf_C, n_buf_B, n_buf_C, k_buf_A, k_buf_B,
-        m_desc_A, m_desc_C, n_desc_B, n_desc_C,
-        packed_a, packed_b,
-        tw_m_buf_A, tw_m_buf_C, tw_n_buf_B, tw_n_buf_C, tw_k_buf_A, tw_k_buf_B,
-        tw_packed_a, tw_packed_b
+        Astorage, Abase, Bstorage, Bbase, Cstorage, Cbase, ws
+    )
+end
+
+# Build or reuse the plan's workspace. Dispatching on the allocator type (not
+# an `isa` branch on a value) keeps both paths concretely typed and makes the
+# unreachable one disappear at compile time.
+#
+# Default path: a plain, GC-owned `ContractWorkspace{T,Vector{T}}`, reused via
+# `reserve!` when one is handed in -- the zero-steady-state-allocation fast
+# path (docs/decisions.md's workspace/allocator design-constraints section).
+function _resolve_workspace(
+        ::Type{T}, workspace, kernel, blocking::Blocking, oracle::Bool,
+        allocator::TO.DefaultAllocator
+    ) where {T}
+    workspace === nothing &&
+        return ContractWorkspace(T, kernel, blocking, oracle, allocator)
+    return _reuse_workspace(T, workspace, kernel, blocking, oracle)
+end
+
+# Explicit-allocator path: sized exactly once from the effective blocking, no
+# `reserve!`, no resizing. The caller owns `release!`.
+function _resolve_workspace(
+        ::Type{T}, workspace, kernel, blocking::Blocking, oracle::Bool, allocator
+    ) where {T}
+    workspace === nothing || throw(
+        ArgumentError(
+            "plan_contract: `workspace` cannot be combined with a non-default " *
+                "`allocator` ($(typeof(allocator))); an allocator-provided workspace is " *
+                "sized once at construction and must not be resized or reused"
+        )
+    )
+    return ContractWorkspace(T, kernel, blocking, oracle, allocator)
+end
+
+@inline function _reuse_workspace(
+        ::Type{T}, ws::ContractWorkspace{T, Vector{T}}, kernel, blocking::Blocking,
+        oracle::Bool
+    ) where {T}
+    return reserve!(ws, kernel, blocking, oracle)
+end
+
+@noinline function _reuse_workspace(
+        ::Type{T}, ws::ContractWorkspace, kernel, blocking::Blocking, oracle::Bool
+    ) where {T}
+    throw(
+        ArgumentError(
+            "plan_contract: cannot reuse a $(typeof(ws)) for an eltype-$T contraction " *
+                "on the default allocator; only a ContractWorkspace{$T,Vector{$T}} is " *
+                "`reserve!`-able"
+        )
     )
 end
 
@@ -403,14 +430,18 @@ function execute!(plan::ContractPlan{T}, alpha::Number, beta::Number) where {T}
     kc_eff = plan.blocking.kc
     nc_eff = plan.blocking.nc
 
+    # A reused workspace may be oversized: every extent below comes from the
+    # *current* block, never from a buffer's length.
+    ws = plan.workspace
+
     # --- loop 5: jc over N in steps of nc_eff ---
     jc = 0
     while jc < Qn
         nblock = min(nc_eff, Qn - jc)
         n_slivers = cld(nblock, NRk)
-        fill_offsets!((plan.n_buf_B, plan.n_buf_C), plan.ngroup, jc, nblock)
+        fill_offsets!((ws.n_buf_B, ws.n_buf_C), plan.ngroup, jc, nblock)
         _classify_slivers!(
-            plan.n_desc_B, plan.n_desc_C, plan.n_buf_B, plan.n_buf_C,
+            ws.n_desc_B, ws.n_desc_C, ws.n_buf_B, ws.n_buf_C,
             nblock, NRk, n_slivers
         )
 
@@ -419,19 +450,19 @@ function execute!(plan::ContractPlan{T}, alpha::Number, beta::Number) where {T}
         firstpanel = true
         while pc < Qk
             kblock = min(kc_eff, Qk - pc)
-            fill_offsets!((plan.k_buf_A, plan.k_buf_B), plan.kgroup, pc, kblock)
-            dK_A = describe_block(plan.k_buf_A, 0, kblock)
-            dK_B = describe_block(plan.k_buf_B, 0, kblock)
-            colsA_k = _axis_of(dK_A, plan.k_buf_A, 0)
-            rowsB_k = _axis_of(dK_B, plan.k_buf_B, 0)
+            fill_offsets!((ws.k_buf_A, ws.k_buf_B), plan.kgroup, pc, kblock)
+            dK_A = describe_block(ws.k_buf_A, 0, kblock)
+            dK_B = describe_block(ws.k_buf_B, 0, kblock)
+            colsA_k = _axis_of(dK_A, ws.k_buf_A, 0)
+            rowsB_k = _axis_of(dK_B, ws.k_buf_B, 0)
 
             beta_eff = firstpanel ? betaT : one(T)
 
             # Pack the whole B panel for this (jc, pc): every N-sliver.
             for s in 0:(n_slivers - 1)
                 sfirst = s * NRk
-                colsB = _axis_of(plan.n_desc_B[s + 1], plan.n_buf_B, sfirst)
-                bview = view(plan.packed_b, _sliver_range(NRk, kblock, s))
+                colsB = _axis_of(ws.n_desc_B[s + 1], ws.n_buf_B, sfirst)
+                bview = view(ws.packed_b, _sliver_range(NRk, kblock, s))
                 _pack_sliver!(pack_b!, bview, plan.Bstorage, plan.Bbase, rowsB_k, colsB, kernel)
             end
 
@@ -440,29 +471,29 @@ function execute!(plan::ContractPlan{T}, alpha::Number, beta::Number) where {T}
             while ic < Qm
                 mblock = min(mc_eff, Qm - ic)
                 m_slivers = cld(mblock, MRk)
-                fill_offsets!((plan.m_buf_A, plan.m_buf_C), plan.mgroup, ic, mblock)
+                fill_offsets!((ws.m_buf_A, ws.m_buf_C), plan.mgroup, ic, mblock)
                 _classify_slivers!(
-                    plan.m_desc_A, plan.m_desc_C, plan.m_buf_A, plan.m_buf_C,
+                    ws.m_desc_A, ws.m_desc_C, ws.m_buf_A, ws.m_buf_C,
                     mblock, MRk, m_slivers
                 )
 
                 # Pack the whole A panel for this (jc, pc, ic): every M-sliver.
                 for r in 0:(m_slivers - 1)
                     rfirst = r * MRk
-                    rowsA = _axis_of(plan.m_desc_A[r + 1], plan.m_buf_A, rfirst)
-                    aview = view(plan.packed_a, _sliver_range(MRk, kblock, r))
+                    rowsA = _axis_of(ws.m_desc_A[r + 1], ws.m_buf_A, rfirst)
+                    aview = view(ws.packed_a, _sliver_range(MRk, kblock, r))
                     _pack_sliver!(pack_a!, aview, plan.Astorage, plan.Abase, rowsA, colsA_k, kernel)
                 end
 
                 # --- loop 2: jr over N-slivers; loop 1: ir over M-slivers ---
                 for s in 0:(n_slivers - 1)
                     sfirst = s * NRk
-                    colsC = _axis_of(plan.n_desc_C[s + 1], plan.n_buf_C, sfirst)
-                    bview = view(plan.packed_b, _sliver_range(NRk, kblock, s))
+                    colsC = _axis_of(ws.n_desc_C[s + 1], ws.n_buf_C, sfirst)
+                    bview = view(ws.packed_b, _sliver_range(NRk, kblock, s))
                     for r in 0:(m_slivers - 1)
                         rfirst = r * MRk
-                        rowsC = _axis_of(plan.m_desc_C[r + 1], plan.m_buf_C, rfirst)
-                        aview = view(plan.packed_a, _sliver_range(MRk, kblock, r))
+                        rowsC = _axis_of(ws.m_desc_C[r + 1], ws.m_buf_C, rfirst)
+                        aview = view(ws.packed_a, _sliver_range(MRk, kblock, r))
                         _execute_micro_tile!(
                             kernel, plan.Cstorage, plan.Cbase, rowsC, colsC,
                             aview, bview, kblock, alphaT, beta_eff
@@ -494,8 +525,20 @@ correctness oracle for [`execute!`](@ref) (docs/decisions.md,
 `execute_tile!` with `beta` on the first panel and `one(T)` on later ones.
 Uses only its own `tw_*` buffers, so it shares no mutable state with
 `execute!`. Allocation-free.
+
+Requires a plan built with `oracle = true` (the default); throws
+`ArgumentError` otherwise, since `oracle = false` is exactly the request not
+to allocate these buffers.
 """
 function execute_tilewise!(plan::ContractPlan{T}, alpha::Number, beta::Number) where {T}
+    ws = plan.workspace
+    _has_oracle(ws) || throw(
+        ArgumentError(
+            "execute_tilewise! needs the oracle buffers, which this plan was built " *
+                "without; re-plan with `oracle = true`"
+        )
+    )
+
     alphaT = convert(T, alpha)
     betaT = convert(T, beta)
 
@@ -514,40 +557,40 @@ function execute_tilewise!(plan::ContractPlan{T}, alpha::Number, beta::Number) w
         return plan.Cstorage
     end
 
-    m_bufs = (plan.tw_m_buf_A, plan.tw_m_buf_C)
-    n_bufs = (plan.tw_n_buf_B, plan.tw_n_buf_C)
-    k_bufs = (plan.tw_k_buf_A, plan.tw_k_buf_B)
+    m_bufs = (ws.tw_m_buf_A, ws.tw_m_buf_C)
+    n_bufs = (ws.tw_n_buf_B, ws.tw_n_buf_C)
+    k_bufs = (ws.tw_k_buf_A, ws.tw_k_buf_B)
     kc_panel = plan.blocking.kc
 
     mfirst = 0
     while mfirst < Qm
         mcount = min(MRk, Qm - mfirst)
         (dM_A, dM_C) = block_descriptors!(m_bufs, plan.mgroup, mfirst, mcount)
-        rowsA = _axis_of(dM_A, plan.tw_m_buf_A, 0)
-        rowsC = _axis_of(dM_C, plan.tw_m_buf_C, 0)
+        rowsA = _axis_of(dM_A, ws.tw_m_buf_A, 0)
+        rowsC = _axis_of(dM_C, ws.tw_m_buf_C, 0)
 
         nfirst = 0
         while nfirst < Qn
             ncount = min(NRk, Qn - nfirst)
             (dN_B, dN_C) = block_descriptors!(n_bufs, plan.ngroup, nfirst, ncount)
-            colsB = _axis_of(dN_B, plan.tw_n_buf_B, 0)
-            colsC = _axis_of(dN_C, plan.tw_n_buf_C, 0)
+            colsB = _axis_of(dN_B, ws.tw_n_buf_B, 0)
+            colsC = _axis_of(dN_C, ws.tw_n_buf_C, 0)
 
             kfirst = 0
             firstpanel = true
             while kfirst < Qk
                 kcount = min(kc_panel, Qk - kfirst)
                 (dK_A, dK_B) = block_descriptors!(k_bufs, plan.kgroup, kfirst, kcount)
-                colsK_A = _axis_of(dK_A, plan.tw_k_buf_A, 0)
-                rowsK_B = _axis_of(dK_B, plan.tw_k_buf_B, 0)
+                colsK_A = _axis_of(dK_A, ws.tw_k_buf_A, 0)
+                rowsK_B = _axis_of(dK_B, ws.tw_k_buf_B, 0)
 
-                _pack_sliver!(pack_a!, plan.tw_packed_a, plan.Astorage, plan.Abase, rowsA, colsK_A, kernel)
-                _pack_sliver!(pack_b!, plan.tw_packed_b, plan.Bstorage, plan.Bbase, rowsK_B, colsB, kernel)
+                _pack_sliver!(pack_a!, ws.tw_packed_a, plan.Astorage, plan.Abase, rowsA, colsK_A, kernel)
+                _pack_sliver!(pack_b!, ws.tw_packed_b, plan.Bstorage, plan.Bbase, rowsK_B, colsB, kernel)
 
                 beta_eff = firstpanel ? betaT : one(T)
                 _execute_micro_tile!(
                     kernel, plan.Cstorage, plan.Cbase, rowsC, colsC,
-                    plan.tw_packed_a, plan.tw_packed_b, kcount, alphaT, beta_eff
+                    ws.tw_packed_a, ws.tw_packed_b, kcount, alphaT, beta_eff
                 )
 
                 firstpanel = false
