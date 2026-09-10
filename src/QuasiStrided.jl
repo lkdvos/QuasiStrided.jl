@@ -31,9 +31,13 @@ include("tensoroperations.jl")
 export QuasiStridedBackend
 
 @static if VERSION >= v"1.11"
-    eval(Expr(:public, :contract!, :plan_contract, :execute!, :ContractPlan,
-              :ContractWorkspace, :Blocking, :default_blocking,
-              :ScalarKernel, :SIMDKernel))
+    eval(
+        Expr(
+            :public, :contract!, :plan_contract, :execute!, :ContractPlan,
+            :ContractWorkspace, :Blocking, :default_blocking,
+            :ScalarKernel, :SIMDKernel
+        )
+    )
 end
 
 end # module QuasiStrided
