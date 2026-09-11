@@ -469,8 +469,14 @@ _ws_lengths(ws) = map(f -> length(getfield(ws, f)), fieldnames(typeof(ws)))
         Cmat = zeros(T, 9, 8)
         plan = _mm_plan(Cmat, Amat, Bmat)
 
-        # Amendment 2: SIMDKernel(Val(8), Val(6), T), not ScalarKernel.
-        @test plan.kernel isa QuasiStrided.SIMDKernel{8, 6, T}
+        # Amendment 2: a SIMDKernel, not a ScalarKernel. The shape itself is
+        # hardware-derived (docs/decisions.md, Phase G) and demoted when M
+        # cannot fill a register tile, so pin the *resolution* rather than a
+        # literal shape -- `{8, 6, T}` held here only because Qm = 9 happens
+        # to trigger the demotion on x86, and broke on aarch64.
+        @test plan.kernel isa QuasiStrided.SIMDKernel
+        @test QuasiStrided.scalartype(plan.kernel) === T
+        @test plan.kernel === QuasiStrided._default_kernel(T, size(Amat, 1), size(Bmat, 2))
         execute!(plan, one(T), zero(T))
         @test Cmat ≈ Amat * Bmat
 

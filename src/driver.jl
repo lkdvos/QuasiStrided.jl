@@ -112,8 +112,80 @@ function _build_pair_group(
     return AxisGroup(lens, (s1, s2))
 end
 
-# Engine-wide default kernel, everywhere (docs/decisions.md, "Amendment 2").
-_default_kernel(::Type{T}) where {T} = SIMDKernel(Val(8), Val(6), T)
+# Engine-wide default kernel (docs/decisions.md: "Amendment 2" for
+# `SIMDKernel`, Phase G for the derived shape, Phase H for why NV stays 12).
+#
+# Shape from one detected capability, the vector register width:
+#   W = vector_bytes/sizeof(T),  MR = 2W,  NR = NR_DEFAULT  =>  NV = 12.
+# Reproduces the swept optimum for both dtypes on AVX-512 and reduces to the
+# previous hardcoded (8,6,4) on AVX2. NV = 12 is also the only setting that
+# fits a 16-register AVX2 machine and Julia 1.10's register allocation.
+const NR_DEFAULT = 6
+
+_legacy_shape(::Type{T}) where {T} = (8, 6, _default_lanewidth(T))
+
+# Deliberately empty: after Phase H the rule above is already the measured
+# optimum (1st of 24 for Float32, 2nd of 33 by 0.01% for Float64), so a row
+# here would only pin this package to one machine's noise.
+_shape_override(::Val, ::Type) = nothing
+
+# The rule applies only to the ISAs it was validated on. `:neon` is detected
+# but deliberately gets the legacy shape: there is no aarch64 measurement, and
+# the rule would pick MR = 2W = 4 with 128-bit lanes, using 12 of 32 NEON
+# registers -- narrower and smaller than the legacy (8,6,4), not obviously
+# better. Derive where measured, fall back everywhere else.
+_rule_applies(::Val{:avx512}) = true
+_rule_applies(::Val{:avx2}) = true
+_rule_applies(::Val) = false
+
+function _derived_shape(profile::TargetProfile, ::Type{T}) where {T}
+    vb = profile.vector_bytes
+    key = Val(profile.isa)
+    (_rule_applies(key) && vb > 0 && vb % sizeof(T) == 0) || return _legacy_shape(T)
+    ovr = _shape_override(key, T)
+    return ovr === nothing ? (2 * (vb ÷ sizeof(T)), NR_DEFAULT, vb ÷ sizeof(T)) : ovr
+end
+
+# Closed set, so compiled SIMDKernel (and driver) specializations are bounded.
+const KERNEL_SHAPES_F64 = ((8, 6, 4), (16, 6, 8))
+const KERNEL_SHAPES_F32 = ((8, 6, 8), (32, 6, 16), (16, 6, 8))
+
+kernel_shapes(::Type{Float64}) = KERNEL_SHAPES_F64
+kernel_shapes(::Type{Float32}) = KERNEL_SHAPES_F32
+kernel_shapes(::Type{T}) where {T} = (_legacy_shape(T),)
+
+# Unrolled over `kernel_shapes(T)` so every branch builds a concrete kernel
+# from literal `Val`s; the last shape is the fallback. Generated because a
+# plain loop would construct `Val(cand[1])` dynamically and widen to `Any`.
+# Costs one dynamic dispatch per `plan_contract`, none per tile or K step:
+# `_plan_contract` specializes, so `execute!` sees no abstract type.
+@generated function _kernel_from_shape(shape::Tuple{Int, Int, Int}, ::Type{T}) where {T}
+    shapes = kernel_shapes(T)
+    ex = :(SIMDKernel(Val($(shapes[end][1])), Val($(shapes[end][2])), T, Val($(shapes[end][3]))))
+    for (MR, NR, W) in reverse(shapes[1:(end - 1)])
+        ex = :(
+            shape === ($MR, $NR, $W) ? SIMDKernel(Val($MR), Val($NR), T, Val($W)) : $ex
+        )
+    end
+    return ex
+end
+
+@noinline _kernel_for(profile::TargetProfile, ::Type{T}) where {T} =
+    _kernel_from_shape(_derived_shape(profile, T), T)
+
+_default_kernel(::Type{T}) where {T} = _kernel_for(target_profile(), T)
+
+# Extent-aware variant, used only when the caller did not name a kernel: a
+# contraction whose M extent cannot fill one register tile pads every
+# micro-tile away, so fall back to the legacy shape. Keys on padding waste (a
+# countable quantity known at plan time), not on a cache estimate -- which is
+# what distinguishes it from the refuted depth-adaptive MC.
+@noinline function _default_kernel(::Type{T}, Qm::Int, Qn::Int) where {T}
+    kernel = _kernel_for(target_profile(), T)
+    (Qm > 0 && Qm < mr(kernel)) || return kernel
+    legacy = _legacy_shape(T)
+    return SIMDKernel(Val(legacy[1]), Val(legacy[2]), T, Val(legacy[3]))
+end
 
 # LOAD-BEARING (docs/decisions.md, macro-blocking Phase A findings): `_axis_of`
 # produces a Union{AffineAxis,ScatterAxis}, and each consumer below is a
@@ -121,27 +193,27 @@ _default_kernel(::Type{T}) where {T} = SIMDKernel(Val(8), Val(6), T)
 # (R,C), so no partially-applied (boxing) QSTile is ever built. Do not collapse
 # these helpers into their call sites, and do not let a union cross any other
 # boundary.
+# Both arms are isbits, so this Union needs no heap box (see PtrScatterAxis).
 @inline function _axis_of(d::BlockDescriptor, buffer::Vector{Int}, first::Int)
     return d.regular ? AffineAxis(d.base, d.stride, d.count) :
-        ScatterAxis(view(buffer, (first + 1):(first + d.count)), d.count)
+        PtrScatterAxis(pointer(buffer, first + 1), d.count)
 end
 
 # `pack!` is pack_a! or pack_b! (a plain function, specialized on, never a
 # closure); A and B differ only in which of rows/cols is the k axis, which
 # the caller has already resolved.
 @inline function _pack_sliver!(
-        pack!::PF, packed::AbstractVector{T}, storage::S, base::Int,
+        pack!::PF, packed::PK, storage::S, base::Int,
         rows::R, cols::C, kernel
-    ) where {PF, T, S, R <: Axis, C <: Axis}
+    ) where {PF, PK, S, R <: Axis, C <: Axis}
     pack!(packed, SourceTile(storage, base, rows, cols), kernel, identity)
     return nothing
 end
 
 @inline function _execute_micro_tile!(
         kernel, storage::S, base::Int, rows::R, cols::C,
-        packed_a::AbstractVector{T}, packed_b::AbstractVector{T},
-        kc_len::Int, alpha, beta
-    ) where {T, S, R <: Axis, C <: Axis}
+        packed_a::PA, packed_b::PB, kc_len::Int, alpha, beta
+    ) where {PA, PB, S, R <: Axis, C <: Axis}
     destination = DestinationTile(storage, base, rows, cols)
     execute_tile!(kernel, destination, packed_a, packed_b, kc_len, alpha, beta)
     return nothing
@@ -163,6 +235,12 @@ end
     stride = reg_tile * kc_len
     lo = s * stride + 1
     return lo:(lo + stride - 1)
+end
+
+# Same addressing as `_sliver_range`, as a borrowed pointer. Keep in step.
+@inline function _sliver_panel(buffer, reg_tile::Int, kc_len::Int, s::Int)
+    stride = reg_tile * kc_len
+    return packed_panel(buffer, s * stride + 1, stride)
 end
 
 # Classify each register sliver of a just-filled macro block. Shared by the
@@ -278,7 +356,7 @@ function plan_contract(
         C::StridedView, A::StridedView, indA::NTuple{NA, Int},
         B::StridedView, indB::NTuple{NB, Int},
         indC::NTuple{NC, Int};
-        kernel = _default_kernel(eltype(C)),
+        kernel = nothing,
         mc::Union{Int, Nothing} = nothing,
         kc::Union{Int, Nothing} = nothing,
         nc::Union{Int, Nothing} = nothing,
@@ -291,6 +369,36 @@ function plan_contract(
         throw(ArgumentError("eltype(A) = $(eltype(A)) does not match eltype(C) = $T"))
     eltype(B) === T ||
         throw(ArgumentError("eltype(B) = $(eltype(B)) does not match eltype(C) = $T"))
+
+    mlabels, nlabels, klabels = _classify_labels(indA, indB, indC)
+
+    mgroup = _build_pair_group(mlabels, indA, A, indC, C)  # maps: (A, C)
+    ngroup = _build_pair_group(nlabels, indB, B, indC, C)  # maps: (B, C)
+    kgroup = _build_pair_group(klabels, indA, A, indB, B)  # maps: (A, B)
+
+    Qm = axis_length(mgroup)
+    Qn = axis_length(ngroup)
+    Qk = axis_length(kgroup)
+
+    # Resolved here, not in the signature default: the demotion needs Qm.
+    # Nothing between the eltype checks and here reads `kernel`.
+    resolved = kernel === nothing ? _default_kernel(T, Qm, Qn) : kernel
+    return _plan_contract(
+        C, A, B, indC, mgroup, ngroup, kgroup, Qm, Qn, Qk,
+        resolved, mc, kc, nc, workspace, allocator, oracle
+    )
+end
+
+# Function barrier: the small Union from `_default_kernel` dies here, so
+# `ContractPlan`'s `Kern` is concrete and `execute!` sees no abstract type.
+function _plan_contract(
+        C::StridedView, A::StridedView, B::StridedView, indC::NTuple{NC, Int},
+        mgroup, ngroup, kgroup, Qm::Int, Qn::Int, Qk::Int,
+        kernel::K, mc::Union{Int, Nothing}, kc::Union{Int, Nothing},
+        nc::Union{Int, Nothing}, workspace::Union{Nothing, ContractWorkspace},
+        allocator, oracle::Bool
+    ) where {NC, K}
+    T = eltype(C)
     scalartype(kernel) === T ||
         throw(ArgumentError("kernel scalar type $(scalartype(kernel)) does not match eltype(C) = $T"))
 
@@ -302,17 +410,8 @@ function plan_contract(
         nc === nothing ? defaults.nc : nc
     )
 
-    mlabels, nlabels, klabels = _classify_labels(indA, indB, indC)
-
-    mgroup = _build_pair_group(mlabels, indA, A, indC, C)  # maps: (A, C)
-    ngroup = _build_pair_group(nlabels, indB, B, indC, C)  # maps: (B, C)
-    kgroup = _build_pair_group(klabels, indA, A, indB, B)  # maps: (A, B)
-
     MRk = mr(kernel)
     NRk = nr(kernel)
-    Qm = axis_length(mgroup)
-    Qn = axis_length(ngroup)
-    Qk = axis_length(kgroup)
 
     mc_rounded = _roundup(requested.mc, MRk)
     nc_rounded = _roundup(requested.nc, NRk)
@@ -434,6 +533,22 @@ function execute!(plan::ContractPlan{T}, alpha::Number, beta::Number) where {T}
     # *current* block, never from a buffer's length.
     ws = plan.workspace
 
+    # Panels below borrow pointers into ws.packed_a/_b (src/panel.jl), as do
+    # the PtrScatterAxes from `_axis_of`; this is their lifetime.
+    return GC.@preserve ws begin
+        _execute_nest!(
+            plan, ws, kernel, MRk, NRk, Qm, Qn, Qk,
+            mc_eff, kc_eff, nc_eff, alphaT, betaT
+        )
+    end
+end
+
+# Split out so the `GC.@preserve` above has one obvious scope.
+function _execute_nest!(
+        plan::ContractPlan{T}, ws, kernel::K, MRk::Int, NRk::Int,
+        Qm::Int, Qn::Int, Qk::Int, mc_eff::Int, kc_eff::Int, nc_eff::Int,
+        alphaT::T, betaT::T
+    ) where {T, K}
     # --- loop 5: jc over N in steps of nc_eff ---
     jc = 0
     while jc < Qn
@@ -462,8 +577,8 @@ function execute!(plan::ContractPlan{T}, alpha::Number, beta::Number) where {T}
             for s in 0:(n_slivers - 1)
                 sfirst = s * NRk
                 colsB = _axis_of(ws.n_desc_B[s + 1], ws.n_buf_B, sfirst)
-                bview = view(ws.packed_b, _sliver_range(NRk, kblock, s))
-                _pack_sliver!(pack_b!, bview, plan.Bstorage, plan.Bbase, rowsB_k, colsB, kernel)
+                bpanel = _sliver_panel(ws.packed_b, NRk, kblock, s)
+                _pack_sliver!(pack_b!, bpanel, plan.Bstorage, plan.Bbase, rowsB_k, colsB, kernel)
             end
 
             # --- loop 3: ic over M in steps of mc_eff ---
@@ -481,22 +596,22 @@ function execute!(plan::ContractPlan{T}, alpha::Number, beta::Number) where {T}
                 for r in 0:(m_slivers - 1)
                     rfirst = r * MRk
                     rowsA = _axis_of(ws.m_desc_A[r + 1], ws.m_buf_A, rfirst)
-                    aview = view(ws.packed_a, _sliver_range(MRk, kblock, r))
-                    _pack_sliver!(pack_a!, aview, plan.Astorage, plan.Abase, rowsA, colsA_k, kernel)
+                    apanel = _sliver_panel(ws.packed_a, MRk, kblock, r)
+                    _pack_sliver!(pack_a!, apanel, plan.Astorage, plan.Abase, rowsA, colsA_k, kernel)
                 end
 
                 # --- loop 2: jr over N-slivers; loop 1: ir over M-slivers ---
                 for s in 0:(n_slivers - 1)
                     sfirst = s * NRk
                     colsC = _axis_of(ws.n_desc_C[s + 1], ws.n_buf_C, sfirst)
-                    bview = view(ws.packed_b, _sliver_range(NRk, kblock, s))
+                    bpanel = _sliver_panel(ws.packed_b, NRk, kblock, s)
                     for r in 0:(m_slivers - 1)
                         rfirst = r * MRk
                         rowsC = _axis_of(ws.m_desc_C[r + 1], ws.m_buf_C, rfirst)
-                        aview = view(ws.packed_a, _sliver_range(MRk, kblock, r))
+                        apanel = _sliver_panel(ws.packed_a, MRk, kblock, r)
                         _execute_micro_tile!(
                             kernel, plan.Cstorage, plan.Cbase, rowsC, colsC,
-                            aview, bview, kblock, alphaT, beta_eff
+                            apanel, bpanel, kblock, alphaT, beta_eff
                         )
                     end
                 end

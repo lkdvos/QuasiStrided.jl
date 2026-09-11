@@ -125,6 +125,33 @@ Gold 6244 / Cascade Lake):
   grid — single machine, see `docs/decisions.md`'s Phase E section for the
   full sweep and provenance. `Blocking`/`default_blocking` expose tunable,
   measured (not modeled/probed) `mc`/`kc`/`nc` defaults.
+- **Packed panels handed to the kernel as borrowed pointers**
+  (`PackedPanel`), not `view`s, and an `isbits` scattered axis
+  (`PtrScatterAxis`) so `Union{AffineAxis,PtrScatterAxis}` never heap-boxes.
+  Together these removed a ~4x throughput cliff above 16 accumulator vectors
+  and a 24 KB-per-call allocation on irregular destinations, and they cost no
+  new dependency. `execute!` remains allocation-free on Julia >= 1.11 —
+  including through permuted/negative-stride/sliced 3-index contractions,
+  which is now asserted.
+- **A hardware-derived register shape**, so the engine does not need
+  retuning per machine. One capability-derived rule — `W =
+  vector_bytes/sizeof(T)`, `MR = 2W`, `NR = 6` — is applied to the vector
+  ISA detected at load (`target_profile()`; `Sys.CPU_NAME` plus a CPUID
+  probe, no external dependency). On AVX-512 that yields `(16,6,8)` for
+  `Float64` and `(32,6,16)` for `Float32`. Against the complete previously
+  shipped configuration (the `(8,6)` shape plus the Phase E blocking
+  constants), the complete new one is **1.26x faster in geomean for
+  `Float64` and 1.27x for `Float32`** across the measured shape grid, up to
+  1.78x/1.91x at 512³, with the worst point at 0.96x/1.00x (inside this
+  machine's measured noise floor). On AVX2 the same rule reproduces the old
+  `(8,6,4)` exactly. The rule is applied only on the ISAs it was measured on
+  (AVX-512, AVX2); aarch64/NEON and any unrecognized CPU fall back to the
+  previous constants bit-identically, so they are unchanged rather than
+  guessed at. A contraction whose `M` extent cannot fill one register
+  tile is demoted to the smaller shape, so a larger `MR` never costs padding
+  on small problems. Single machine measured — see `docs/decisions.md`'s
+  Phase G section, and `benchmark/bench_kernel_shape.jl` /
+  `benchmark/bench_default_vs_legacy.jl`.
 - Zero steady-state allocation for `SIMDKernel` through the full driver on
   Julia >= 1.11. On Julia 1.10 (LTS), `SIMDKernel`'s `accumulate`/
   `execute_tile!` allocate tens of KB per call instead — a compiler
@@ -177,11 +204,13 @@ Gold 6244 / Cascade Lake):
   `StridedBLAS()` on most shapes, so silently capturing the default dispatch
   would be a regression for existing users.
 - einsum string parsing; batch axes, diagonals, or isolated reductions; a
-  separate beta-addend tensor; autotuning across shapes, CPU-dispatch
-  tables, or cache-probing/analytical block-size derivation (the current
-  defaults are hardcoded per-dtype constants measured on one machine, by
-  design — see `docs/decisions.md`'s "Block-size policy"); threading; GPU
-  execution; complex-arithmetic methods (planar/1m/3m); K padding.
+  separate beta-addend tensor; autotuning across shapes; runtime cache
+  probing or analytical block-size derivation (`mc`/`kc`/`nc` remain
+  measured constants — the detected cache geometry is reported by
+  `cache_topology()` and used for nothing that picks a number at runtime,
+  see `docs/decisions.md`'s "Block-size policy" and its Phase G amendment);
+  threading; GPU execution; complex-arithmetic methods (planar/1m/3m); K
+  padding.
 
 See the companion design specs and `docs/decisions.md` for the full
 deferred list. `benchmark/bench_tensoroperations.jl` (results in

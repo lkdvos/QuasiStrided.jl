@@ -29,13 +29,15 @@ packed_b_length(k::DescriptorKernel, kc::Int) = packed_b_length(k.descriptor, kc
 # pack_a!/pack_b! dispatch on a bare KernelDescriptor; forward any wrapper.
 # Every forwarded argument needs its own bound type parameter (`V`, `K`, `F`):
 # leaving one unbound here reintroduces the Phase 2b finding-5 allocation.
+# `V` is unconstrained rather than `<: AbstractVector{T}` so that a
+# `PackedPanel` (src/panel.jl) forwards too; `T` comes from `K` instead.
 pack_a!(
     packed::V, source::QSTile, kernel::K, transform::F
-) where {T, V <: AbstractVector{T}, MR, NR, K <: DescriptorKernel{MR, NR, T}, F} =
+) where {V, MR, NR, T, K <: DescriptorKernel{MR, NR, T}, F} =
     pack_a!(packed, source, kernel.descriptor, transform)
 pack_b!(
     packed::V, source::QSTile, kernel::K, transform::F
-) where {T, V <: AbstractVector{T}, MR, NR, K <: DescriptorKernel{MR, NR, T}, F} =
+) where {V, MR, NR, T, K <: DescriptorKernel{MR, NR, T}, F} =
     pack_b!(packed, source, kernel.descriptor, transform)
 
 """
@@ -58,16 +60,15 @@ returns `acc` unchanged without reading the packed buffers.
 """
 function Base.accumulate(
         kernel::ScalarKernel{MR, NR, T}, acc::AbstractMatrix{T},
-        packed_a::AbstractVector{T}, packed_b::AbstractVector{T},
-        kc::Int
-    ) where {MR, NR, T}
+        packed_a::PA, packed_b::PB, kc::Int
+    ) where {MR, NR, T, PA, PB}
     kc == 0 && return acc
     kc > 0 || throw(ArgumentError("accumulate requires kc >= 0, got kc = $kc"))
     @inbounds for p in 0:(kc - 1)
         for j in 0:(NR - 1)
-            bj = packed_b[packed_b_offset(kernel, j, p) + 1]
+            bj = panel_load(packed_b, packed_b_offset(kernel, j, p))
             for i in 0:(MR - 1)
-                ai = packed_a[packed_a_offset(kernel, i, p) + 1]
+                ai = panel_load(packed_a, packed_a_offset(kernel, i, p))
                 acc[i + 1, j + 1] = muladd(ai, bj, acc[i + 1, j + 1])
             end
         end
@@ -100,6 +101,21 @@ function scale_tile!(destination::QSTile, beta::T) where {T}
     return destination
 end
 
+# `C = alpha*r + beta*C` at one element, in the three forms the kernels need.
+# Ternaries, so `beta == 0` never reads the old value (contract pinned by the
+# nonfinite-poisoning tests).
+@inline _axpby_tile!(dest, i::Int, j::Int, alpha, r, beta) = tile_store!(
+    dest, i, j,
+    iszero(beta) ? alpha * r :
+        isone(beta) ? muladd(alpha, r, tile_load(dest, i, j)) :
+        muladd(alpha, r, beta * tile_load(dest, i, j))
+)
+
+@inline _axpby_at!(storage, idx::Int, alpha, r, beta) = @inbounds storage[idx] =
+    iszero(beta) ? alpha * r :
+    isone(beta) ? muladd(alpha, r, storage[idx]) :
+    muladd(alpha, r, beta * storage[idx])
+
 """
     store_tile!(destination::QSTile{T}, acc, alpha::T, beta::T, kernel::ScalarKernel) -> destination
 
@@ -121,20 +137,8 @@ function store_tile!(
         return destination
     end
 
-    if iszero(beta)
-        @inbounds for j in 0:(n - 1), i in 0:(m - 1)
-            tile_store!(destination, i, j, alpha * acc[i + 1, j + 1])
-        end
-    elseif isone(beta)
-        @inbounds for j in 0:(n - 1), i in 0:(m - 1)
-            c = tile_load(destination, i, j)
-            tile_store!(destination, i, j, muladd(alpha, acc[i + 1, j + 1], c))
-        end
-    else
-        @inbounds for j in 0:(n - 1), i in 0:(m - 1)
-            c = tile_load(destination, i, j)
-            tile_store!(destination, i, j, muladd(alpha, acc[i + 1, j + 1], beta * c))
-        end
+    @inbounds for j in 0:(n - 1), i in 0:(m - 1)
+        _axpby_tile!(destination, i, j, alpha, acc[i + 1, j + 1], beta)
     end
     return destination
 end
@@ -150,9 +154,8 @@ to `beta` scaling only, without reading `packed_a`/`packed_b`.
 """
 function execute_tile!(
         kernel::ScalarKernel{MR, NR, T}, destination::QSTile,
-        packed_a::AbstractVector{T}, packed_b::AbstractVector{T},
-        kc::Int, alpha, beta
-    ) where {MR, NR, T}
+        packed_a::PA, packed_b::PB, kc::Int, alpha, beta
+    ) where {MR, NR, T, PA, PB}
     m = nrows(destination)
     n = ncols(destination)
     m <= MR || throw(ArgumentError("destination valid row extent $m exceeds mr(kernel) = $MR"))

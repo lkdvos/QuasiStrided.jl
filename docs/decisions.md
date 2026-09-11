@@ -391,6 +391,13 @@ as a hard target: 0 B for `SIMDKernel` on Julia >= 1.11, bounded for
 
 ### Block-size policy (settled)
 
+> **Amended.** The register shape `(MR, NR, W)` is now derived from detected
+> hardware, and `default_blocking` gained one ISA-keyed measured row. See
+> "Hardware-derived register shape milestone: Phase G" at the end of this
+> file for what survives of the decision below and what changed. No
+> analytical or probing model chooses a number at runtime, which is the part
+> of this section that still stands.
+
 Tunable keywords (`mc`, `kc`, `nc` on `plan_contract`) with hardcoded,
 measured, single-machine-labeled defaults via `default_blocking(kernel)`.
 Explicitly **not** an analytical or cache-probing model: `tensorcontract-rs`
@@ -1215,8 +1222,16 @@ Reading it plainly:
   `shallowK_256x24x256`), where per-call planning overhead is a large
   fraction of the work, and settles to a ~2.4-2.8x (`Float64`) / ~3.4-3.5x
   (`Float32`) plateau at `256^3` and above. That plateau is the honest
-  measure of the microkernel gap against a tuned vendor GEMM; it is not
-  closing with size.
+  measure of the gap against a tuned vendor GEMM; it is not closing with
+  size.
+
+  > **Attributed 2026-09-11 (Phase G, refined in Phase H): that plateau is
+  > not a *microkernel* gap.** At the BLIS `skx` register shape the pure-Julia `SIMDKernel`
+  > reaches 101-103 GFLOP/s, ~88% of this machine's peak. What the plateau
+  > measures is the driver handing each micro-tile a `view` of its macro
+  > panel, which costs ~4x once the accumulator exceeds 16 vectors, plus
+  > per-call planning overhead. See Phase G, "NV is held at 12
+  > deliberately".
 - **QuasiStrided beats `StridedNative()` at every point**, by **5.3x-11.1x**
   (`Float64`) and **6.1x-18.7x** (`Float32`). Same ordering as the
   `StridedBLAS` result, for the same reason: the advantage is smallest where
@@ -1353,3 +1368,463 @@ confirm and dispose of.
 `13171/13171` and the `StridedNative()` comparison now reads `5.3x-18.7x`.
 T14 confirmed both strings are absent from the current `README.md` and
 verified the corrected numbers are accurate — no further action needed.
+
+## Hardware-derived register shape milestone: Phase G
+
+Machine: Xeon Gold 6244, Cascade Lake, 2x8 cores, `Sys.CPU_NAME == "cascadelake"`,
+L1d 32 KiB/core 8-way (shared with the SMT sibling only), L2 1 MiB/core 16-way
+(likewise), L3 24.75 MiB 11-way shared across 8 cores, hostname `ccqlin038`.
+Julia 1.12.6. Date 2026-09-11. Base revision `3e712ea`. One machine class only
+— every caveat in Phase E's "known limitations" still applies.
+
+### Amendment to "Block-size policy (settled)"
+
+The settled policy (this file, "Block-size policy (settled)") forbade an
+analytical or cache-probing model choosing block sizes, citing
+`tensorcontract-rs`'s A33 (a runtime analytical cache model lost 14-34% on its
+own reference machine and failed on two further machine classes) and A57 (that
+model's L2-privacy assumption is false on Apple Silicon). `README.md` also
+listed "CPU-dispatch tables" as not implemented.
+
+**What survives, unchanged:**
+
+* No analytical or probing model ever chooses a number at runtime. Nothing in
+  this milestone computes a block size from a cache size. `src/target.jl` now
+  *detects* cache sizes, ways and sharing, and `default_blocking` deliberately
+  does not consult any of it — see "Why cache geometry is still not used".
+* No probing at package load or at first call. `__init__` does one dictionary
+  lookup and reads sysfs; it runs no benchmark.
+* Hardcoded measured constants remain the mechanism, and remain the fallback.
+* A33 and A57 are not contradicted. Where cache *sharing* would have mattered,
+  it is read (`shared_cpu_list` on Linux, `hw.perflevel0.cpusperl2` on macOS —
+  literally the A57 datum) rather than assumed. It is currently read for
+  reporting only.
+
+**What changes:**
+
+* The register shape `(MR, NR, W)` becomes hardware-derived. This was outside
+  the settled decision's scope: that text is entirely about `mc`/`kc`/`nc`, and
+  says nothing about register blocking. `MR=8, NR=6, W=4` had never been
+  derived and had never been swept by any benchmark in this project.
+* `default_blocking` gains one measured row keyed on the detected vector ISA,
+  because `kc` had to be re-measured at the new register shape (below).
+* `README.md`'s "CPU-dispatch tables" exclusion is dropped. What ships is a
+  single capability-derived rule plus one measured row, not a per-uarch table.
+
+### The old default was BLIS's AVX2 shape, on an AVX-512 machine
+
+`nm` on the `blis_jll` 2.0.0+2 artifact shows both `bli_dgemm_haswell_asm_6x8`
+and `bli_dgemm_haswell_asm_8x6`. So `MR=8, NR=6, W=4` was never arbitrary — it
+is exactly BLIS's `haswell` (AVX2) dgemm register shape. It was simply the
+wrong ISA's shape for this machine, which is AVX-512 with 32 vector registers.
+
+BLIS's own register blocking, harvested from the artifact's shipped config
+registry (`share/blis/config/<arch>/bli_kernel_defs_<arch>.h`, 28
+architectures), for reference: `skx` MR_d=16 NR_d=14, MR_s=32 NR_s=12;
+`haswell`/`zen`..`zen3` MR_d=6 NR_d=8, MR_s=6 NR_s=16; `firestorm` (Apple M1)
+MR_d=6 NR_d=8; `a64fx` MR_d=16 NR_d=10.
+
+### The rule that ships
+
+    W  = vector_bytes / sizeof(T)     # one full vector register
+    MR = 2 * W                        # two A vectors per output column
+    NR = 6                            # six output columns
+
+so `NV = (MR/W)*NR = 12` accumulators wherever the rule applies.
+
+`benchmark/bench_kernel_shape.jl` swept 11 Float64 and 8 Float32 candidate
+shapes, each crossed with three `kc` values, over `MAIN_SHAPES` plus three new
+small-extent shapes plus the scattered 3-index fixture, 9 reps, median, with
+the start/middle/end canary bracket. **This rule reproduces the swept optimum
+for both dtypes independently** — Float64 `(16, 6, 8)`, Float32 `(32, 6, 16)` —
+and reduces to the previous hardcoded `(8,6,4)`/`(8,6,8)` on AVX2, so an AVX2
+machine is unchanged. `:unknown` resolves to the legacy shape, so an
+unrecognized CPU is bit-identical to the old behavior.
+
+**The rule applies only to the ISAs it was validated on** (`:avx512`,
+`:avx2`); `_rule_applies` gates it. `:neon` is detected -- it feeds
+`cache_topology` and is there for a future measurement -- but deliberately
+takes the legacy shape, because there is no aarch64 measurement and the rule
+would pick `MR = 2W = 4` on 128-bit lanes: 12 of 32 NEON registers, narrower
+*and* smaller than the legacy `(8,6,4)`, with nothing to justify it. Derive
+where measured, fall back everywhere else.
+
+Caught by CI, not by local testing: an earlier revision did derive for
+`:neon`, and `test_driver.jl`'s "SIMDKernel is the engine-wide default"
+assertion failed on both macOS runners. That assertion pinned the literal
+`SIMDKernel{8,6,T}` and had been passing on x86 only *by accident* -- its
+fixture has `Qm = 9`, which is below the derived `MR = 16` and so triggers the
+demotion. It now pins the resolution (`_default_kernel(T, Qm, Qn)`) rather
+than a literal shape, which is machine-independent by construction. Worth
+recording as a pattern: making a constant hardware-derived silently converts
+every test that asserted its old value into a platform-dependent test.
+
+`kc` was swept jointly with the register shape and not held fixed, because
+`MR*kc*sizeof(T)` is the A-micropanel L1 footprint: the old Float64 point
+`MR=8, kc=128` is exactly 8 KiB, a quarter of this machine's L1d, so doubling
+`MR` at fixed `kc` doubles that footprint and would measure the wrong thing.
+Both dtypes preferred twice the old `kc`.
+
+Two different comparisons, both reported because they answer different
+questions and it is easy to conflate them.
+
+**(a) Register shape alone**, `mc`/`nc` pinned identically on both sides,
+`kc` at each shape's own best (`benchmark/bench_kernel_shape.jl`, 9 reps):
+
+| shape | Float64 | Float32 |
+| --- | --- | --- |
+| 64^3 | 1.345 | 1.384 |
+| 128^3 | 1.494 | 1.536 |
+| 256^3 | 1.491 | 1.655 |
+| 512^3 | 1.475 | 1.803 |
+| shallowK 256x24x256 | 1.342 | 1.374 |
+| smallN 256x256x12 | 1.165 | 1.437 |
+| smallM 12x256x256 | 1.200 | **0.885** |
+| smallMN 16x256x16 | 1.119 | **0.868** |
+| scattered a64k64b16n64 | 1.393 | 1.153 |
+
+The two Float32 regressions are the `MR=32` padding cases and are what
+motivated the extent-aware demotion below; this table is measured with the
+shape forced, so the demotion is deliberately not in effect here.
+
+**(b) The complete shipped configuration** -- derived shape plus its
+ISA-keyed blocking, against the complete previously shipped configuration
+(the `(8,6)` shape plus the Phase E constants). Measured through the real
+default path, so the demotion *is* in effect
+(`benchmark/bench_default_vs_legacy.jl`, 21 reps):
+
+| shape | Float64 | shape used | Float32 | shape used |
+| --- | --- | --- | --- | --- |
+| 64^3 | 1.148 | 16x6/W8 | 1.264 | 32x6/W16 |
+| 128^3 | 1.320 | 16x6/W8 | 1.445 | 32x6/W16 |
+| 256^3 | 1.636 | 16x6/W8 | 1.492 | 32x6/W16 |
+| 512^3 | 1.781 | 16x6/W8 | 1.909 | 32x6/W16 |
+| shallowK 256x24x256 | 1.219 | 16x6/W8 | 1.423 | 32x6/W16 |
+| smallN 256x256x12 | 1.204 | 16x6/W8 | 1.052 | 32x6/W16 |
+| smallM 12x256x256 | 1.088 | 8x6/W4 (demoted) | 1.027 | 8x6/W8 (demoted) |
+| smallMN 16x256x16 | **0.963** | 16x6/W8 | 0.996 | 8x6/W8 (demoted) |
+| scattered a64k64b16n64 | 1.209 | 16x6/W8 | 1.109 | 32x6/W16 |
+| **geomean** | **1.264** | | **1.274** | |
+
+The single sub-unity point, Float64 `smallMN` at 0.963, is a 3.7% shortfall
+against a canary spread of 4-12% in this session (the machine was not
+exclusive), so it is at or below the noise floor rather than a measured
+regression. `Qm = 16` equals `MR = 16` there, so the demotion correctly does
+not fire.
+
+An earlier pass of (b) at 11 reps reported 0.840 and 0.890 at the two
+small-`N`/`MN` Float64 points. Those did not reproduce at 21 reps with the
+configurations measured adjacently, and a separate four-way comparison
+(legacy / shape-only / two blockings, 15 reps) put every Float64 small-extent
+point at 1.10-1.35. Recorded because it is exactly the kind of shortfall this
+project's canary discipline exists to catch, and it was caught.
+
+### Julia 1.10 (LTS): no regression, no version-conditional shape needed
+
+The standing concern was that `NV` scaling would worsen the recorded Julia
+1.10 gap ("the `NTuple{NV,Vec{W,T}}` accumulator is not kept register-resident
+by the older compiler"). Measured on Julia 1.10.11, 256^3, single-threaded:
+
+| dtype | legacy NV | legacy alloc / time | new NV | new alloc / time | speedup |
+| --- | --- | --- | --- | --- | --- |
+| Float64 | 12 | 0 B / 1.086 ms | 12 | 0 B / 0.605 ms | 1.794 |
+| Float32 | 6 | 0 B / 0.581 ms | 12 | 0 B / 0.311 ms | 1.865 |
+
+Float64's `NV` is unchanged at 12 -- `(8,6,4)` and `(16,6,8)` have the same
+accumulator count, only the lane width differs -- and Float32's doubles from 6
+to 12, still well inside the limit. Both stay allocation-free on 1.10 through
+the driver, and the speedup there is *larger* than on 1.12. So no
+`VERSION`-conditional shape is needed and the `julia = "1.10"` compat floor is
+unaffected. This is also why holding `NV` at 12 is cheap insurance rather than
+a sacrifice.
+
+### Extent-aware demotion, and why it is not the refuted depth-adaptive MC
+
+The two Float32 regressions are `MR=32` padding against `Qm = 12` and `16`:
+every micro-tile's row block is then mostly padding. `_default_kernel(T, Qm,
+Qn)` falls back to the legacy shape when `Qm < MR`, which removes them.
+
+This keys on `cld(Qm,MR)*MR/Qm` — padding waste, a deterministic countable
+quantity known at plan time — and not on a cache-residency estimate. That is
+what distinguishes it from the depth-adaptive MC that `docs/refuted.md` records
+as failed. It is applied only when the caller did not name a kernel.
+
+To make it possible, `plan_contract`'s `kernel` keyword now defaults to
+`nothing` and is resolved after the M/N/K groups are built (it needs `Qm`).
+Nothing between the eltype checks and that point reads `kernel`. The body then
+tail-calls a `_plan_contract` function barrier that specializes on the concrete
+kernel type, so the small `Union` over the closed shape set dies there and
+`ContractPlan`'s `Kern` parameter stays concrete: one dynamic dispatch per
+`plan_contract` call, zero per micro-tile or K step. One user-visible
+consequence: a kernel-scalartype mismatch is now reported after a label error
+rather than before.
+
+### Why cache geometry is still not used, despite now being detected
+
+Re-running Phase E's 36-point `(mc,kc,nc)` grid on 2026-09-11 found the whole
+grid spans only 9% (Float64, 1.0091 to 1.0990) and 11% (Float32, 1.0124 to
+1.1201) between its best and worst points. A model's available upside here is
+therefore a few percent, against the tens of percent A33 records such models
+losing. `cache_topology()` is exposed for reporting and used for nothing that
+picks a number at runtime.
+
+Two incidental findings from that re-run, both worth recording:
+
+* Float32's chosen default `(96, 384, 1152)` reproduced exactly. Float64's
+  reproduced `mc` and `kc` and moved `nc` one grid step (`768` to `1536`); the
+  two points are 3.3% apart in geomean, inside this project's 6% convention.
+* **Phase E's shipped Float64 default `(64, 128, 768)` is the worst of all 36
+  grid points** (geomean 1.0990 against the best 1.0091). It was selected by
+  the "smallest footprint within 6% of best" tiebreak, not on speed, and it
+  sits at the `kc` value Phase E's own text identified as consistently worst.
+  This is why `kc` was given the most freedom this milestone.
+
+### NV is held at 12 deliberately — the real ceiling is panel addressing
+
+A larger register tile makes the *isolated* microkernel substantially faster.
+Measured with the real `SIMDKernel` and `Base.accumulate`, Float64, `kc=256`,
+against this machine's ~115 GFLOP/s peak:
+
+| (MR,NR,W) | NV | packed panel as `view` | as plain `Vector` |
+| --- | --- | --- | --- |
+| (8,6,4) | 12 | 54.0 | 55.9 |
+| (16,8,8) | 16 | 77.6 | 78.3 |
+| (16,12,8) | 24 | 23.7 | 93.4 |
+| (16,14,8) | 28 | 25.8 | **101.8** |
+| (32,6,8) | 24 | 26.9 | **102.6** |
+
+`src/driver.jl` hands each micro-tile `view(ws.packed_a, _sliver_range(...))`.
+That costs nothing up to `NV = 16` and about **4x above it**: the view's
+address arithmetic stops the `NTuple{NV,Vec{W,T}}` accumulator from staying
+register-resident. Confirmed independently by profiling `(16,14,8)` through the
+driver — 388 of 560 self samples land on `src/kernels/simd.jl:147`, the K-loop
+line itself, i.e. the accumulator round-trip, and none do for `(16,8,8)` — and
+by a temporary driver patch that copies each sliver into a plain `Vector`
+before the kernel call, which took `(16,14,8)` at 256^3 from 22.2 to 37.4
+GFLOP/s *while paying the copy*.
+
+**This contradicts `STATUS.md`'s standing hypothesis that "the microkernel gap
+is not closing with size".** At `(16,14,8)` the pure-Julia SIMD microkernel
+reaches ~88% of machine peak. The microkernel is not the bottleneck; how the
+driver addresses packed panels is. Fixing it is worth an estimated further ~1.9x
+on top of what shipped here, and is the next milestone's headline item.
+
+It was not attempted now because `packed_a`/`packed_b` are the
+allocator-routed temporaries, under a documented "never `resize!` an allocator
+temporary" and reverse-order-`release!` contract (Amendment 1), so giving each
+sliver its own plain `Vector` means reworking `ContractWorkspace` and the
+allocator path.
+
+Approaches tried for that fix and rejected, with numbers (Float64, `kc=256`,
+`(16,14,8)` unless noted):
+
+* **StaticArrays `MVector{NV,Vec{W,T}}` accumulator, mutated in place: 2.2
+  GFLOP/s**, against 61 for the `NTuple`. A 25x collapse, reproduced at NV=12
+  and NV=16 too. LLVM does not promote an `MVector` whose element type is not
+  a primitive to registers, so the indexed stores stay in memory. A mutable
+  static accumulator is a dead end here, which is worth recording because it
+  is the obvious thing to try.
+* A `PanelRef <: AbstractVector` wrapper carrying parent + `Int` offset: 25.4
+  GFLOP/s — no better than the view.
+* Plumbing a runtime `Int` offset through the generated K step: 27.0 GFLOP/s.
+  It did help `(32,6,8)` (98.9) but not the large-`NR` shapes.
+
+Only handing the kernel a genuine plain `Vector` recovers full throughput.
+
+### BLIS microkernels are not reachable from `blis_jll`: dropped
+
+The milestone also evaluated calling BLIS's assembly microkernels directly on
+QuasiStrided's packed panels. The packed formats are bit-for-bit BLIS
+micropanels already (`i + MR*p`, `j + NR*p`), and `_pack_panel!` already
+zero-pads edge panels, which is BLIS's requirement — so the integration would
+have been small. It is nonetheless **not possible** against `blis_jll`:
+
+* The 22 assembly microkernels (including `bli_dgemm_skx_asm_16x14`) are
+  present only as **local** symbols (`t` in `nm -a`, absent from `.dynsym`);
+  `Libdl.dlsym` returns `NULL`. Verified on `blis_jll` 0.9.0, 1.0.0 and
+  2.0.0+2 — all three: 22 local asm kernels, 0 dynamically linkable.
+* `bli_cntx_get_ukr_dt` and `bli_cntx_get_blksz_def_dt` are likewise
+  local-only, so neither the function-pointer route nor the named-symbol route
+  works, and BLIS's tuned `MC`/`KC`/`NC` cannot be queried at runtime either.
+* `bli_cntx_print` *is* exported but aborts (`SIGABRT`, "Requested index is out
+  of bounds") when passed `bli_gks_query_cntx()`'s pointer.
+* Only the BLAS-level `bli_?gemm`/`bli_?gemm_ex` are reachable, which is the
+  wrong granularity.
+
+Consequently no `[weakdeps] blis_jll` was added and the package remains
+genuinely zero-external-dependency. Useful things BLIS still provided: its
+shipped config registry as an offline oracle for register shapes (above), and
+the confirmation that the old default was its `haswell` shape. `bli_dgemm_ex`
+remains available as a benchmark reference line if wanted.
+
+Recorded for anyone revisiting this: it would become possible if `blis_jll`
+were built with default symbol visibility, or if the microkernels were reached
+through a BLIS "sandbox" build. Neither is in this package's control.
+
+## Panel addressing milestone: Phase H
+
+Machine, Julia version and single-machine caveats as in Phase G. Date
+2026-09-11. **Measurement caveat specific to this phase:** the machine was
+*not* exclusive for part of it — two unrelated Julia processes from another
+project held two cores — and the canary spread reached 15.5% on the final
+sweep against Phase E's 0.71%. Several conclusions below are explicitly
+"inside noise" for that reason, and are recorded as such rather than resolved.
+
+Motivated by reading Octavian.jl, which solves the problem Phase G left open.
+
+### `view` was the register-tile ceiling; a borrowed pointer removes it
+
+Phase G recorded that the driver's `view(ws.packed_a, _sliver_range(...))`
+costs ~4x above `NV = 16`, and left it as the next milestone's headline item.
+Octavian.jl never forms a `SubArray` at all: its data path is
+`AbstractStridedPointer` throughout and it sub-addresses panels by *pointer
+bumping* (`A = gesp(A, (msize, Zero()))`), reconstructing a pointer wrapper
+only inside the `let` that `@turbo` consumes. It also uses `Int32` loop
+counters to cut register pressure and `offsetprecalc(B, Val{(9,9)}())` to
+precompute access-pattern offsets.
+
+Measured here, Float64, `kc = 256`, real `SIMDKernel`, GFLOP/s (machine peak
+~115):
+
+| (MR,NR,W) | NV | `view` | `Vector` | raw `Ptr` |
+| --- | --- | --- | --- | --- |
+| (8,6,4) | 12 | 47.0 | 47.2 | **56.5** |
+| (16,6,8) | 12 | 62.6 | 63.5 | **79.5** |
+| (16,8,8) | 16 | 71.0 | 62.9 | **78.2** |
+| (16,14,8) | 28 | 30.7 | 73.0 | **96.6** |
+| (32,6,8) | 24 | 30.1 | 77.1 | **100.1** |
+
+A raw pointer removes the cliff *and* beats a plain `Vector` at every shape,
+because the base address is loop-invariant by construction. Critically this
+needs **no new dependency**: `SIMD.vload` already accepts a `Ptr{T}`.
+
+Shipped as `PackedPanel` (`src/panel.jl`): a borrowed `(ptr, len)` pair, with
+`panel_vload`/`panel_load`/`panel_store!` accessors that also have
+`AbstractVector` methods, so every existing caller and the whole test suite
+keeps working with `Vector`s and `view`s. `len` is carried only so
+`execute_tile!`'s capacity checks keep working. `execute!` wraps the loop nest
+in one `GC.@preserve ws`, and the nest moved into `_execute_nest!` so that
+preserve has a single obvious scope.
+
+Approaches tried and rejected, with numbers (Float64, `kc=256`, `(16,14,8)`):
+StaticArrays `MVector{NV,Vec{W,T}}` mutated in place, **2.2 GFLOP/s** against
+61 for the `NTuple` — a 25x collapse, reproduced at NV=12/16/28, because LLVM
+does not promote an `MVector` of a non-primitive element type to registers; a
+`PanelRef <: AbstractVector` wrapper carrying parent + offset, 25.4; a runtime
+`Int` offset plumbed through the generated step, 27.0. Only a genuine raw
+pointer works.
+
+### The scattered axis was boxing, and that was the *real* MR ceiling
+
+With panels in place the first re-sweep made `NV = 24-28` the clear winner
+(Float64 `(32,6,8)` at geomean 1.0058 against the shipped `(16,6,8)` at
+1.1829). But the allocation column showed every shape with `MR > 16`
+allocating — 24576 B per `execute!` on the 3-index scattered fixture, 0 B at
+`MR = 16`.
+
+Allocation profiling named it exactly: `ScatterAxis{SubArray{Int64,1,...}}`
+boxes, 64 B each, attributed to the packing call site.
+`Union{AffineAxis,ScatterAxis}` is **not an isbits union** — `ScatterAxis`
+holds an `AbstractVector` — so whenever Julia cannot union-split that union
+(which depends on callee size, hence on `MR`), the scattered arm is
+heap-boxed. The Phase A barrier methods are still correct and still there;
+they cannot help with this, because the cost is in the union's
+representation, not in a partially-applied `QSTile`.
+
+Two things worth recording about how this was found. First, **a Float32
+default shipped in Phase G allocated 24576 B per call on scattered
+contractions** and the suite did not catch it: the existing allocation
+assertions all use plain, regular contractions, and this only manifests on an
+irregular destination. `test/test_target.jl` now asserts zero allocation
+through a permuted-A / negative-stride-B / sliced-C fixture at the shipped
+defaults — the case this engine exists for. Second, the initial diagnosis was
+wrong: `_acc_lane`'s dynamic tuple indexing in `store_tile!` looked like the
+obvious culprit and was fixed first, with no effect on the allocation. The
+generated, statically-indexed scattered store was kept anyway (it is a
+genuine improvement to that path), but the finding is that guessing cost a
+round trip and the allocation profiler settled it in one command.
+
+Fixed by `PtrScatterAxis` (`src/tiles.jl`): the same borrowed-pointer idea as
+`PackedPanel`, holding `Ptr{Int} + count` instead of a vector, so it is
+`isbits` and `Union{AffineAxis,PtrScatterAxis}` lives in a tagged stack slot.
+`Base.isbitsunion` confirms it. `ScatterAxis` is unchanged and remains the
+vector-backed, bounds-checkable form for the public surface and the tests;
+only `_axis_of` switched. Result: **0 B on every shape measured, up to
+`MR = 48`**, verified against the independent `ScalarKernel`/
+`execute_tilewise!` oracle at exact equality.
+
+### Outcome: the register shape is now a plateau, and the rule already wins
+
+Re-sweeping after both fixes, with all shapes allocation-free, put everything
+from `NV = 12` to `NV = 28` within ~4% geomean — against a 15.5% canary
+spread. Three successive sweeps produced three different "winners", which is
+the signature of fitting noise. So **no override row was added**, and
+`_shape_override` ships deliberately empty with that reasoning attached.
+
+The derivation rule from Phase G (`MR = 2W`, `NR = 6`, `NV = 12`) is what
+ships, and the final sweep says it is already at the optimum: its answer
+ranked **1st of 24 for Float32** (1.0521) and **2nd of 33 for Float64**
+(1.0483 against 1.0482 for the best). `NV = 12` also remains the only setting
+that fits a 16-register AVX2 machine and Julia 1.10's weaker register
+allocation, so it is kept on both counts.
+
+End-to-end geomean against the pre-Phase-G configuration is 1.283 (Float64) /
+~1.3 (Float32) — statistically unchanged from Phase G's 1.264/1.274. **These
+two fixes bought no end-to-end throughput at the shipped shape**, and that is
+the honest result. What they bought is: a real allocation bug fixed on this
+engine's core workload, and the removal of two ceilings — the register tile
+can now be enlarged, and irregular destinations no longer box — so neither is
+a constraint on future work.
+
+### Where the remaining gap actually is
+
+Benchmarked single-threaded on ccqlin038 against Octavian.jl 0.3.29 (pure
+Julia, LoopVectorization-based) and OpenBLAS, plain matmul, GFLOP/s:
+
+| shape | QuasiStrided | Octavian | OpenBLAS |
+| --- | --- | --- | --- |
+| 64^3 | 24.9 | **95.5** | 92.2 |
+| 256^3 | 49.7 | **96.6** | 71.3 |
+| 512^3 | 53.9 | **89.1** | 80.0 |
+| 1024^3 | 50.5 | 79.3 | **88.0** |
+| 256x24x256 | 18.9 | **89.7** | 62.7 |
+| 256x256x12 | 16.0 | **87.2** | 77.5 |
+
+Octavian is essentially *flat* in size — 95.5 GFLOP/s already at 64^3 — and
+beats OpenBLAS at most points. QuasiStrided ramps from 25 to 54. Since the
+microkernel reaches 79-100 GFLOP/s in isolation, the deficit is **packing and
+per-call overhead**, not the kernel. Octavian's answer is a three-tier
+dispatch QuasiStrided has no equivalent of: `maybeinline` (statically small →
+fully inlined, no packing), `dontpack`/`nᵣ ≥ N` → `loopmul!` (no packing at
+all, `@turbo` straight over the unpacked arrays), and only otherwise pack A,
+or pack A and B.
+
+But on this engine's *actual* target — genuine multi-index contractions — the
+comparison inverts. Against TBLIS (Matthews' own C++ BSMTC implementation,
+verified single-threaded), `C[a,n,b] = A[a,k,b] * B[k,n]`, GFLOP/s:
+
+| dims (a,k,b,n) | QuasiStrided | TBLIS | StridedBLAS |
+| --- | --- | --- | --- |
+| (64,64,16,64) | 29.2 | **32.2** | 12.0 |
+| (128,128,32,128) | **43.2** | 35.1 | 24.7 |
+| (256,128,8,256) | **49.2** | 46.8 | 30.0 |
+| (64,256,64,64) | **40.8** | 35.5 | 23.4 |
+| (256,256,4,256) | **52.4** | 48.0 | 53.8 |
+
+QuasiStrided already matches or beats TBLIS on 4 of 5 points and beats
+`StridedBLAS` by 1.0x-2.4x. The plain-matmul gap against Octavian is real but
+it is not this package's workload, and it should not drive the roadmap ahead
+of the packing/overhead work that the table above actually indicts.
+
+### Dependency note
+
+`LoopVectorization.jl` was considered and rejected as a dependency. Its README
+states maintenance runs "through the SciML Small Grants program", with a grant
+specifically for Julia v1.12 support — a large, compiler-fragile package on
+grant funding. It is also unnecessary: the valuable idea was the addressing
+layer, and that was reproduced with `SIMD.vload(Vec{W,T}, ::Ptr{T})` and zero
+new dependencies. Noted for a future maintainer: `CPUSummary.jl` is a
+better-tested replacement for `src/target.jl`'s cache detection (it already
+reports cache inclusivity, and divides L3 by the number of sharing cores),
+and `LayoutPointers`/`StrideArraysCore` provide `gesp`/`PtrArray`, if a
+dependency ever becomes acceptable.

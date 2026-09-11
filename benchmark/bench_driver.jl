@@ -11,96 +11,9 @@
 #
 # writes results + PROVENANCE.txt to benchmark/results/<hostname>-<date>/.
 
-using QuasiStrided
-using QuasiStrided: execute_tilewise!, ScalarKernel, SIMDKernel, mr, nr, lanewidth,
-    plan_contract, execute!
-using StridedViews: StridedView
-using LinearAlgebra
-using Statistics: median
-using Random
-using Dates
-using Printf
+include(joinpath(@__DIR__, "harness.jl"))
 
-# Single-core measurement discipline (this project's standing rule).
-LinearAlgebra.BLAS.set_num_threads(1)
-const NTHREADS = Threads.nthreads()
-const BLAS_THREADS = LinearAlgebra.BLAS.get_num_threads()
-if NTHREADS != 1
-    @warn "Threads.nthreads() = $NTHREADS != 1 -- this is NOT the pinned " *
-        "single-core measurement this project's rules require. Results " *
-        "below should not be trusted as the reference-machine numbers."
-end
-
-# Warm up once (discarded), then `reps` timed calls; median, not mean.
-function median_time_s(f!::Function; reps::Int = 5)
-    f!()  # warm-up, discarded
-    ts = Vector{Float64}(undef, reps)
-    for r in 1:reps
-        t0 = time_ns()
-        f!()
-        t1 = time_ns()
-        ts[r] = (t1 - t0) / 1.0e9
-    end
-    return median(ts)
-end
-
-# Shapes.
-struct ShapeSpec
-    name::String
-    Ma::Int
-    Ka::Int
-    Na::Int
-end
-
-const MAIN_SHAPES = [
-    ShapeSpec("64^3", 64, 64, 64),
-    ShapeSpec("128^3", 128, 128, 128),
-    ShapeSpec("256^3", 256, 256, 256),
-    ShapeSpec("512^3", 512, 512, 512),
-    ShapeSpec("shallowK_256x24x256", 256, 24, 256),
-]
-const EXTRA_SHAPES = [
-    ShapeSpec("1024x256x1024", 1024, 256, 1024),
-]
-
-function build_plain(::Type{T}, spec::ShapeSpec, rng) where {T}
-    Amat = randn(rng, T, spec.Ma, spec.Ka)
-    Bmat = randn(rng, T, spec.Ka, spec.Na)
-    Cmat = zeros(T, spec.Ma, spec.Na)
-    Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
-    return (
-        Av = Av, indA = (1, 2), Bv = Bv, indB = (2, 3), Cv = Cv, indC = (1, 3),
-        Amat = Amat, Bmat = Bmat, Cmat = Cmat,
-    )
-end
-
-# 3-index / scattered-C fixture (permuted A, negative-stride B,
-# sliced-with-offset C), sized up from test/test_macro_driver.jl's version.
-function build_scattered(::Type{T}, rng) where {T}
-    a_n, k_n, b_n, n_n = 64, 64, 16, 64
-    A2 = randn(rng, T, a_n, k_n)
-    Araw = StridedView(vec(A2), (a_n, k_n, b_n), (1, a_n, 0), 0)
-    Aperm = permutedims(Araw, (2, 3, 1))  # k,b,a order
-    indA = (2, 3, 1)
-    Bdata = randn(rng, T, k_n * n_n)
-    Bneg = StridedView(Bdata, (k_n, n_n), (-1, k_n), k_n - 1)
-    indB = (2, 4)
-    Cbig = zeros(T, a_n + 2, n_n + 3, b_n + 1)
-    Csub = view(Cbig, 2:(a_n + 1), 2:(n_n + 1), 1:b_n)
-    Cv = StridedView(Csub)
-    indC = (1, 4, 3)
-    return (Av = Aperm, indA = indA, Bv = Bneg, indB = indB, Cv = Cv, indC = indC)
-end
-
-# (mc,kc,nc) grids, 36 combos each. Float32's is Float64's scaled ~1.5x:
-# it packs more per cache line, so it can profitably use larger blocks.
-function full_grid(mcs, kcs, ncs)
-    combos = Tuple{Int, Int, Int}[]
-    for kc in kcs, mc in mcs, nc in ncs
-        push!(combos, (mc, kc, nc))
-    end
-    return combos
-end
+using QuasiStrided: execute_tilewise!
 
 const GRID_F64 = full_grid((64, 128, 256, 512), (128, 256, 512), (768, 1536, 3072))
 const GRID_F32 = full_grid((96, 192, 384, 768), (192, 384, 768), (1152, 2304, 4608))
@@ -108,31 +21,32 @@ const GRID_F32 = full_grid((96, 192, 384, 768), (192, 384, 768), (1152, 2304, 46
 grid_for(::Type{Float64}) = GRID_F64
 grid_for(::Type{Float32}) = GRID_F32
 
-const KERNEL_CTORS = (ScalarKernel = ScalarKernel, SIMDKernel = SIMDKernel)
-const DTYPES = (Float64, Float32)
+# ScalarKernel stays at the historical (8,6) reference shape; SIMDKernel uses
+# whatever `_default_kernel` derives for this machine, so this sweep validates
+# mc/nc at the shape the engine actually ships (docs/decisions.md, Phase G).
+kernels_for(::Type{T}) where {T} = (
+    ScalarKernel = ScalarKernel(Val(8), Val(6), T),
+    SIMDKernel = QuasiStrided._default_kernel(T),
+)
 
-# Header.
 function print_header(io::IO)
-    println(io, "# QuasiStrided.jl benchmark/bench_driver.jl")
-    println(io, "cpu = ", Sys.CPU_NAME)
-    println(io, "julia = ", VERSION)
-    println(io, "nthreads = ", NTHREADS, "  blas_threads = ", BLAS_THREADS)
+    print_env_header(io, "bench_driver.jl")
+    println(io, "target = ", QuasiStrided.target_profile())
     for T in DTYPES
-        sk = ScalarKernel(Val(8), Val(6), T)
-        simdk = SIMDKernel(Val(8), Val(6), T)
-        println(
-            io, "kernel(", T, "): MR=", mr(sk), " NR=", nr(sk),
-            " W(SIMD)=", lanewidth(simdk)
-        )
+        for (kname, k) in pairs(kernels_for(T))
+            println(
+                io, "kernel(", T, ", ", kname, "): MR=", mr(k), " NR=", nr(k),
+                k isa SIMDKernel ? "  W=" * string(lanewidth(k)) : ""
+            )
+        end
+        println(io, "default_blocking(", T, ") = ", QuasiStrided.default_blocking(kernels_for(T).SIMDKernel))
     end
-    return println(io, "date = ", now())
+    return nothing
 end
 print_header(stdout)
 
 # Output location.
-const OUTDIR = joinpath(
-    @__DIR__, "results", "$(gethostname())-$(Dates.format(now(), "yyyy-mm-dd"))"
-)
+const OUTDIR = results_dir()
 mkpath(OUTDIR)
 const CSV_PATH = joinpath(OUTDIR, "bench.csv")
 const CANARY_PATH = joinpath(OUTDIR, "canary.csv")
@@ -180,9 +94,8 @@ raw_execute = Vector{NamedTuple}()  # for ranking
 canary_results = Float64[]
 push!(canary_results, run_canary(rng, "A (start)"))
 
-for (kname, kctor) in pairs(KERNEL_CTORS)
-    for T in DTYPES
-        kernel = kctor(Val(8), Val(6), T)
+for T in DTYPES
+    for (kname, kernel) in pairs(kernels_for(T))
         combos = grid_for(T)
         for (mc, kc, nc) in combos
             for spec in MAIN_SHAPES
@@ -242,9 +155,8 @@ end
 # Extra shapes (large cuboid + scattered-C fixture): only at each dtype's
 # center combo, both kernels, to check the grid-derived winner generalizes
 # without paying for the full grid at these more expensive shapes.
-for (kname, kctor) in pairs(KERNEL_CTORS)
-    for T in DTYPES
-        kernel = kctor(Val(8), Val(6), T)
+for T in DTYPES
+    for (kname, kernel) in pairs(kernels_for(T))
         mc, kc, nc = grid_for(T)[cld(length(grid_for(T)), 2)]
 
         for spec in EXTRA_SHAPES
@@ -313,26 +225,7 @@ println("canary spread (max-min)/min = ", @sprintf("%.4f", canary_spread))
 # time is first normalized by that (kernel,dtype,shape)'s own minimum
 # across the combo grid, so shapes of very different absolute cost weigh
 # equally in the geomean.
-function rank_combos(raw, T::DataType)
-    rows = filter(r -> r.dtype == T, raw)
-    # minimum time per (kernel,shape) across all combos
-    mins = Dict{Tuple{String, String}, Float64}()
-    for r in rows
-        key = (r.kernel, r.shape)
-        mins[key] = min(get(mins, key, Inf), r.t)
-    end
-    combo_ratios = Dict{Tuple{Int, Int, Int}, Vector{Float64}}()
-    for r in rows
-        key = (r.mc, r.kc, r.nc)
-        push!(get!(combo_ratios, key, Float64[]), r.t / mins[(r.kernel, r.shape)])
-    end
-    geo(v) = exp(sum(log, v) / length(v))
-    ranked = sort(
-        [(combo, geo(ratios)) for (combo, ratios) in combo_ratios];
-        by = x -> x[2]
-    )
-    return ranked
-end
+rank_combos(raw, T::DataType) = rank_by(raw, T, r -> (r.mc, r.kc, r.nc))
 
 open(SUMMARY_PATH, "w") do io
     println(io, "# Phase E ranking summary")
@@ -368,11 +261,7 @@ end
 println(read(SUMMARY_PATH, String))
 
 # Provenance.
-commit = try
-    strip(read(`git -C $(joinpath(@__DIR__, "..")) rev-parse HEAD`, String))
-catch
-    "unknown (git rev-parse failed)"
-end
+commit = git_commit()
 open(PROVENANCE_PATH, "w") do io
     println(io, "git_commit = ", commit)
     println(io, "command = julia --project=. benchmark/bench_driver.jl")

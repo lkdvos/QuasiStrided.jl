@@ -7,20 +7,18 @@ detail belongs in `docs/decisions.md`.
 
 ## Integrated revision
 
-Local git repo at `/mnt/home/ldevos/Projects/QuasiStrided.jl`, `main` at
-`314c47f` ("Fix Runic formatting in bench_driver.jl") — the macro-blocking
-milestone's closing state. Published (see "Published" below).
+Local git repo at `/mnt/home/ldevos/Projects/QuasiStrided.jl`. `main` is at
+`3e712ea` ("Add TensorOperations.jl backend (QuasiStridedBackend) (#2)") --
+the TensorOperations integration milestone was squash-merged as PR #2 on
+2026-09-10 and is published. The stale text that used to stand here, saying
+that milestone was "still entirely uncommitted", is resolved.
 
-The TensorOperations integration milestone (below) lives in the
-`tensoroperations` worktree/branch, based on that same revision. As of this
-milestone's documentation close (T13, 2026-09-09) that branch is still *at*
-`314c47f`: the entire milestone exists as uncommitted working-tree changes —
-11 modified files plus 6 new untracked ones (`src/tensoroperations.jl`,
-`src/workspace.jl`, `test/test_tensoroperations.jl`, `test/test_quality.jl`,
-`benchmark/bench_tensoroperations.jl`, and the 2026-09-09 benchmark results
-directory). Nothing from it is committed, merged into `main`, or pushed, so
-the "Published" section below still describes `main` alone and is
-deliberately unchanged. Committing/merging is the step *after* T14.
+Current work is on branch `blis`, based on `3e712ea`: the hardware-derived
+register shape milestone (see "Hardware-derived register shape milestone"
+below). Note `Manifest.toml` and `benchmark/results/` are both gitignored, so
+the committed manifest is stale relative to `Project.toml` and a fresh clone
+needs `Pkg.resolve()`; benchmark result directories exist on disk but are not
+in the tree.
 
 ## Environment
 
@@ -89,6 +87,12 @@ count as of this milestone's close: see the macro-blocking section below.)
   see that section below and `docs/decisions.md`.
 - No autotuning, threading, or GPU path — still explicitly deferred, not
   gaps in scope. Cache-blocked macro-kernel is now implemented (see below).
+- **CORRECTED 2026-09-11**: the standing claim that "the microkernel gap
+  against a tuned vendor GEMM is not closing with size" is **false**. At the
+  BLIS `skx` register shape the pure-Julia `SIMDKernel` reaches 101-103
+  GFLOP/s, ~88% of this machine's peak. The binding constraint is that the
+  driver passes each micro-tile a `view` of its macro panel, which costs ~4x
+  above `NV = 16`. See "Next task" and `docs/decisions.md`'s Phase G.
 
 ## Published
 
@@ -280,36 +284,139 @@ bookkeeping, since fixed) is in `docs/decisions.md`'s close section.
 1.12.6, `ccqlin038`, re-run at T13 on 2026-09-09). Provisional only in the
 sense that T14 has not run yet; no code change is expected from T13.
 
+## Hardware-derived register shape milestone — complete
+
+Goal: make the engine perform sensibly on any machine without per-machine
+retuning. Narrative, measurements and provenance in `docs/decisions.md`,
+"Hardware-derived register shape milestone: Phase G" — that file, not this
+one, is authoritative for *why*.
+
+Shipped:
+
+- `src/target.jl` (new): runtime hardware detection with **no new
+  dependency** — `Sys.CPU_NAME` against a recognition table of LLVM uarch
+  names, falling back to a `Base.BinaryPlatforms.CPUID` probe, then to
+  `:unknown`. Plus `cache_topology()`, which reads Linux sysfs / macOS
+  `sysctl` on demand and reports cache size, ways, line size and **sharing**.
+  Detection runs once per process in `__init__`, never at precompile time.
+  `Project.toml` `[deps]` is unchanged.
+- A single capability-derived register-shape rule in `src/driver.jl`:
+  `W = vector_bytes/sizeof(T)`, `MR = 2W`, `NR = 6` (so `NV = 12`). It
+  reproduces the swept optimum for both dtypes independently on AVX-512, and
+  reduces to the old hardcoded `(8,6,4)` on AVX2. Applied only on those two
+  measured ISAs (`_rule_applies`); `:neon` and `:unknown` take the previous
+  constants bit-identically, so aarch64 is unchanged rather than guessed at.
+- Extent-aware demotion: `_default_kernel(T, Qm, Qn)` falls back to the
+  legacy shape when `Qm < MR`, applied only when the caller did not name a
+  kernel. `plan_contract`'s `kernel` keyword now defaults to `nothing` and is
+  resolved after the M/N/K groups are built, behind a `_plan_contract`
+  function barrier that keeps `ContractPlan`'s `Kern` parameter concrete.
+- `default_blocking` gained one ISA-keyed measured row (AVX-512), with the
+  Phase E constants as the fallback for every other ISA.
+- `benchmark/harness.jl` (new, factored out of `bench_driver.jl`),
+  `benchmark/bench_kernel_shape.jl` (new, the register-shape sweep with a
+  validated spill detector), `benchmark/bench_default_vs_legacy.jl` (new,
+  the shipped-vs-previous regression guard). `bench_driver.jl` now sweeps at
+  the derived shape.
+- `test/test_target.jl` (new, 128 tests).
+
+Measured, single machine (ccqlin038, Cascade Lake), complete new
+configuration against the complete previous one: **geomean 1.264x (Float64)
+and 1.274x (Float32)**, up to 1.78x/1.91x at 512³, worst point 0.963x
+(inside this session's 4-12% canary spread). On Julia 1.10 LTS the speedups
+are larger (1.79x/1.87x) and both paths stay allocation-free.
+
+Test suite green on both CI Julia versions: Julia 1.12.6 (13171 pre-existing
+tests all still passing, plus 128 new in `test/test_target.jl`), and Julia
+1.10.11 LTS (13687 pass, 9 broken — the pre-existing
+`skip=(VERSION < v"1.11")` allocation assertions, unchanged by this work).
+
+## Panel addressing milestone — complete
+
+Goal: remove the two ceilings Phase G identified, prompted by reading
+Octavian.jl. Narrative and measurements in `docs/decisions.md`, "Panel
+addressing milestone: Phase H".
+
+Shipped:
+
+- `src/panel.jl` (new): `PackedPanel`, a borrowed `(Ptr{T}, len)` handed to
+  the kernel instead of `view(ws.packed_a, range)`, with
+  `panel_vload`/`panel_load`/`panel_store!` accessors that also have
+  `AbstractVector` methods so every existing caller keeps working. Needs **no
+  new dependency** — `SIMD.vload` already accepts a `Ptr{T}`. `execute!` wraps
+  the nest in one `GC.@preserve ws`; the nest moved to `_execute_nest!`.
+- `PtrScatterAxis` in `src/tiles.jl` (new): `Ptr{Int} + count`, so it is
+  `isbits` and `Union{AffineAxis,PtrScatterAxis}` needs no heap box.
+  `ScatterAxis` is unchanged and stays the vector-backed public form; only
+  `_axis_of` switched.
+- A generated, statically-indexed scattered store path in
+  `src/kernels/simd.jl`, replacing dynamic `NTuple` indexing in
+  `store_tile!`'s fallback.
+- `benchmark/bench_default_vs_legacy.jl` and the register-shape sweep re-run;
+  `_shape_override` added as a hook and left deliberately **empty**.
+- `test/test_target.jl` grew a zero-allocation assertion through a
+  permuted-A / negative-stride-B / sliced-C fixture.
+
+**A Phase G default was allocating and the suite missed it.** The Float32
+default `(32,6,16)` allocated 24576 B per `execute!` on scattered
+contractions; every existing allocation assertion used plain regular
+contractions, so nothing caught it. Fixed by `PtrScatterAxis`, and the new
+scattered assertion closes the gap.
+
+Measured: 0 B on every shape up to `MR = 48` (was 24 KB above `MR = 16`);
+microkernel 62.6 → 79.5 GFLOP/s at the shipped shape and 30.7 → 96.6 at
+`(16,14,8)`. **End-to-end geomean is unchanged** at 1.283 (Float64) against
+the pre-Phase-G configuration. These fixes removed ceilings; they did not add
+throughput at the shipped shape.
+
+Test suite: 13299/13299 on Julia 1.12.6.
+
 ## Next task
 
-**Milestone closed.** T14 (final gated review) ran and returned no blocking
-and no should-fix findings against the shipped code, tests, or benchmarks —
-it independently re-verified the test count, every benchmark ratio, the
-three-tier API table's counts, the argcheck order, T11's `PermutedDimsArray`
-aliasing fix, and git hygiene, all matching what's documented. Its one
-should-fix was against this file's and `docs/decisions.md`'s own bookkeeping
-(the two README nits noted below had already been fixed directly in
-`README.md` between T13 and T14, but the close-section prose still described
-them as outstanding); that record has now been corrected in
-`docs/decisions.md`'s close section. Full disposition there.
+**Packing and per-call overhead is now the whole gap.** Benchmarked
+single-threaded against Octavian.jl and OpenBLAS (`docs/decisions.md`,
+Phase H), QuasiStrided reaches 25-54 GFLOP/s on plain matmul where Octavian
+is essentially flat at 79-98 and beats OpenBLAS at most points. Since the
+microkernel measures 79-100 GFLOP/s in isolation, the deficit is entirely
+packing plus per-call cost. Octavian's answer is a three-tier dispatch this
+engine has no equivalent of:
 
-`fable_review_tensorops_used: true`, and the Sonnet-High T14 pass is also
-spent — there is no budget for a third review this milestone.
+1. `maybeinline` — statically small, fully inlined, no packing;
+2. `dontpack`/`nᵣ ≥ N` → `loopmul!` — **no packing at all**, straight over the
+   unpacked arrays;
+3. otherwise pack A only, or pack A and B.
 
-Remaining step: commit and merge (see "Integrated revision" — the branch is
-still entirely uncommitted as of this writing). T15 (an optional, non-blocking
-upstream docs PR to TensorOperations.jl) is out of scope for that and can
-happen any time after.
+QuasiStrided always packs both. Adding tiers 1-2 is the highest-value next
+item, and it targets exactly the small and skewed shapes a tensor network
+produces (`256x256x12` measures 16 GFLOP/s here against Octavian's 87).
 
-Every worker must read `docs/decisions.md`'s "TensorOperations integration
-milestone" sections in full first; they are authoritative over the plan file
-wherever the two differ (they correct the plan's claim that `tensoralloc`
-always returns a concrete `Vector{T}`, supersede its
-`ManualAllocator()`-backed default pool, and carry T11's addendum moving
-the adapter's aliasing check onto the `StridedView`-wrapped operands).
+Keep the priority honest, though: on **genuine multi-index contractions** —
+the actual target — QuasiStrided already matches or beats TBLIS, the C++ BSMTC
+reference, on 4 of 5 measured points, and beats `StridedBLAS` by 1.0x-2.4x.
+The plain-matmul gap is real but is not this package's workload.
 
-Still deferred beyond this milestone (see README "Not implemented" and
-`docs/decisions.md`): threading (state is already organized to not preclude
-it — see `docs/decisions.md`'s Phase D finding 4), autotuning across
-shapes, GPU, complex-arithmetic methods, K padding, orientation swap,
-`tensoradd!`/`tensortrace!` support in this backend.
+Two smaller follow-ons, both now unblocked rather than urgent: the register
+tile can be enlarged (`NV` up to 28 is allocation-free and spill-free — it
+just measured no faster), and `default_blocking`'s `mc`/`nc` were validated
+at the previous register shape.
+
+**Measurement hygiene, learned the hard way this milestone:** ccqlin038 is
+not reliably exclusive. Canary spreads of 4-15% were normal (against Phase
+E's 0.71%), three successive register-shape sweeps produced three different
+"winners", and an 11-rep comparison invented two regressions that 21 reps
+erased. Use >= 15 reps, time compared configurations adjacently, check for
+other users' processes first, and treat anything under ~10% as noise.
+
+Still deferred (see README "Not implemented" and `docs/decisions.md`):
+threading (state is still organized to not preclude it, but note
+`PackedPanel`/`PtrScatterAxis` borrow pointers into workspace buffers, so a
+threaded driver must keep the `GC.@preserve` and the per-worker split of the
+M-side state consistent), autotuning across shapes, GPU, complex-arithmetic
+methods, K padding, orientation swap, `tensoradd!`/`tensortrace!`. T15 (an
+optional upstream docs PR to TensorOperations.jl) remains unstarted.
+
+**BLIS microkernels stay closed** (Phase G): all of `blis_jll` 0.9/1.0/2.0
+ship the asm kernels and `bli_cntx_get_*` as local symbols only, so `dlsym`
+cannot reach them. **LoopVectorization.jl was considered and rejected** as a
+dependency (grant-funded maintenance, compiler-fragile, and unnecessary — the
+addressing idea was reproduced with zero new dependencies).
