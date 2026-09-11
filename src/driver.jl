@@ -129,17 +129,26 @@ _legacy_shape(::Type{T}) where {T} = (8, 6, _default_lanewidth(T))
 # here would only pin this package to one machine's noise.
 _shape_override(::Val, ::Type) = nothing
 
+# The rule applies only to the ISAs it was validated on. `:neon` is detected
+# but deliberately gets the legacy shape: there is no aarch64 measurement, and
+# the rule would pick MR = 2W = 4 with 128-bit lanes, using 12 of 32 NEON
+# registers -- narrower and smaller than the legacy (8,6,4), not obviously
+# better. Derive where measured, fall back everywhere else.
+_rule_applies(::Val{:avx512}) = true
+_rule_applies(::Val{:avx2}) = true
+_rule_applies(::Val) = false
+
 function _derived_shape(profile::TargetProfile, ::Type{T}) where {T}
     vb = profile.vector_bytes
-    (vb <= 0 || vb % sizeof(T) != 0) && return _legacy_shape(T)
-    W = vb ÷ sizeof(T)
-    ovr = _shape_override(Val(profile.isa), T)
-    return ovr === nothing ? (2 * W, NR_DEFAULT, W) : ovr
+    key = Val(profile.isa)
+    (_rule_applies(key) && vb > 0 && vb % sizeof(T) == 0) || return _legacy_shape(T)
+    ovr = _shape_override(key, T)
+    return ovr === nothing ? (2 * (vb ÷ sizeof(T)), NR_DEFAULT, vb ÷ sizeof(T)) : ovr
 end
 
 # Closed set, so compiled SIMDKernel (and driver) specializations are bounded.
-const KERNEL_SHAPES_F64 = ((8, 6, 4), (16, 6, 8), (4, 6, 2))
-const KERNEL_SHAPES_F32 = ((8, 6, 8), (32, 6, 16), (16, 6, 8), (8, 6, 4))
+const KERNEL_SHAPES_F64 = ((8, 6, 4), (16, 6, 8))
+const KERNEL_SHAPES_F32 = ((8, 6, 8), (32, 6, 16), (16, 6, 8))
 
 kernel_shapes(::Type{Float64}) = KERNEL_SHAPES_F64
 kernel_shapes(::Type{Float32}) = KERNEL_SHAPES_F32

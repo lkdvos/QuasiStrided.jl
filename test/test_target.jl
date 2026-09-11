@@ -109,7 +109,7 @@ end
     @testset "derivation rule: MR = 2W, NR = NR_DEFAULT, NV = 12" begin
         # NV = 12 everywhere keeps the rule safe on a 16-register AVX2 machine
         # and on Julia 1.10, and after Phase H it is also the measured optimum.
-        for (isakey, vb) in ((:avx512, 64), (:avx2, 32), (:neon, 16)), T in (Float64, Float32)
+        for (isakey, vb) in ((:avx512, 64), (:avx2, 32)), T in (Float64, Float32)
             MR, NR, W = _derived_shape(synthetic(isakey, vb), T)
             @test W == vb ÷ sizeof(T)
             @test (MR, NR) == (2 * W, NR_DEFAULT)
@@ -120,6 +120,21 @@ end
         # change from this work.
         @test _derived_shape(synthetic(:avx2, 32), Float64) === (8, 6, 4)
         @test _derived_shape(synthetic(:avx2, 32), Float64) === _legacy_shape(Float64)
+    end
+
+    @testset "the rule applies only where it was measured" begin
+        # :neon is detected but unmeasured, so it gets the legacy shape rather
+        # than an invented one -- the rule would pick MR = 2W = 4 on 128-bit
+        # lanes, narrower and smaller than legacy with nothing to justify it.
+        # This is also what keeps the shipped default identical on aarch64,
+        # which test_driver.jl's "SIMDKernel is the default" testset pins.
+        for T in (Float64, Float32)
+            @test _derived_shape(synthetic(:neon, 16), T) === _legacy_shape(T)
+            @test _derived_shape(synthetic(:unknown, 0), T) === _legacy_shape(T)
+            for vb in (16, 32, 64)   # width must not matter for an unmeasured ISA
+                @test _derived_shape(synthetic(:neon, vb), T) === _legacy_shape(T)
+            end
+        end
     end
 
     @testset "the override hook is empty, and the rule is what ships" begin

@@ -301,10 +301,11 @@ Shipped:
   Detection runs once per process in `__init__`, never at precompile time.
   `Project.toml` `[deps]` is unchanged.
 - A single capability-derived register-shape rule in `src/driver.jl`:
-  `W = vector_bytes/sizeof(T)`, `MR = 2W`, `NR = 6` (so `NV = 12` always).
-  It reproduces the swept optimum for both dtypes independently on AVX-512,
-  and reduces to the old hardcoded `(8,6,4)` on AVX2. `:unknown` resolves to
-  the previous constants bit-identically.
+  `W = vector_bytes/sizeof(T)`, `MR = 2W`, `NR = 6` (so `NV = 12`). It
+  reproduces the swept optimum for both dtypes independently on AVX-512, and
+  reduces to the old hardcoded `(8,6,4)` on AVX2. Applied only on those two
+  measured ISAs (`_rule_applies`); `:neon` and `:unknown` take the previous
+  constants bit-identically, so aarch64 is unchanged rather than guessed at.
 - Extent-aware demotion: `_default_kernel(T, Qm, Qn)` falls back to the
   legacy shape when `Qm < MR`, applied only when the caller did not name a
   kernel. `plan_contract`'s `kernel` keyword now defaults to `nothing` and is

@@ -104,11 +104,7 @@ end
     bvars = [Symbol(:b, j) for j in 0:(NR - 1)]
 
     load_a = [
-        :(
-                $(avars[v + 1]) = panel_vload(
-                    Vec{$W, $T}, packed_a, packed_a_offset(kernel, $(v * W), p)
-                )
-            )
+        :($(avars[v + 1]) = panel_vload(Vec{$W, $T}, packed_a, packed_a_offset(kernel, $(v * W), p)))
             for v in 0:(NVECA - 1)
     ]
     load_b = [

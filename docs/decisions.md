@@ -1430,7 +1430,7 @@ MR_d=6 NR_d=8; `a64fx` MR_d=16 NR_d=10.
     MR = 2 * W                        # two A vectors per output column
     NR = 6                            # six output columns
 
-so `NV = (MR/W)*NR = 12` accumulators on every architecture.
+so `NV = (MR/W)*NR = 12` accumulators wherever the rule applies.
 
 `benchmark/bench_kernel_shape.jl` swept 11 Float64 and 8 Float32 candidate
 shapes, each crossed with three `kc` values, over `MAIN_SHAPES` plus three new
@@ -1440,6 +1440,24 @@ for both dtypes independently** — Float64 `(16, 6, 8)`, Float32 `(32, 6, 16)` 
 and reduces to the previous hardcoded `(8,6,4)`/`(8,6,8)` on AVX2, so an AVX2
 machine is unchanged. `:unknown` resolves to the legacy shape, so an
 unrecognized CPU is bit-identical to the old behavior.
+
+**The rule applies only to the ISAs it was validated on** (`:avx512`,
+`:avx2`); `_rule_applies` gates it. `:neon` is detected -- it feeds
+`cache_topology` and is there for a future measurement -- but deliberately
+takes the legacy shape, because there is no aarch64 measurement and the rule
+would pick `MR = 2W = 4` on 128-bit lanes: 12 of 32 NEON registers, narrower
+*and* smaller than the legacy `(8,6,4)`, with nothing to justify it. Derive
+where measured, fall back everywhere else.
+
+Caught by CI, not by local testing: an earlier revision did derive for
+`:neon`, and `test_driver.jl`'s "SIMDKernel is the engine-wide default"
+assertion failed on both macOS runners. That assertion pinned the literal
+`SIMDKernel{8,6,T}` and had been passing on x86 only *by accident* -- its
+fixture has `Qm = 9`, which is below the derived `MR = 16` and so triggers the
+demotion. It now pins the resolution (`_default_kernel(T, Qm, Qn)`) rather
+than a literal shape, which is machine-independent by construction. Worth
+recording as a pattern: making a constant hardware-derived silently converts
+every test that asserted its old value into a platform-dependent test.
 
 `kc` was swept jointly with the register shape and not held fixed, because
 `MR*kc*sizeof(T)` is the A-micropanel L1 footprint: the old Float64 point

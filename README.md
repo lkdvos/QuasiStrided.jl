@@ -144,8 +144,10 @@ Gold 6244 / Cascade Lake):
   `Float64` and 1.27x for `Float32`** across the measured shape grid, up to
   1.78x/1.91x at 512³, with the worst point at 0.96x/1.00x (inside this
   machine's measured noise floor). On AVX2 the same rule reproduces the old
-  `(8,6,4)` exactly, and an unrecognized CPU falls back to the previous
-  constants bit-identically. A contraction whose `M` extent cannot fill one register
+  `(8,6,4)` exactly. The rule is applied only on the ISAs it was measured on
+  (AVX-512, AVX2); aarch64/NEON and any unrecognized CPU fall back to the
+  previous constants bit-identically, so they are unchanged rather than
+  guessed at. A contraction whose `M` extent cannot fill one register
   tile is demoted to the smaller shape, so a larger `MR` never costs padding
   on small problems. Single machine measured — see `docs/decisions.md`'s
   Phase G section, and `benchmark/bench_kernel_shape.jl` /
