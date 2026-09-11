@@ -26,19 +26,37 @@ end
 """
     default_blocking(kernel) -> Blocking
 
-Default cache-blocking factors for `kernel`, dispatched on
-`scalartype(kernel)`. Hardcoded measured constants, not a cache model
-(docs/decisions.md, "Block-size policy"). These are the *requested* `mc`/`nc`
--- `plan_contract` rounds them to `mr`/`nr` multiples and clamps them to the
-contraction's actual extents.
-"""
-default_blocking(kernel) = default_blocking(scalartype(kernel))
+Cache-blocking factors keyed on the detected vector ISA
+([`target_profile`](@ref)) and `scalartype(kernel)`. Measured constants, not a
+cache model: `plan_contract` rounds `mc`/`nc` to `mr`/`nr` multiples and clamps
+them to the contraction's extents.
 
-# Measured 2026-09-08 on ONE machine class (Cascade Lake, Xeon Gold 6244,
-# ccqlin038): benchmark/results/ccqlin038.flatironinstitute.org-2026-09-08/
-# PROVENANCE.txt, docs/decisions.md -> Phase E.
-default_blocking(::Type{Float64}) = Blocking(64, 128, 768)
-default_blocking(::Type{Float32}) = Blocking(96, 384, 1152)
+Cache-geometry *derivation* is still not used although `src/target.jl` now
+detects the geometry: re-measuring the 36-point grid found it spans only
+9%/11% best-to-worst, so a model's upside is a few percent against the tens of
+percent docs/decisions.md records such models losing. [`cache_topology`](@ref)
+is exposed for reporting only.
+"""
+default_blocking(kernel) = default_blocking(Val(target_profile().isa), scalartype(kernel))
+
+# What shipped before hardware detection existed; every ISA without a measured
+# row falls back here, so an unrecognized CPU is bit-identical to the old
+# behavior. Measured 2026-09-08 at the (8,6) shape (Phase E).
+_legacy_blocking(::Type{Float64}) = Blocking(64, 128, 768)
+_legacy_blocking(::Type{Float32}) = Blocking(96, 384, 1152)
+default_blocking(::Val, ::Type{T}) where {T} = _legacy_blocking(T)
+
+# AVX-512 at the derived shape (Phase G). `kc` was swept jointly with the
+# register shape, since MR*kc*sizeof(T) is the A-micropanel L1 footprint;
+# `mc`/`nc` then re-validated on the full grid, landing within ~1.6% of its
+# best at ~2.1x the old packed footprint (1.75 vs 0.81 MiB Float64, 3.66 vs
+# 1.83 MiB Float32). The grid is a plateau, so these are not sharp optima.
+default_blocking(::Val{:avx512}, ::Type{Float64}) = Blocking(128, 256, 768)
+default_blocking(::Val{:avx512}, ::Type{Float32}) = Blocking(96, 768, 1152)
+
+# Unchanged pre-detection behavior for callers passing a scalar type.
+default_blocking(::Type{Float64}) = _legacy_blocking(Float64)
+default_blocking(::Type{Float32}) = _legacy_blocking(Float32)
 
 # Smallest multiple of `n` that is >= `x` (`x >= 0`, `n >= 1`).
 @inline _roundup(x::Int, n::Int) = cld(x, n) * n

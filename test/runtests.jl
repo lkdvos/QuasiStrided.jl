@@ -19,6 +19,7 @@ using QuasiStrided: AxisGroup, axis_length, offsets, fill_offsets!, BlockDescrip
 # colliding with those (see its header comment).
 
 @testset "QuasiStrided.jl" begin
+    include("test_target.jl")
     include("test_axis_group.jl")
     include("strided_integration.jl")
     include("test_kernel_descriptor.jl")

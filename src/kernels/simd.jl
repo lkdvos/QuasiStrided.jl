@@ -89,9 +89,8 @@ end
 # one scalar load per B column, NVECA*NR FMAs, generated as straight-line code.
 @generated function _accumulate_step(
         kernel::SIMDKernel{MR, NR, T, W}, acc::NTuple{NV, Vec{W, T}},
-        packed_a::AbstractVector{T}, packed_b::AbstractVector{T},
-        p::Int
-    ) where {MR, NR, T, W, NV}
+        packed_a::PA, packed_b::PB, p::Int
+    ) where {MR, NR, T, W, NV, PA, PB}
     NVECA = MR ÷ W
     NVECA * NR == NV ||
         throw(
@@ -105,11 +104,15 @@ end
     bvars = [Symbol(:b, j) for j in 0:(NR - 1)]
 
     load_a = [
-        :($(avars[v + 1]) = vload(Vec{$W, $T}, packed_a, packed_a_offset(kernel, $(v * W), p) + 1))
+        :(
+                $(avars[v + 1]) = panel_vload(
+                    Vec{$W, $T}, packed_a, packed_a_offset(kernel, $(v * W), p)
+                )
+            )
             for v in 0:(NVECA - 1)
     ]
     load_b = [
-        :($(bvars[j + 1]) = packed_b[packed_b_offset(kernel, $j, p) + 1])
+        :($(bvars[j + 1]) = panel_load(packed_b, packed_b_offset(kernel, $j, p)))
             for j in 0:(NR - 1)
     ]
 
@@ -134,14 +137,15 @@ end
 
 SIMD counterpart of `ScalarKernel`'s `accumulate`; same contract (`kc == 0`
 is a no-op), but **not bitwise identical** (FMA grouping/order differ —
-compare with a tolerance, never `==`). `packed_a` must support `SIMD.vload`
-(a `Vector{T}` or unit-range `view`); `packed_b` is read by scalar `getindex`.
+compare with a tolerance, never `==`). `packed_a`/`packed_b` may be a
+[`PackedPanel`](@ref) — what the driver passes, and the only form that keeps
+a large accumulator register-resident — or any contiguous `AbstractVector{T}`
+such as a `Vector` or unit-range `view`.
 """
 function Base.accumulate(
         kernel::SIMDKernel{MR, NR, T, W}, acc::NTuple{NV, Vec{W, T}},
-        packed_a::AbstractVector{T}, packed_b::AbstractVector{T},
-        kc::Int
-    ) where {MR, NR, T, W, NV}
+        packed_a::PA, packed_b::PB, kc::Int
+    ) where {MR, NR, T, W, NV, PA, PB}
     kc == 0 && return acc
     kc > 0 || throw(ArgumentError("accumulate requires kc >= 0, got kc = $kc"))
     @inbounds for p in 0:(kc - 1)
@@ -154,12 +158,58 @@ end
 
 _unit_stride_rows(ax::AffineAxis) = ax.stride == 1
 _unit_stride_rows(::ScatterAxis) = false
+_unit_stride_rows(::PtrScatterAxis) = false
 
 @inline function _acc_lane(
         acc::NTuple{NV, Vec{W, T}}, v::Int, j::Int, lane1::Int,
         ::Val{NVECA}
     ) where {NV, W, T, NVECA}
     return acc[v + NVECA * j + 1][lane1]
+end
+
+# Scalar/scattered store path, with the accumulator tuple indexed only by
+# *compile-time* constants.
+#
+# The straightforward `for j, i` loop reaches the tuple as
+# `acc[v + NVECA*j + 1]` with both `v` and `j` runtime values. Indexing an
+# `NTuple` dynamically forces the whole tuple to memory, and above NV = 16 the
+# compiler heap-allocates it rather than using the stack: measured 24576 B per
+# `execute!` on the 3-index scattered fixture at (MR,NR,W) = (32,6,8), against
+# 0 B at (16,6,8) (docs/decisions.md, Phase H). Since scattered destinations
+# are this engine's reason to exist, that silently capped the usable register
+# tile on exactly the workload that matters.
+#
+# Unrolling over `(v, j)` hoists each `acc[...]` to a static index, so only a
+# single `Vec` is ever addressed dynamically (by lane), which stays on the
+# stack. That is NV blocks of code, not MR*NR statements.
+@generated function _store_tile_scattered!(
+        destination::QSTile, acc::NTuple{NV, Vec{W, T}},
+        alpha::T, beta::T, kernel::SIMDKernel{MR, NR, T, W},
+        m::Int, n::Int
+    ) where {MR, NR, T, W, NV}
+    NVECA = MR ÷ W
+    blocks = Any[]
+    for j in 0:(NR - 1), v in 0:(NVECA - 1)
+        idx = v + NVECA * j + 1
+        push!(
+            blocks, quote
+                if $j < n
+                    vec = acc[$idx]
+                    for lane in 1:$W
+                        i = $(v * W) + lane - 1
+                        i < m || break
+                        _axpby_tile!(destination, i, $j, alpha, vec[lane], beta)
+                    end
+                end
+            end
+        )
+    end
+    return quote
+        @inbounds begin
+            $(blocks...)
+        end
+        return destination
+    end
 end
 
 """
@@ -198,41 +248,24 @@ function store_tile!(
             for v in 0:(nfull - 1)
                 idx = colbase + v * W + 1  # one-based storage index of row v*W
                 rvec = acc[v + NVECA * j + 1]
-                if iszero(beta)
-                    outvec = alpha * rvec
-                elseif isone(beta)
-                    outvec = muladd(alpha, rvec, vload(Vec{W, T}, storage, idx))
-                else
-                    outvec = muladd(alpha, rvec, beta * vload(Vec{W, T}, storage, idx))
-                end
-                vstore(outvec, storage, idx)
+                vstore(
+                    iszero(beta) ? alpha * rvec :
+                        isone(beta) ? muladd(alpha, rvec, vload(Vec{W, T}, storage, idx)) :
+                        muladd(alpha, rvec, beta * vload(Vec{W, T}, storage, idx)),
+                    storage, idx
+                )
             end
             for i in (nfull * W):(m - 1)
-                idx = colbase + i + 1
-                r = _acc_lane(acc, i ÷ W, j, (i % W) + 1, Val(NVECA))
-                if iszero(beta)
-                    storage[idx] = alpha * r
-                elseif isone(beta)
-                    storage[idx] = muladd(alpha, r, storage[idx])
-                else
-                    storage[idx] = muladd(alpha, r, beta * storage[idx])
-                end
+                _axpby_at!(
+                    storage, colbase + i + 1, alpha,
+                    _acc_lane(acc, i ÷ W, j, (i % W) + 1, Val(NVECA)), beta
+                )
             end
         end
         return destination
     end
 
-    @inbounds for j in 0:(n - 1), i in 0:(m - 1)
-        r = _acc_lane(acc, i ÷ W, j, (i % W) + 1, Val(NVECA))
-        if iszero(beta)
-            tile_store!(destination, i, j, alpha * r)
-        elseif isone(beta)
-            tile_store!(destination, i, j, muladd(alpha, r, tile_load(destination, i, j)))
-        else
-            tile_store!(destination, i, j, muladd(alpha, r, beta * tile_load(destination, i, j)))
-        end
-    end
-    return destination
+    return _store_tile_scattered!(destination, acc, alpha, beta, kernel, m, n)
 end
 
 """
@@ -244,9 +277,8 @@ tolerance (FMA grouping differs), never bitwise.
 """
 function execute_tile!(
         kernel::SIMDKernel{MR, NR, T, W}, destination::QSTile,
-        packed_a::AbstractVector{T}, packed_b::AbstractVector{T},
-        kc::Int, alpha, beta
-    ) where {MR, NR, T, W}
+        packed_a::PA, packed_b::PB, kc::Int, alpha, beta
+    ) where {MR, NR, T, W, PA, PB}
     m = nrows(destination)
     n = ncols(destination)
     m <= MR || throw(ArgumentError("destination valid row extent $m exceeds mr(kernel) = $MR"))

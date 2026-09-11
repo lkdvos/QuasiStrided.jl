@@ -42,7 +42,29 @@ struct ScatterAxis{V <: AbstractVector{Int}}
     end
 end
 
-const Axis = Union{AffineAxis, ScatterAxis}
+"""
+    PtrScatterAxis(offsets::Ptr{Int}, count::Int)
+
+Like [`ScatterAxis`](@ref) but over borrowed offsets held as a raw pointer, so
+that it is `isbits` and `Union{AffineAxis,PtrScatterAxis}` needs no heap box.
+`ScatterAxis` holds an `AbstractVector`, which made that union non-isbits and
+cost 4-7 KB per `execute!` on irregular destinations whenever Julia could not
+union-split it (docs/decisions.md, Phase H). Used by the driver; `ScatterAxis`
+remains the vector-backed, bounds-checkable form everywhere else. The pointer
+is borrowed -- `execute!` holds the `GC.@preserve`.
+"""
+struct PtrScatterAxis
+    offsets::Ptr{Int}
+    count::Int
+
+    function PtrScatterAxis(offsets::Ptr{Int}, count::Int)
+        count >= 0 ||
+            throw(ArgumentError("PtrScatterAxis count must be nonnegative, got $count"))
+        return new(offsets, count)
+    end
+end
+
+const Axis = Union{AffineAxis, ScatterAxis, PtrScatterAxis}
 
 """
     axis_length(ax::Union{AffineAxis,ScatterAxis})::Int
@@ -51,6 +73,7 @@ Number of valid logical coordinates (`0:axis_length(ax)-1`).
 """
 axis_length(ax::AffineAxis) = ax.count
 axis_length(ax::ScatterAxis) = ax.count
+axis_length(ax::PtrScatterAxis) = ax.count
 
 """
     axis_offset(ax::Union{AffineAxis,ScatterAxis}, t::Int)::Int
@@ -60,6 +83,8 @@ Unchecked offset for `t`; caller ensures `0 <= t < axis_length(ax)` (see
 """
 @inline axis_offset(ax::AffineAxis, t::Int) = ax.base + t * ax.stride
 @inline axis_offset(ax::ScatterAxis, t::Int) = @inbounds ax.offsets[t + 1]
+@inline axis_offset(ax::PtrScatterAxis, t::Int) =
+    unsafe_load(ax.offsets + sizeof(Int) * t)
 
 """
     checked_axis_offset(ax::Union{AffineAxis,ScatterAxis}, t::Int)::Int
@@ -216,6 +241,16 @@ function axis_offset_range(ax::ScatterAxis)
     ax.count == 0 && return (0, -1)
     prefix = view(ax.offsets, 1:ax.count)
     return (Int(minimum(prefix)), Int(maximum(prefix)))
+end
+
+function axis_offset_range(ax::PtrScatterAxis)
+    ax.count == 0 && return (0, -1)
+    lo = hi = unsafe_load(ax.offsets)
+    for t in 1:(ax.count - 1)
+        v = axis_offset(ax, t)
+        lo, hi = min(lo, v), max(hi, v)
+    end
+    return (lo, hi)
 end
 
 """
