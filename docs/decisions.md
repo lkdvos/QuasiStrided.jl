@@ -3401,7 +3401,7 @@ silently build a different kernel.
 
 ## Upstream TensorOperations.jl benchmark suite comparison: preparatory milestone
 
-Written on branch `upstream-bench` (base `114e594`), covering T0-T8. T3
+Written on branch `upstream-bench` (base `71c1536`), covering T0-T8. T3
 (three-way measurement) and T5 (profiling triage) are the substantive tasks;
 this section is their record.
 
@@ -3520,9 +3520,13 @@ QuasiStrided): `ao2mo_2` 0.315x, `ao2mo_3` 0.323x, `ccsd_3` 0.372x,
 
 **The one substantive throughput finding: the `ccsd_t_*_dim16` regression
 class.** The four `ccsd_t_*_dim16` cases (six-index output, CCSD(T)-shaped
-contractions) are 6.6-11.5x slower than `StridedBLAS` across both dtypes,
-and — uniquely among all 118 cases at a non-trivial absolute size — 2.8-3.6x
-slower than plain `StridedNative`. Concretely, `ccsd_t_1_dim16`:
+contractions) are **6.6-14.2x** slower than `StridedBLAS` across both dtypes,
+and **2.0-4.4x** slower than plain `StridedNative` — the only case class
+where QuasiStrided loses to `StridedNative` at a non-trivial absolute size
+(re-derived from all 8 rows, not just `ccsd_t_1`; a review pass caught an
+earlier draft of this section that quoted only `ccsd_t_1`'s own ratios,
+10.1-11.5x / 2.5-3.6x, as if they bounded all four equations). Concretely,
+`ccsd_t_1_dim16`:
 
 | dtype | StridedNative | StridedBLAS | QuasiStrided | QS/BLAS |
 | --- | --- | --- | --- | --- |
@@ -3530,7 +3534,12 @@ slower than plain `StridedNative`. Concretely, `ccsd_t_1_dim16`:
 | Float32 | 0.324 s | 0.124 s | 1.425 s | 11.509 |
 
 (`summary_to_suite.txt`: Float64 section lines 235-239, Float32/tccg section
-lines 536-540.)
+lines 536-540; full per-equation QS/BLAS and QS/Native ratios for all four
+`ccsd_t_*_dim16` cases x both dtypes independently recomputed from
+`bench_to_suite.csv` at review time: QS/BLAS in {10.110, 13.983, 9.677,
+14.239} (Float64), {11.509, 10.747, 6.604, 9.888} (Float32); QS/Native in
+{3.575, 2.544, 2.639, 2.621} (Float64), {4.394, 2.180, 2.259, 2.007}
+(Float32).)
 
 Many small `:pairwise`/`:tccg` cases sit at a flat QuasiStrided per-call floor
 of roughly 5-25 µs regardless of how little arithmetic the case does — worst
@@ -3553,25 +3562,42 @@ case). Artifacts: `benchmark/results/ccqlin038.flatironinstitute.org-2026-09-15/
 
 **Instrument caveat, read before the numbers below.** `compute_buckets`
 classifies only leaf frames into named buckets (`microkernel`, `packing`,
-`store`, `blas`, etc.); the scattered-store code path's leaves — in
-`SIMD/src/LLVM_intrinsics.jl`, `QuasiStrided/src/kernel.jl`, `src/tiles.jl` —
-don't match any bucket substring, so they land in `other` alongside real
-idle-thread sampling noise (`buckets_summary.txt`'s `ccsd_t_1_dim16`
-QuasiStridedComposite row: `store 0.00%`, `other 91.15%`). Read the bucket
-tables' `other` row at face value and you would conclude nothing costly is
-happening; it is. The quantitative claims below instead come from the
-`.tree.txt`/`.flat.txt` inclusive-count profiles, normalized to the
-compute-thread root, not from the raw bucket percentages.
+`store`, `blas`, etc.). Two separate issues make the raw bucket tables
+under-report store cost: (1) a genuine tool bug, caught at review (T6) and
+since fixed in `benchmark/profile_buckets.jl` — `"microkernel"`'s bucket
+matched on the bare file-path substring `"kernels/"`, and the store path's
+own named frames (`_store_tile_scattered!`, `tile_store!`, `tile_offset`,
+`_axpby_tile!`) live in that same file (`src/kernels/simd.jl`) as the FMA
+microkernel, so first-match-wins ordering swallowed them into `microkernel`
+instead of `store` (the original run's `ccsd_t_1_dim16` `microkernel: 7.97%`
+figure was mostly store cost, not arithmetic — do not use that number); (2)
+even after that fix, the scattered-store path's *further* leaves — in
+`SIMD/src/LLVM_intrinsics.jl` and `Base/genericmemory.jl` — still don't match
+any bucket substring and still land in `other` alongside real idle-thread
+sampling noise (re-run after the fix: `ccsd_t_1_dim16` QuasiStridedComposite
+`store` rises from 0.00% to a still-small 1.46%/4.27%-scale figure, `other`
+still ~91-95%). Read the bucket tables' `other` row at face value in either
+version and you would conclude nothing costly is happening in the store
+path; it is. The quantitative claims below come entirely from the
+`.tree.txt`/`.flat.txt` inclusive-count profiles (which classify by the full
+call stack, not a single leaf), normalized to the compute-thread root, not
+from either version of the bucket percentages.
 
 **Verdict: two different mechanisms, not one.** `dim15_2_2_2`'s loss and
 `ccsd_t_1_dim16`'s loss are **not** the same story.
+
+Every derived-seconds figure below (as opposed to a plain percentage) uses
+one fixed convention: (tree-profile bucket's share of the compute-thread
+root sample count) x (T3's measured median time for that case/backend), so
+it is reconstructible from `bench_to_suite.csv` plus the cited
+`.tree.txt`/`.flat.txt` frame counts alone.
 
 - `dim15_2_2_2` (the known small-shape pattern): microkernel `accumulate`
   (FMA) is 46.63% of QuasiStrided's own time, packing 16.12%, store 21.22% —
   the already-documented "real arithmetic dominates, packing plus per-call
   overhead adds a multiplier" story. QuasiStrided's microkernel time alone
-  (2.587e-4 s) is ~0.85x of StridedBLAS's **entire** GEMM time (3.056e-4 s)
-  at this shape.
+  (2.587e-4 s) is ~0.85x of StridedBLAS's **entire** GEMM time (3.056e-4 s,
+  i.e. 94.19% of StridedBLAS's own 3.24365e-4 s median) at this shape.
 - `ccsd_t_1_dim16`: `store_tile!`/`_store_tile_scattered!` is 75.30%
   (Float64) / 88.36% (Float32) of QuasiStrided's time; the FMA microkernel is
   0.40%/0.24%; packing is 0.02%/0.03%. Essentially no arithmetic or packing
@@ -3581,21 +3607,33 @@ compute-thread root, not from the raw bucket percentages.
 location.** Neither was fixed or modified — both `src/kernels/simd.jl:217`
 and `src/driver.jl:815` were read only, as a read-only diagnostic pass.
 
-- **Cause A: the vectorized store fast-path guard is unsatisfiable on the
-  TensorOperations path.** `src/kernels/simd.jl:217`'s guard —
+- **Cause A: the vectorized store fast-path guard is unsatisfiable for any
+  `Array`-backed destination, not just on the TensorOperations path.**
+  `src/kernels/simd.jl:217`'s guard —
   `_unit_stride_rows(destination.rows) && destination.storage isa Vector{T}`
-  — never passes on this path: `src/driver.jl:815` sets `Cstorage =
-  parent(C)` where `C::StridedView`, and `parent` of a `StridedView` wrapping
-  a plain `Array` resolves to `Memory{T}` on Julia 1.12, never `Vector{T}`
-  (confirmed by a direct read-only probe,
-  `profiles/T5_probe_storage_type.jl`/`.txt`, run on this same machine/Julia
-  for ranks 1, 2, 4, 6 — all four report `parent(StridedView(C))::Memory{T}`,
-  `isa Vector{T} = false`). Zero `vstore` samples appeared in any of the 8
-  profiles taken. Consequence: **every** case in this run — including
-  cache-resident ones like `dim15_2_2_2`, whose M direction is in fact
-  contiguous and would satisfy `_unit_stride_rows` — pays for the scattered-
-  store path unconditionally on the TO adapter path. This is a shape/rank-
-  independent tax, not something that only bites `ccsd_t_1`.
+  — never passes: `src/driver.jl:815` sets `Cstorage = parent(C)` inside
+  `_plan_contract(C::StridedView, ...)` (`src/driver.jl:776`), which every
+  plan-construction call goes through regardless of entry point (native
+  `contract!`/`plan_contract` or the TensorOperations adapter). `parent` of a
+  `StridedView` wrapping a plain `Array` resolves to `Memory{T}`, never
+  `Vector{T}`, on Julia >= 1.11 — this is provable **statically** from
+  `StridedViews.jl`'s own source (v0.5.2, the version resolved here):
+  `_normalizeparent(A::Array) = A.ref.mem` under
+  `@static if isdefined(Core, :Memory)` (`StridedViews/src/auxiliary.jl:50-55`),
+  applied in the `StridedView` constructor (`StridedViews/src/stridedview.jl:54`),
+  with `Base.parent(a::StridedView) = a.parent` (`:121`) — not merely
+  consistent with the on-disk runtime probe
+  (`profiles/T5_probe_storage_type.jl`/`.txt`, ranks 1, 2, 4, 6, all reporting
+  `Memory{T}`), independently confirmed this way at review time. Zero
+  `vstore` samples appeared in any of the 8 profiles taken (grepped for
+  `vstore` across `profiles/`: zero matches; `vload` frames from
+  `panel_vload` do appear, so the absence is informative, not a symbolization
+  gap). Consequence: **every** case in this run — including cache-resident
+  ones like `dim15_2_2_2`, whose M direction is in fact contiguous and would
+  satisfy `_unit_stride_rows` — pays for the scattered-store path
+  unconditionally. This is a shape/rank-independent tax on any Array-backed
+  destination, not something that only bites `ccsd_t_1` or only the
+  TensorOperations entry point.
 
   **This SUGGESTS, but does not yet verify**, that STATUS.md's existing
   "packing plus per-call cost is the whole gap" attribution (measured with
@@ -3610,8 +3648,8 @@ and `src/driver.jl:815` were read only, as a read-only diagnostic pass.
 
 - **Cause B: `ccsd_t_1`'s destination has a cache/TLB-unfriendly stride
   pattern, independent of Cause A.** `C[a,b,c,i,j,k]` is 134.2 MB (Float64) —
-  this machine's L3 is 25,952,256 bytes (`PROVENANCE_to_suite.txt`/machine
-  info; L3 far smaller than the output) — and its GEMM-M composite axis
+  this machine's L3 is 25,952,256 bytes (~24.75 MiB/socket, already on record
+  above in this file; L3 far smaller than the output) — and its GEMM-M composite axis
   `(i,j,a)` has a non-monotonic C-stride pattern `(4096, 65536, 1)`. Per-
   element store cost measured at 84.5 ns (Float64) / 75.1 ns (Float32),
   versus 2.05-2.33 ns on cache-resident outputs (`ao2mo_2`, `dim15_2_2_2`) —
@@ -3623,8 +3661,10 @@ and `src/driver.jl:815` were read only, as a read-only diagnostic pass.
 
 **Why `ao2mo_2` wins despite the same store-dominated profile (48% store
 share) as `ccsd_t_1`.** Identical flops-per-output-element (32, since both
-have a single contracted index of extent 16) but a 41x smaller/cache-resident
-output; and `StridedBLAS` must additionally pay for two `Strided` permutes
+have a single contracted index of extent 16) but a 256x smaller output by
+element count (16^4 = 65,536 vs 16^6 = 16,777,216; ~129x smaller by total
+operand bytes, 1.05 MB vs 135.3 MB) that is cache-resident rather than L3-
+exceeding; and `StridedBLAS` must additionally pay for two `Strided` permutes
 (66.4% of its own time) plus a 1.05 MB-per-call allocation with a visible GC
 tail at this shape. So QuasiStrided's win at `ao2mo_2` is "avoided the
 temp/permute", not "faster GEMM" — worth distinguishing from the pairwise/

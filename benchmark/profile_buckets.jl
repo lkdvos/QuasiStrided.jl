@@ -23,8 +23,21 @@ const QS_BUCKETS = [
     ("adapter/prepare", ["_qs_prepare", "StridedView", "argcheck", "dimcheck", "mightalias", "tensoroperations.jl"]),
     ("planning", ["plan_contract", "_plan_contract", "AxisGroup", "fill_offsets!", "block_descriptors!", "driver.jl", "axis_group.jl"]),
     ("packing", ["pack_a!", "pack_b!", "_pack_panel!", "_pack_sliver!", "packing.jl"]),
+    # "store" MUST be listed (and therefore matched) before "microkernel":
+    # the store path's own frames (`_store_tile_scattered!`, `tile_store!`,
+    # `tile_offset`, `_axpby_tile!`) live in the same file (kernels/simd.jl)
+    # as the FMA microkernel, so a bare "kernels/" file-path substring on
+    # "microkernel" would swallow them first-match-wins. Found by review
+    # (T6) of an earlier ordering that put "microkernel" first and so
+    # mis-attributed all store cost as arithmetic.
+    (
+        "store",
+        [
+            "store_tile!", "scale_tile!", "_store_tile_scattered!",
+            "tile_store!", "tile_offset", "_axpby_tile!",
+        ],
+    ),
     ("microkernel", ["accumulate", "_execute_micro_tile!", "execute_tile!", "kernels/"]),
-    ("store", ["store_tile!", "scale_tile!"]),
 ]
 
 const BLAS_BUCKETS = [
@@ -52,8 +65,10 @@ _frame_haystack(frame) = string(frame.func) * "|" * string(frame.file)
 function _is_qs_or_kernels_path(frame)
     f = string(frame.file)
     return occursin("QuasiStrided", f) &&
-        (occursin("driver.jl", f) || occursin("axis_group.jl", f) || occursin("kernels/", f) ||
-        occursin("packing.jl", f) || occursin("tensoroperations.jl", f))
+        (
+        occursin("driver.jl", f) || occursin("axis_group.jl", f) || occursin("kernels/", f) ||
+            occursin("packing.jl", f) || occursin("tensoroperations.jl", f)
+    )
 end
 
 function _is_tensoroperations_path(frame)
@@ -141,8 +156,10 @@ regardless of how many samples were sentinels.
 function print_bucket_table(io, caseid, backendname, buckets, total_samples, allocated_bytes, reps)
     denom = sum(values(buckets))
     println(io, "="^72)
-    @printf(io, "case=%s backend=%s reps=%d total_raw_samples=%d classified_samples=%d\n",
-        caseid, backendname, reps, total_samples, denom)
+    @printf(
+        io, "case=%s backend=%s reps=%d total_raw_samples=%d classified_samples=%d\n",
+        caseid, backendname, reps, total_samples, denom
+    )
     @printf(io, "allocated (representative single call): %d bytes\n", allocated_bytes)
     println(io, "-"^72)
     order = backendname == "StridedBLAS" ? BUCKET_ORDER_BLAS : BUCKET_ORDER_QS

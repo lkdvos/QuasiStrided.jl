@@ -701,13 +701,16 @@ and `:tccg` (48 cases x 2 dims) x 2 dtypes. Performance: QuasiStrided wins
 outright on 32/118 cases (real chemistry `:tccg` shapes at dim16, e.g.
 `ao2mo_2` 0.315x BLAS's time), and beats `StridedNative` on 83/118; one
 substantive throughput regression class found -- the four `ccsd_t_*_dim16`
-six-index-output cases, 6.6-11.5x slower than `StridedBLAS` and (uniquely)
-2.8-3.6x slower than plain `StridedNative` too -- triaged by profiling to two
+six-index-output cases, 6.6-14.2x slower than `StridedBLAS` and 2.0-4.4x
+slower than plain `StridedNative` too (the only case class where that
+happens at a non-trivial absolute size) -- triaged by profiling to two
 separable, unverified causes: (A) the vectorized store fast-path guard
-(`src/kernels/simd.jl:217`) is unsatisfiable on the TensorOperations path
-(`src/driver.jl:815` hands it `Memory{T}`, never `Vector{T}`) and so every
-case pays for the scattered-store path unconditionally; (B) `ccsd_t_1`'s
-134.2 MB output has a non-monotonic GEMM-M stride pattern, giving 36-41x
+(`src/kernels/simd.jl:217`) is unsatisfiable for any `Array`-backed
+destination, not just on the TensorOperations path (`src/driver.jl:815`
+hands it `Memory{T}`, never `Vector{T}`, on every plan-construction call)
+and so every case pays for the scattered-store path unconditionally; (B)
+`ccsd_t_1`'s 134.2 MB output has a non-monotonic GEMM-M stride pattern,
+giving 36-41x
 higher per-element store cost than a cache-resident output. Both are read-
 only findings (`src/` was read, not edited) and neither is confirmed by a
 second reviewer.
