@@ -3521,3 +3521,54 @@ not something this milestone acts on unilaterally.
 
 Review budget: one gated pass (independent review, after docs are written),
 `fable_review_storefastpath_used: false` -- not yet spent.
+
+### T1-T3 results and the decision gate
+
+**T1** (`benchmark/probes/`): E1 confirmed empirically -- `parent(StridedView(::Array{T}))`
+is `Memory{T}` (never `Vector{T}`) on this Julia 1.12.6 install, for every
+tested rank/dtype. E2 confirmed -- `SIMD.vload`/`vstore` on `Memory{T}` are
+correct and allocation-free (0 B, measured inside a compiled wrapper function
+to avoid top-level-scope measurement artifacts). **E3 confirmed empirically,
+not just analytically**: zero unit-stride C-side M/N slivers across all four
+`ccsd_t_*` equations x both dtypes at `dim=16` -- the row stride is always
+4096 (`i`'s stride), never 1. Julia 1.10 LTS is installed locally via
+`juliaup` but requires its own `Pkg.instantiate()` to test directly (deferred
+to CI's `lts` matrix entry, per this milestone's own decision boundaries);
+Julia 1.10's behavior is otherwise established by direct reading of
+`StridedViews.jl`'s source (E1), not merely inferred.
+
+**T2** (`benchmark/bench_store_path.jl`): the core deliverable for the gate.
+`Memory{T}` (D-mem, today's real path) costs **~4-5x more per element to
+store than `Vector{T}`** (D-vec, today's fast path) when rows ARE
+unit-stride -- a consistent ~1.8-2.3 ns/element gap across all 4 kernel
+shapes x 2 `kc` values x both beta regimes, far above the 3.7% canary noise
+floor. Zero unexpected allocation in any of the 144 measured cells.
+Separately, D-strided-hot/cold (non-unit-stride rows, approximating the
+actual `ccsd_t_*` addressing pattern) cost 8-25 ns/element **regardless of
+storage type** -- confirming the storage-type gap and the regression are
+orthogonal, exactly as E3 predicts.
+
+**T3** (`benchmark/bench_ccsd_t_store.jl`, smoke-tested at `dim=8` only):
+zero correctness mismatches across all three arms. Arm 3 (a label-order
+control, out of this milestone's scope to act on) showed a notable speedup
+at `dim=8` on 3 of 4 cases, but the script's own on-the-record analysis
+shows the effect's sign is `dim`-vs-`MR`/`NR`-dependent, not a clean win --
+flagged for the coordinator to check again at `dim=16` if a future milestone
+picks up the label-order lever; **not** investigated further here per the
+frozen non-goal.
+
+**Gate decision: (a) fix.** All three conditions from the decision
+boundaries above are met: (1) `SIMD` is correct and allocation-free on
+`Memory{T}` (T1); (2) E3 is confirmed, so the fix is not motivated by a
+false belief that it closes the `ccsd_t_*` regression -- it does not, and
+the docs must say so plainly (T1/T3); (3) T2 shows a real, consistent,
+above-noise gain at every shipped/swept register shape from a genuine
+`Vector`/`Memory` destination taking the fast path. Proceeding to **T4**:
+widen `src/kernels/simd.jl:217`'s guard from `destination.storage isa
+Vector{T}` to a `DenseVector{T}` check (covering `Memory{T}` too, per D2),
+with a statically-indexed tail body (per E6) verified allocation-free at
+`NV` up to 28 with tail rows, on Julia >= 1.11. This will speed up ordinary
+(unit-stride-destination) contractions on Julia 1.12; it will not move the
+`ccsd_t_*_dim16` regression at all, and the docs close-out (T7) must state
+that explicitly so nobody reads a future `Pkg.test()`-adjacent benchmark
+re-run as evidence either way for that specific case class.
