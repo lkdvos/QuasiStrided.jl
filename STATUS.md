@@ -411,12 +411,84 @@ Still deferred (see README "Not implemented" and `docs/decisions.md`):
 threading (state is still organized to not preclude it, but note
 `PackedPanel`/`PtrScatterAxis` borrow pointers into workspace buffers, so a
 threaded driver must keep the `GC.@preserve` and the per-worker split of the
-M-side state consistent), autotuning across shapes, GPU, complex-arithmetic
-methods, K padding, orientation swap, `tensoradd!`/`tensortrace!`. T15 (an
-optional upstream docs PR to TensorOperations.jl) remains unstarted.
+M-side state consistent), autotuning across shapes, GPU, K padding,
+orientation swap, `tensoradd!`/`tensortrace!`. T15 (an optional upstream docs
+PR to TensorOperations.jl) remains unstarted. **Complex-arithmetic methods are
+no longer deferred** -- they are the open milestone below; what stays out of
+scope there is 3m, mixed real/complex operands, and writing into a conjugated
+output `C`.
 
 **BLIS microkernels stay closed** (Phase G): all of `blis_jll` 0.9/1.0/2.0
 ship the asm kernels and `bli_cntx_get_*` as local symbols only, so `dlsym`
 cannot reach them. **LoopVectorization.jl was considered and rejected** as a
 dependency (grant-funded maintenance, compiler-fragile, and unnecessary — the
 addressing idea was reproduced with zero new dependencies).
+
+## Complex element-type milestone — open
+
+Opened 2026-09-14 on branch/worktree `complex`, base `114e594`. Goal: support
+`ComplexF32`/`ComplexF64` end to end — engine and `QuasiStridedBackend` — with
+two switchable microkernel methods, and discharge the conjugation invariant that
+has blocked this since the TensorOperations milestone.
+
+Full design, every frozen decision, and the reasoning behind each rejected
+alternative are in `docs/decisions.md`, "Complex element-type milestone: Phase A
+direction freeze" and "Amendment 3" — **that file, not this one, is
+authoritative for *why***. This section is only *what phase, what count*.
+
+Direction in one paragraph: planar (split-complex, BLIS "1r", a genuinely
+complex microkernel issuing four real FMAs with no shuffles) is the
+unconditional default; 1m (Van Zee's induced method — the *existing real kernel*
+over `2*kc` real steps, fed by "1e"-packed A) is selectable by naming the
+kernel; 3m is out. The design is taken from the user's sibling project
+`tensorcontract-rs`, which was built to measure exactly these methods and whose
+refutations are binding here — in particular that **the method ranking does not
+transfer between machines** (four orderings measured on four machines), so no
+auto-dispatch rule is derived from any sweep and every ratio names `ccqlin038`.
+
+Review budget: two gated passes, one Fable scoped to the conjugation/`op`
+semantics and the frozen-record amendment (a wrong `_op_conjugates` entry is a
+silent wrong answer, which is this package's worst failure mode), then one
+Sonnet-High over everything since Phase A. Neither is spent yet;
+`fable_review_complex_used: false`.
+
+- [x] **Phase A** (direction freeze): `docs/decisions.md` milestone section +
+      Amendment 3 + the second addendum to the frozen argcheck order;
+      `STATUS.md` entry; `src/complex_format.jl` (new) with declarations and
+      total real-side defaults only — `PackFormat`/`ComplexMethod` singletons,
+      `reals_per_element`, `a_reals`/`b_reals`/`accumulator_planes`,
+      `ComplexKernelDescriptor` and its accessors, and the
+      `realtype`/`packed_a_per_k`/`packed_b_per_k`/`complex_method` defaults
+      plus `DescriptorKernel` forwarders that keep every generic total. **No
+      behaviour**: `git diff` touches no existing function body, and the only
+      edit to an existing source file is one `include` line in
+      `src/QuasiStrided.jl`.
+- [ ] **Phase B** (five-way parallel, disjoint files, all depending on A only):
+      **B1** plumbing (`src/workspace.jl`, `src/driver.jl`, `src/blocking.jl`) —
+      the `VT` bound relaxation, `realtype`-driven buffer allocation, the four
+      `_sliver_panel` call sites, `_pack_sliver!`'s `TF` parameter,
+      `ContractPlan`'s `TA`/`TB`, the complex shape rule and menus, and the
+      3-argument `default_blocking`. `src/driver.jl` is **exclusive** to B1.
+      **B2** packing (additive only; `_pack_panel!` untouched). **B3** the
+      planar kernel. **B4** the adapter. **B5** adapter tests, authored blind
+      against the Phase A freeze.
+- [ ] **Phase C** (integration): merge B1–B5, wire the default complex kernel,
+      budget one reconciliation.
+- [ ] **Phase D** (1m).
+- [ ] **Phase E** (remaining test layers, four disjoint files in parallel).
+- [ ] **Phase F** (measurement on `ccqlin038`).
+- [ ] **Phase G** (the two gated reviews).
+- [ ] **Phase H** (close: `docs/decisions.md`, this file, `README.md`).
+
+**Test count at Phase A open: 13299/13299** (Julia 1.12.6). B1's acceptance
+criterion is that this number is unchanged *and* that
+`benchmark/bench_default_vs_legacy.jl` stays inside the canary spread, with no
+complex kernel wired in — B1 is the real-path guard and it lands first.
+
+Two notes for anyone picking this up on a fresh checkout of this worktree.
+`Manifest.toml` is gitignored, so the environment must be resolved before
+anything runs. And on the *first* full run after that, Aqua's
+`test_persistent_tasks` can fail on a timeout: it loads the package in a
+subprocess, which on a cold depot has to precompile first (observed here at
+2m24s, against 5.5s once warm). It is not a real failure — re-run the suite,
+and check it in isolation before believing it.

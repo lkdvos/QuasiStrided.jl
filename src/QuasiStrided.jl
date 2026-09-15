@@ -12,6 +12,9 @@ include("axis_group.jl")
 # --- Phase 2: tiles, packing, scalar kernel ---
 include("kernel_descriptor.jl")
 
+# --- Complex milestone: packed formats, methods, the complex descriptor ---
+include("complex_format.jl")
+
 include("panel.jl")
 
 include("tiles.jl")
