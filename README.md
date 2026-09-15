@@ -265,4 +265,8 @@ head-to-head comparison against `StridedNative`/`StridedBLAS` on identical
 shapes, single machine: `StridedBLAS()` wins on every measured shape/dtype
 point (2.4x-10.9x faster than `QuasiStridedBackend()`), which is the evidence
 behind leaving `select_backend` unhooked above; `QuasiStridedBackend()` in
-turn beats `StridedNative()` by 5.3x-18.7x on every shape.
+turn beats `StridedNative()` by 5.3x-18.7x on every shape. A second,
+preparatory comparison against TensorOperations.jl's own (unmerged, PR #303)
+upstream benchmark suite lives in `benchmark/bench_to_suite.jl`; see
+`docs/decisions.md`'s "Upstream TensorOperations.jl benchmark suite
+comparison" section for the measured numbers.

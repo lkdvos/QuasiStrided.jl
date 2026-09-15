@@ -3398,3 +3398,267 @@ alongside. A test verifies every resolved shape constructs at the shape asked
 for, which is the invariant that matters -- `_complex_kernel_from_shape` falls
 through to the menu tail on no match, so a row absent from the menu would
 silently build a different kernel.
+
+## Upstream TensorOperations.jl benchmark suite comparison: preparatory milestone
+
+Written on branch `upstream-bench` (base `114e594`), covering T0-T8. T3
+(three-way measurement) and T5 (profiling triage) are the substantive tasks;
+this section is their record.
+
+### Motivation and scope
+
+TensorOperations.jl PR #303 (`QuantumKitHub/TensorOperations.jl#303`, branch
+`benchmark`, commit `528dd85d8bf886c734a207732a7cb591a3691dd3`, **unmerged**)
+adds a standardized `TensorOperationsBenchmarks` suite with case categories
+(`:pairwise`, `:tccg`, `:permute`, `:trace`, `:mixed_precision`, `:mps`,
+`:ctmrg`, `:trg`). This milestone is **preparatory**: get a working three-way
+comparison (`StridedNative`/`StridedBLAS`/`QuasiStrided`) running against that
+suite's `:pairwise` and `:tccg` categories only, plus an initial profiling
+triage on four cases drawn from that run. No engine change was made anywhere
+in this milestone.
+
+Stated plainly because it is easy to miss later: the dependency is pinned to
+the **unmerged PR's exact commit SHA** via `benchmark/Project.toml`'s
+`[sources]` table, not to a registered release (PR #303 has no release).
+**Repointing to the registered release once the PR merges is an explicit,
+unstarted follow-up** — nothing here depends on the PR's diff surviving
+review unchanged, but the case generators (`_pairwise_cases`,
+`_tccg_cases`) and the `within_memory_budget`/`MAX_CASE_BYTES` filter used
+below are read directly from that pinned commit and could change before
+merge.
+
+### The composite backend (`benchmark/composite_backend.jl`)
+
+The upstream suite's `AbstractProvider` interface takes exactly one
+`backend` per provider, but its category list spans both operations
+`QuasiStridedBackend` implements (`tensorcontract!`) and operations it does
+not (`tensoradd!`/`tensortrace!`, needed for `:permute`/`:trace`/etc.).
+`QuasiStridedComposite{F<:AbstractBackend} <: AbstractBackend` exists purely
+to give the suite's one-backend-per-provider interface something to point
+at:
+
+- `tensorcontract!` dispatches to `QuasiStridedBackend()` **unconditionally**
+  — an ineligible contraction still throws exactly as it would through the
+  real backend, verified (this milestone's 118 cases pass through this path
+  and none of them throw; see the T3 correctness finding below).
+- `tensoradd!`/`tensortrace!` dispatch to `backend.addtrace`, which defaults
+  to `StridedNative()`, because `QuasiStridedBackend` does not implement
+  these operations at all — not as a performance choice.
+
+**This does not change `QuasiStridedBackend`'s frozen hard-reject/no-fallback
+invariant** (see "Hard-reject, never fall back" above, in the TensorOperations
+integration milestone's Phase A freeze). `QuasiStridedComposite` is a
+benchmark-only wrapper one level up from `QuasiStridedBackend`; it must not
+migrate into `src/` — that would reverse a frozen product decision, and the
+source comment in `composite_backend.jl` says so explicitly.
+
+**Hazard flagged for future readers, not yet materialized.** Any timing taken
+under `QuasiStridedComposite` for an add/trace/permute operation measures
+`StridedNative` (the `addtrace` field), *not* QuasiStrided — a future
+`:permute`/`:trace`/`:mps`/etc. run using this same composite must label
+results accordingly. This pass never times those categories (only
+`:pairwise`/`:tccg`, both pure contractions), so the hazard did not
+materialize here, but it is recorded because the next milestone to touch this
+file may not re-read this reasoning.
+
+### T3 measurement results
+
+**Run metadata.** `ccqlin038.flatironinstitute.org`, 2026-09-15, Julia
+1.12.6, this repo's commit `3b864afd57c151ecf7b07a810cadd8d59c711275` (per
+`PROVENANCE_to_suite.txt`, matching this branch's "Add benchmark env +
+composite backend" commit), `TensorOperationsBenchmarks` pinned rev
+`528dd85d8bf886c734a207732a7cb591a3691dd3`, `TensorOperations` resolved
+version 5.8.1, `nthreads=1`, `blas_threads=1`, 21 reps (median, one discarded
+warm-up). Single machine, **not exclusive**: `machine_load_at_run` recorded
+`load average: 1.61, 1.93, 2.86` with other `julia`/`herdr`/`claude`
+processes visible in `top_processes_at_run` at the time of the run. Full
+provenance and raw CSV in
+`benchmark/results/ccqlin038.flatironinstitute.org-2026-09-15/` (gitignored;
+see the numbers inlined here and below for anything load-bearing).
+
+**Canary.** StridedBLAS 64³ Float64 `@tensor` matmul, 15 reps, taken at
+start/middle/end of the sweep: medians `[6.021e-6, 5.891e-6, 5.651e-6]` s,
+relative spread `(max-min)/min = 6.55%`. Noise floor used:
+`max(10%, canary spread) = 10.0%` — read any ratio smaller than that as
+noise, not as a result.
+
+**Case counts.** 11 of a nominal 15 `:pairwise` cases (dims {15, 63, 128}) —
+upstream's own `within_memory_budget` filter (`registry.jl`'s
+`MAX_CASE_BYTES = 256 MiB`, Float64-assumed) drops `dim63_2_2_2`,
+`dim128_2_1_2`, `dim128_2_2_2`, `dim128_1_3_1`; this is **upstream's filter**,
+not a trim this project applied. 48 `:tccg` cases (24 real quantum-chemistry
+contraction specs — `ccsd_*`, `ccsd_t_*`, `ao2mo_*`, `intensli_*` — at dims
+{8, 16}). Both dtypes: 118 total cases, 354 timed backend-rows.
+
+**Correctness: zero mismatches, zero rejections.** All 118 cases pass
+`isapprox` against `StridedBLAS` at rtol `1e-10` (Float64) / `1e-5`
+(Float32); `mismatches_to_suite.txt` records 0. Zero backend
+rejections/throws on any case, **including** the pure-outer-product
+`(1,0,1)` pairwise shapes (`dim15_1_0_1`, `dim63_1_0_1`, `dim128_1_0_1`,
+`ncontract=0`) and all 4-6-index chemistry shapes (`ccsd_t_*`'s six-index
+outputs among them). This is a positive correctness finding for
+`src/tensoroperations.jl` on shapes it had not previously been measured
+against — the TensorOperations integration milestone's T9 benchmark used
+plain-matmul and shallow-K shapes only.
+
+**Geomean ratios** (from `bench_to_suite.csv`/`summary_to_suite.txt`,
+QS/BLAS and Native/QS, geometric mean):
+
+| category | dtype | n | QS/BLAS | Native/QS |
+| --- | --- | --- | --- | --- |
+| pairwise | Float64 | 11 | 4.293 | 2.586 |
+| tccg | Float64 | 48 | 1.774 | 2.068 |
+| pairwise | Float32 | 11 | 6.844 | 3.241 |
+| tccg | Float32 | 48 | 1.780 | 2.431 |
+
+QuasiStrided beats `StridedBLAS` outright in 32/118 cases; is within-noise-
+or-better (ratio <= 1.1x) in 39/118; beats `StridedNative` in 83/118.
+
+**Best wins** (Float64, `:tccg` dim16, QS/BLAS ratio, lower is better for
+QuasiStrided): `ao2mo_2` 0.315x, `ao2mo_3` 0.323x, `ccsd_3` 0.372x,
+`intensli_1` 0.450x, `ccsd_8` 0.508x, `ccsd_6` 0.509x.
+
+**The one substantive throughput finding: the `ccsd_t_*_dim16` regression
+class.** The four `ccsd_t_*_dim16` cases (six-index output, CCSD(T)-shaped
+contractions) are 6.6-11.5x slower than `StridedBLAS` across both dtypes,
+and — uniquely among all 118 cases at a non-trivial absolute size — 2.8-3.6x
+slower than plain `StridedNative`. Concretely, `ccsd_t_1_dim16`:
+
+| dtype | StridedNative | StridedBLAS | QuasiStrided | QS/BLAS |
+| --- | --- | --- | --- | --- |
+| Float64 | 0.527 s | 0.186 s | 1.883 s | 10.110 |
+| Float32 | 0.324 s | 0.124 s | 1.425 s | 11.509 |
+
+(`summary_to_suite.txt`: Float64 section lines 235-239, Float32/tccg section
+lines 536-540.)
+
+Many small `:pairwise`/`:tccg` cases sit at a flat QuasiStrided per-call floor
+of roughly 5-25 µs regardless of how little arithmetic the case does — worst
+example, Float32 `dim63_1_0_1` (a ~450-8k-flop outer product): QuasiStrided
+14.3 µs vs StridedBLAS's 0.50 µs, 28.5x slower. This is consistent with, and
+further evidence for, the pre-existing "packing plus per-call overhead
+dominates small shapes" finding already on record (STATUS.md's "Next task"
+section, and this file's Phase H/"Where the remaining gap actually is").
+
+Best absolute QuasiStrided throughput seen in this run: 75.5 GFLOP/s
+(`ccsd_9_dim16`, Float32) against `StridedBLAS`'s 58.5 GFLOP/s at the same
+case.
+
+### T5 profiling triage results
+
+Four cases profiled, each on both `QuasiStridedComposite` and `StridedBLAS`:
+`ccsd_t_1_dim16`, `ao2mo_2_dim16`, `dim15_2_2_2` (the known small-shape
+pattern), and `ccsd_t_1_dim16_f32` (the Float32 repeat of the regression
+case). Artifacts: `benchmark/results/ccqlin038.flatironinstitute.org-2026-09-15/profiles/{buckets_summary.txt, *.flat.txt, *.tree.txt}`.
+
+**Instrument caveat, read before the numbers below.** `compute_buckets`
+classifies only leaf frames into named buckets (`microkernel`, `packing`,
+`store`, `blas`, etc.); the scattered-store code path's leaves — in
+`SIMD/src/LLVM_intrinsics.jl`, `QuasiStrided/src/kernel.jl`, `src/tiles.jl` —
+don't match any bucket substring, so they land in `other` alongside real
+idle-thread sampling noise (`buckets_summary.txt`'s `ccsd_t_1_dim16`
+QuasiStridedComposite row: `store 0.00%`, `other 91.15%`). Read the bucket
+tables' `other` row at face value and you would conclude nothing costly is
+happening; it is. The quantitative claims below instead come from the
+`.tree.txt`/`.flat.txt` inclusive-count profiles, normalized to the
+compute-thread root, not from the raw bucket percentages.
+
+**Verdict: two different mechanisms, not one.** `dim15_2_2_2`'s loss and
+`ccsd_t_1_dim16`'s loss are **not** the same story.
+
+- `dim15_2_2_2` (the known small-shape pattern): microkernel `accumulate`
+  (FMA) is 46.63% of QuasiStrided's own time, packing 16.12%, store 21.22% —
+  the already-documented "real arithmetic dominates, packing plus per-call
+  overhead adds a multiplier" story. QuasiStrided's microkernel time alone
+  (2.587e-4 s) is ~0.85x of StridedBLAS's **entire** GEMM time (3.056e-4 s)
+  at this shape.
+- `ccsd_t_1_dim16`: `store_tile!`/`_store_tile_scattered!` is 75.30%
+  (Float64) / 88.36% (Float32) of QuasiStrided's time; the FMA microkernel is
+  0.40%/0.24%; packing is 0.02%/0.03%. Essentially no arithmetic or packing
+  cost at all — this is an output-store problem, full stop.
+
+**Two separable causes found for the store cost, both cited to a specific
+location.** Neither was fixed or modified — both `src/kernels/simd.jl:217`
+and `src/driver.jl:815` were read only, as a read-only diagnostic pass.
+
+- **Cause A: the vectorized store fast-path guard is unsatisfiable on the
+  TensorOperations path.** `src/kernels/simd.jl:217`'s guard —
+  `_unit_stride_rows(destination.rows) && destination.storage isa Vector{T}`
+  — never passes on this path: `src/driver.jl:815` sets `Cstorage =
+  parent(C)` where `C::StridedView`, and `parent` of a `StridedView` wrapping
+  a plain `Array` resolves to `Memory{T}` on Julia 1.12, never `Vector{T}`
+  (confirmed by a direct read-only probe,
+  `profiles/T5_probe_storage_type.jl`/`.txt`, run on this same machine/Julia
+  for ranks 1, 2, 4, 6 — all four report `parent(StridedView(C))::Memory{T}`,
+  `isa Vector{T} = false`). Zero `vstore` samples appeared in any of the 8
+  profiles taken. Consequence: **every** case in this run — including
+  cache-resident ones like `dim15_2_2_2`, whose M direction is in fact
+  contiguous and would satisfy `_unit_stride_rows` — pays for the scattered-
+  store path unconditionally on the TO adapter path. This is a shape/rank-
+  independent tax, not something that only bites `ccsd_t_1`.
+
+  **This SUGGESTS, but does not yet verify**, that STATUS.md's existing
+  "packing plus per-call cost is the whole gap" attribution (measured with
+  the microkernel benchmarked in isolation — see STATUS.md's "Next task" and
+  this file's Phase H sections) may have been handed a real `Vector` in that
+  isolated benchmarking context, and so never exercised this scattered-store
+  path at all. If so, the isolated-microkernel numbers and the TO-adapter
+  numbers measured in this milestone may not be measuring the same store code
+  path. **Stated as an open, unverified hypothesis, not a conclusion** — no
+  attempt was made in this milestone to re-run the isolated microkernel
+  benchmark and check its own `destination.storage` type.
+
+- **Cause B: `ccsd_t_1`'s destination has a cache/TLB-unfriendly stride
+  pattern, independent of Cause A.** `C[a,b,c,i,j,k]` is 134.2 MB (Float64) —
+  this machine's L3 is 25,952,256 bytes (`PROVENANCE_to_suite.txt`/machine
+  info; L3 far smaller than the output) — and its GEMM-M composite axis
+  `(i,j,a)` has a non-monotonic C-stride pattern `(4096, 65536, 1)`. Per-
+  element store cost measured at 84.5 ns (Float64) / 75.1 ns (Float32),
+  versus 2.05-2.33 ns on cache-resident outputs (`ao2mo_2`, `dim15_2_2_2`) —
+  a 36-41x per-element blow-up. Attributed **by interpretation**, not
+  hardware performance counters, to cache/TLB-unfriendly access. Confirmed
+  dtype-independent via the Float32 repeat (`ccsd_t_1_dim16_f32`): same
+  dominant bucket, same top leaf frame (`SIMD extractelement`), byte-
+  identical 5792-byte-per-call allocation as the Float64 case.
+
+**Why `ao2mo_2` wins despite the same store-dominated profile (48% store
+share) as `ccsd_t_1`.** Identical flops-per-output-element (32, since both
+have a single contracted index of extent 16) but a 41x smaller/cache-resident
+output; and `StridedBLAS` must additionally pay for two `Strided` permutes
+(66.4% of its own time) plus a 1.05 MB-per-call allocation with a visible GC
+tail at this shape. So QuasiStrided's win at `ao2mo_2` is "avoided the
+temp/permute", not "faster GEMM" — worth distinguishing from the pairwise/
+tccg wins tabulated above, none of which come from a faster microkernel.
+
+**Recommendation, as given: a further broad blind profiling sweep is NOT
+warranted.** The two named, separable, directly-testable causes above are
+worth a targeted next milestone instead of a wider sweep. Two proposed cheap
+checks:
+
+1. Confirm/refute whether `store_tile!`'s `Vector{T}` guard is ever
+   satisfiable *anywhere* in the package as currently used — a static/dynamic
+   check, no benchmarking required. If never, every existing packing-vs-
+   kernel decomposition claim in this file needs re-reading against which
+   store path it actually measured.
+2. Re-time the four `ccsd_t_*_dim16` cases against a control case differing
+   only in having a cache-resident output, to separate Cause A's contribution
+   (shape/rank-independent tax) from Cause B's (this specific stride
+   pattern's cache/TLB cost).
+
+**These are unverified findings from a diagnostic pass, not fixes, and not
+yet confirmed by a second reviewer.** `src/kernels/simd.jl:217` and
+`src/driver.jl:815` were read, not modified; no attempt was made in this
+milestone to fix or test the fast-path guard.
+
+### Follow-ups, explicitly out of scope for this milestone
+
+- Repointing the `TensorOperationsBenchmarks` dependency once PR #303 merges
+  or is released, replacing the pinned-commit `[sources]` entry.
+- Investigating/fixing the `store_tile!` `Vector{T}` vs `Memory{T}` guard
+  (Cause A above).
+- Any engine change targeting the `ccsd_t_*` six-index-output regression
+  class (Cause B above).
+- Running the remaining upstream categories: `:permute`, `:trace`,
+  `:mixed_precision`, `:mps`, `:ctmrg`, `:trg`.
+- A wider profiling sweep — explicitly not recommended by this triage (see
+  "Recommendation, as given" above).

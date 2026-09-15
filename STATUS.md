@@ -652,3 +652,71 @@ anything runs. And on the *first* full run after that, Aqua's
 subprocess, which on a cold depot has to precompile first (observed here at
 2m24s, against 5.5s once warm). It is not a real failure — re-run the suite,
 and check it in isolation before believing it.
+
+## Upstream TensorOperations.jl benchmark-suite comparison -- preparatory, complete
+
+Opened 2026-09-15 on branch `upstream-bench`, base `71c1536`. Goal: a working
+three-way (`StridedNative`/`StridedBLAS`/`QuasiStrided`) comparison driven by
+TensorOperations.jl PR #303's unmerged `TensorOperationsBenchmarks` suite
+(`:pairwise` + `:tccg` categories only), plus a first-look profiling triage.
+No engine change; this is a **preparatory milestone**, not an optimization
+pass. Full design, every measured number, and the profiling triage's
+SHOWS/SUGGESTS reasoning are in `docs/decisions.md`, "Upstream
+TensorOperations.jl benchmark suite comparison: preparatory milestone" --
+that file, not this one, is authoritative for *why*.
+
+- [x] **T0** (scouting): upstream API + dependency fact-finding, read-only.
+- [x] **T1** (`benchmark/Project.toml`): pinned `TensorOperationsBenchmarks`
+      to PR #303's unmerged commit via `[sources]`.
+- [x] **T2** (`benchmark/composite_backend.jl`): benchmark-only
+      `QuasiStridedComposite`, does not touch `QuasiStridedBackend`'s frozen
+      hard-reject invariant.
+- [x] **T3** (`benchmark/bench_to_suite.jl` + measurement run): 118 cases,
+      354 timed rows, 21 reps, `ccqlin038.flatironinstitute.org` 2026-09-15.
+      Zero mismatches, zero backend rejections.
+- [x] **T4** (`benchmark/profile_to_suite.jl`): bucketed profiling tool.
+- [x] **T5** (profiling triage): 4 cases profiled x 2 backends. Two
+      separable causes found for the `ccsd_t_*_dim16` regression, both
+      unverified/untested.
+- [x] **T7** (this entry + the `docs/decisions.md` section).
+- [ ] **T6** (independent review) -- not yet run.
+- [ ] **T8** (address T6 findings, commit, PR) -- not yet run.
+
+**Milestone (T0-T5, T7) is complete as a preparatory milestone.** T6/T8
+(review and any resulting fix-ups/PR) are the coordinator's next step, not
+part of this section's scope.
+
+### What shipped
+
+`benchmark/Project.toml` (new; pins `TensorOperationsBenchmarks` to PR #303's
+commit `528dd85d8bf886c734a207732a7cb591a3691dd3`), `benchmark/composite_backend.jl`
+(new), `benchmark/bench_to_suite.jl` (new), `benchmark/profile_to_suite.jl`
+(new).
+
+### Measured
+
+Correctness: clean -- 0/118 mismatches (rtol 1e-10 F64 / 1e-5 F32 against
+`StridedBLAS`), 0 backend rejections, across `:pairwise` (11 cases x 3 dims)
+and `:tccg` (48 cases x 2 dims) x 2 dtypes. Performance: QuasiStrided wins
+outright on 32/118 cases (real chemistry `:tccg` shapes at dim16, e.g.
+`ao2mo_2` 0.315x BLAS's time), and beats `StridedNative` on 83/118; one
+substantive throughput regression class found -- the four `ccsd_t_*_dim16`
+six-index-output cases, 6.6-11.5x slower than `StridedBLAS` and (uniquely)
+2.8-3.6x slower than plain `StridedNative` too -- triaged by profiling to two
+separable, unverified causes: (A) the vectorized store fast-path guard
+(`src/kernels/simd.jl:217`) is unsatisfiable on the TensorOperations path
+(`src/driver.jl:815` hands it `Memory{T}`, never `Vector{T}`) and so every
+case pays for the scattered-store path unconditionally; (B) `ccsd_t_1`'s
+134.2 MB output has a non-monotonic GEMM-M stride pattern, giving 36-41x
+higher per-element store cost than a cache-resident output. Both are read-
+only findings (`src/` was read, not edited) and neither is confirmed by a
+second reviewer.
+
+### Still out of scope
+
+Repointing `TensorOperationsBenchmarks` to a registered release once PR #303
+merges; fixing the `store_tile!` `Vector{T}`/`Memory{T}` guard (Cause A);
+any engine change for the `ccsd_t_*` regression class (Cause B); the
+remaining upstream categories (`:permute`, `:trace`, `:mixed_precision`,
+`:mps`, `:ctmrg`, `:trg`); a wider profiling sweep (not recommended by T5's
+own triage).
