@@ -3,15 +3,16 @@
 # `TensorOperationsBenchmarks` suite's `:pairwise`/`:tccg` categories.
 #
 # This is a STANDALONE profiling script, not a benchmark: it does not depend
-# on `benchmark/bench_to_suite.jl` (a sibling task, concurrently under
-# development) at all. Instead it profiles a small, hand-edited `CASES` list
-# defined below. Once `bench_to_suite.jl` has produced real timing results,
-# the coordinator/triage task should REPLACE the 4 example cases below with
-# the specific cases found interesting there (e.g. worst QuasiStrided/BLAS
-# slowdown, a near-parity case, etc.) -- the 4 shipped here are PLACEHOLDER
-# EXAMPLES only, chosen to exercise a plain-matmul-like :pairwise shape, a
-# multi-index :tccg shape (mirroring TCCG's `ccsd_2`), a larger plain-matmul
-# shape, and one Float32 case.
+# on `benchmark/bench_to_suite.jl` at build/run time. Instead it profiles a
+# small, hand-edited `CASES` list defined below. The 4 cases currently listed
+# are the T5 triage set, chosen from `bench_to_suite.jl`'s (T3's) three-way
+# run results (see benchmark/results/ccqlin038.flatironinstitute.org-2026-09-15/
+# summary_to_suite.txt): the worst substantive QuasiStrided/BLAS loss
+# (tccg/ccsd_t_1_dim16), the best QuasiStrided win (tccg/ao2mo_2_dim16), the
+# known small-shape overhead pattern (pairwise/dim15_2_2_2), and a Float32
+# repeat of the worst-loss shape to separate dtype- from shape-sensitivity.
+# Every IA/IB/IC/dims triple was read out of the upstream generators
+# themselves, not hand-written -- see the CASES comments below.
 #
 # Usage:
 #   julia --project=benchmark benchmark/profile_to_suite.jl
@@ -57,37 +58,59 @@ include(joinpath(@__DIR__, "composite_backend.jl"))
 include(joinpath(@__DIR__, "profile_buckets.jl"))
 
 # ---------------------------------------------------------------------------
-# CASES -- PLACEHOLDER EXAMPLES, replace once bench_to_suite.jl results exist.
+# CASES -- the T5 triage set (see header comment above).
 # ---------------------------------------------------------------------------
 
 const CASES = [
-    # 1. Small :pairwise-style plain matmul: C[a1,b1] = A[a1,c1] * B[c1,b1].
+    # The 4 cases below are the T5 triage set, chosen from T3's three-way run
+    # (benchmark/results/ccqlin038.flatironinstitute.org-2026-09-15/
+    # summary_to_suite.txt). Every IA/IB/IC/dims triple was read out of the
+    # upstream generators themselves --
+    #   TensorOperationsBenchmarks._tccg_cases((16,)) / ._pairwise_cases((15,))
+    # then `case.spec.IA` / `.IB` / `.IC` / `.dims` -- not hand-written, so the
+    # shapes here are byte-identical to the ones bench_to_suite.jl timed.
+    #
+    # 1. tccg/ccsd_t_1_dim16 -- worst substantive throughput loss in T3:
+    #    QS/BLAS = 10.110, Native/QS = 0.280 (the only class where QuasiStrided
+    #    loses to StridedNative at a non-trivial absolute size).
+    #    C[a,b,c,i,j,k] = A[i,j,m,a] * B[m,k,b,c]; single contracted index m.
     (
-        id = "pairwise_small_63",
-        IA = [:a1, :c1], IB = [:c1, :b1], IC = [:a1, :b1],
-        dims = Dict(:a1 => 63, :b1 => 63, :c1 => 63),
+        id = "ccsd_t_1_dim16",
+        IA = [:i, :j, :m, :a], IB = [:m, :k, :b, :c],
+        IC = [:a, :b, :c, :i, :j, :k],
+        dims = Dict(
+            :i => 16, :j => 16, :m => 16, :a => 16, :k => 16, :b => 16, :c => 16
+        ),
         dtype = Float64,
     ),
-    # 2. :tccg-style multi-index case, mirroring TCCG's `ccsd_2`
-    #    (C[i,j] = A[i,k,l] * B[l,j,k]).
+    # 2. tccg/ao2mo_2_dim16 -- best QuasiStrided win in T3: QS/BLAS = 0.315.
+    #    C[a,b,r,s] = A[q,b] * B[a,q,r,s]; single contracted index q.
     (
-        id = "tccg_ccsd2_16",
-        IA = [:i, :k, :l], IB = [:l, :j, :k], IC = [:i, :j],
-        dims = Dict(:i => 16, :j => 16, :k => 16, :l => 16),
+        id = "ao2mo_2_dim16",
+        IA = [:q, :b], IB = [:a, :q, :r, :s], IC = [:a, :b, :r, :s],
+        dims = Dict(:q => 16, :b => 16, :a => 16, :r => 16, :s => 16),
         dtype = Float64,
     ),
-    # 3. Larger :pairwise-style plain matmul.
+    # 3. pairwise/dim15_2_2_2 -- the known small-shape overhead pattern
+    #    (QS/BLAS = 1.710 Float64), GEMM-like with rank-4 operands.
+    #    C[a1,a2,b1,b2] = A[a1,a2,c1,c2] * B[c1,c2,b1,b2].
     (
-        id = "pairwise_large_256",
-        IA = [:a1, :c1], IB = [:c1, :b1], IC = [:a1, :b1],
-        dims = Dict(:a1 => 256, :b1 => 256, :c1 => 256),
+        id = "dim15_2_2_2",
+        IA = [:a1, :a2, :c1, :c2], IB = [:c1, :c2, :b1, :b2],
+        IC = [:a1, :a2, :b1, :b2],
+        dims = Dict(:a1 => 15, :a2 => 15, :c1 => 15, :c2 => 15, :b1 => 15, :b2 => 15),
         dtype = Float64,
     ),
-    # 4. Float32 example (same shape family as case 1, single precision).
+    # 4. tccg/ccsd_t_1_dim16 again, at Float32 (QS/BLAS = 11.509 in T3) --
+    #    same shape as case 1, so the pair isolates dtype-sensitivity from
+    #    shape-sensitivity.
     (
-        id = "pairwise_small_63_f32",
-        IA = [:a1, :c1], IB = [:c1, :b1], IC = [:a1, :b1],
-        dims = Dict(:a1 => 63, :b1 => 63, :c1 => 63),
+        id = "ccsd_t_1_dim16_f32",
+        IA = [:i, :j, :m, :a], IB = [:m, :k, :b, :c],
+        IC = [:a, :b, :c, :i, :j, :k],
+        dims = Dict(
+            :i => 16, :j => 16, :m => 16, :a => 16, :k => 16, :b => 16, :c => 16
+        ),
         dtype = Float32,
     ),
 ]
