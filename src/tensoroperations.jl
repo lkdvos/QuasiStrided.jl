@@ -24,12 +24,23 @@ macro-blocking engine ([`QuasiStrided.contract!`](@ref)):
     @tensor backend = QuasiStridedBackend() C[i, j] := A[i, k] * B[k, j]
 
 Contraction only, and only for strided operands sharing a single element type
-out of `Float32`/`Float64`; everything else (`TensorOperations.tensoradd!`,
-`TensorOperations.tensortrace!`, mixed or unsupported eltypes, a non-strided
-operand, an output aliased with an input) throws an `ArgumentError`. It is not
-registered with `TensorOperations.select_backend` and never falls back to
-another backend. Rationale is frozen in docs/decisions.md, "TensorOperations
-integration milestone: Phase A direction freeze".
+out of `Float32`/`Float64`/`ComplexF32`/`ComplexF64`; everything else
+(`TensorOperations.tensoradd!`, `TensorOperations.tensortrace!`, mixed or
+unsupported eltypes -- mixed real/complex included, since promotion belongs in
+TensorOperations' own `promote_contract` layer -- a non-strided operand, an
+output aliased with an input, or a conjugated output view) throws an
+`ArgumentError`.
+
+TensorOperations' `conjA`/`conjB` flags are honored for complex eltypes: they
+are forwarded to `plan_contract`, which folds each with the corresponding
+operand's `StridedView.op` and applies the result in the packing pass. A
+conjugated *output* `C` is rejected rather than supported.
+
+It is not registered with `TensorOperations.select_backend` and never falls
+back to another backend, so a timing taken with this backend always measures
+this engine. Rationale is frozen in docs/decisions.md, "TensorOperations
+integration milestone: Phase A direction freeze" and "Complex element-type
+milestone: Phase A direction freeze".
 """
 struct QuasiStridedBackend <: TO.AbstractBackend end
 
@@ -50,13 +61,20 @@ const _QS_WORKSPACE_KEY = :quasistrided_contract_workspaces
 end
 
 # Fetch (or lazily build) this task's persistent, `reserve!`-able
-# `ContractWorkspace{T,Vector{T}}` for scalar type `T`. Built once per
+# `ContractWorkspace{T,Vector{real(T)}}` for scalar type `T`. Built once per
 # `(task, T)` at `T`'s own default kernel/blocking; `plan_contract` grows it
 # to whatever blocking the actual call needs via `reserve!`.
+#
+# The key is `eltype(C)` alone, with **no method component**: planar and 1m
+# pack into the same `Vector{real(T)}` and `reserve!` is grow-only, so a
+# workspace pooled under one complex method serves the other after at most a
+# grow (docs/decisions.md, "Buffer element type: the `VT` bound relaxes").
+# Keying on the storage type rather than the packed type is what keeps a
+# `Float64` and a `ComplexF64` contraction from colliding on one workspace.
 @inline function _qs_task_workspace(::Type{T}) where {T}
     pool = _qs_workspace_pool()
     ws = get(pool, T, nothing)
-    ws === nothing || return ws::ContractWorkspace{T, Vector{T}}
+    ws === nothing || return ws::ContractWorkspace{T, Vector{real(T)}}
     kernel = _default_kernel(T)
     new_ws = ContractWorkspace(T, kernel, default_blocking(kernel), false, TO.DefaultAllocator())
     pool[T] = new_ws
@@ -110,16 +128,19 @@ end
 # The two clauses of the frozen eligibility predicate, split out only so the
 # rejection message can name the one that failed. `_qs_eligible` below is the
 # predicate itself; nothing else in this file re-states it.
+const _QS_ELTYPES = (Float32, Float64, ComplexF32, ComplexF64)
+
 _qs_eltype_ok(C, A, B) =
-    eltype(A) === eltype(B) === eltype(C) && eltype(C) ∈ (Float32, Float64)
+    eltype(A) === eltype(B) === eltype(C) && eltype(C) ∈ _QS_ELTYPES
 _qs_strided_ok(C, A, B) = all(isstrided, (A, B, C))
 
 """
     _qs_eligible(C, A, B) -> Bool
 
 Whether `QuasiStridedBackend` can serve `tensorcontract!(C, A, ..., B, ...)`:
-a single shared element type out of `Float32`/`Float64`, and all three operands
-strided. Ineligible inputs are rejected outright (see [`QuasiStridedBackend`](@ref)),
+a single shared element type out of `_QS_ELTYPES`
+(`Float32`/`Float64`/`ComplexF32`/`ComplexF64`), and all three operands
+strided. Mixed real/complex is deliberately *not* accepted. Ineligible inputs are rejected outright (see [`QuasiStridedBackend`](@ref)),
 never routed to another backend.
 """
 _qs_eligible(C, A, B) = _qs_eltype_ok(C, A, B) && _qs_strided_ok(C, A, B)
@@ -141,7 +162,7 @@ end
     _qs_eligible(C, A, B) && return nothing
     _qs_eltype_ok(C, A, B) || _qs_throw(
         "QuasiStridedBackend requires all tensors of $f to share a single " *
-            "element type out of Float32 and Float64, got " *
+            "element type out of Float32, Float64, ComplexF32 and ComplexF64, got " *
             join(map(eltype, (C, A, B)), ", ")
     )
     _qs_strided_ok(C, A, B) || _qs_throw(
@@ -155,15 +176,103 @@ end
 # Operations
 # ----------------------------------------------------------------------------
 
-# Shared prefix of both `tensorcontract!` methods below, in the frozen order
-# (docs/decisions.md, "Required argument-checking order in the adapter", plus
-# its `StridedView`-based-aliasing addendum): eligibility, argcheck, dimcheck,
-# wrap, aliasing. The engine itself performs no aliasing check at all.
+# ----------------------------------------------------------------------------
+# Conjugation (docs/decisions.md, "Conjugation: semantics, and where each piece
+# is absorbed", and Amendment 3, which discharges the former invariant)
+# ----------------------------------------------------------------------------
 #
-# LOAD-BEARING: `conjA`/`conjB` are dropped and `StridedView.op` ignored,
-# correct only because the eligibility gate pins the element type to real
-# Float32/Float64, on which every `op` and a conjugated α/β are the identity
-# (docs/decisions.md, "Eligibility predicate, and the conjugation invariant").
+# `conjA`/`conjB` are NOT dropped: both `tensorcontract!` methods below forward
+# them to `plan_contract` as its `conjA`/`conjB` keywords, and the engine folds
+# each one with the corresponding view's `.op` through `_qs_isconj`
+# (src/driver.jl), converts the result to a singleton `identity`/`conj`, and
+# applies it in the packing pass via the existing `transform` seam. Three facts
+# about that split are load-bearing.
+#
+# (a) The combining rule is
+#
+#         _qs_isconj(v::StridedView{T}, flag::Bool) where {T} =
+#             (T <: Complex) && (flag ⊻ _op_conjugates(v.op))
+#
+#     `⊻`, not `||`: TO's flag and `StridedView.op` are two *independent*
+#     requests to conjugate the same data. TO's contract is
+#     `C = β*C + α*permutedims(contract(opA(A), opB(B)), pAB)`, i.e. `conjA` is
+#     applied on top of whatever the view already carries, and `conj` is
+#     involutive -- so two conjugations cancel and only the parity of the pair
+#     survives. `α`/`β` are not conjugated at all: `conjA` conjugates A's data
+#     only.
+#
+# (b) `_op_conjugates` is a *total* table (`identity`/`transpose` -> `false`,
+#     since both are elementwise identities on a `Number`; `conj`/`adjoint` ->
+#     `true`) with an `@noinline` throwing fallback -- deliberately not
+#     TensorOperations' TBLIS extension's `(A.op === conj)` test
+#     (`isconj`, ext/TensorOperationsTBLISExt.jl). That test is right for every
+#     `op` `StridedViews` itself constructs, but it is not total:
+#     `StridedView(p, sz, st, off, adjoint)` is directly constructible, and
+#     `=== conj` classifies it as *unconjugated*, silently returning the
+#     unconjugated contraction. That is exactly the silent-wrong-answer class
+#     this milestone exists to close, so an unrecognised `op` is hard-rejected
+#     instead -- consistent with this backend's "hard-reject, never fall back"
+#     rule. The fallback is unreachable for every `op` `StridedViews` builds,
+#     so being total costs nothing.
+#
+# (c) A conjugated output `C` is *rejected*, not supported: `plan_contract`
+#     throws on `_qs_isconj(Cv, false)`. In-tree precedent, same rejection:
+#     TensorOperations' TBLIS extension does
+#     `isconj(SV(C), false) && throw_conj_output(f)`
+#     (ext/TensorOperationsTBLISExt.jl). Supporting it would thread a
+#     conjugation flag as a type parameter through `store_tile!` ->
+#     `execute_tile!` -> `_execute_micro_tile!` -> the nest, doubling
+#     specialisations of the *innermost* code for a case TO's public API cannot
+#     even express (there is no `conjC` parameter), and would require
+#     re-deriving the beta-applied-once argument under
+#     `beta_eff = firstpanel ? betaT : one(T)`.
+#
+# Both the fold and the rejection live in `plan_contract`, not here:
+# `plan_contract`/`contract!` are public entry points reachable without this
+# adapter, and a caller who hands the engine a conjugated complex `StridedView`
+# directly is exposed to the identical silent wrongness. Putting the check at
+# the engine boundary protects both paths, and the adapter does not duplicate
+# it (docs/decisions.md, "Second addendum to 'Required argument-checking order
+# in the adapter (frozen)'"). It also makes the plan/view mismatch hazard
+# unrepresentable rather than merely detected: `execute!(plan, α, β)` takes no
+# operands, so there is nothing to re-supply with a different `op`.
+#
+# The real path is *structurally* immune -- stronger than the original frozen
+# text claimed. `StridedViews` defines `Base.conj(a::StridedView{<:Real}) = a`
+# (and `adjoint` on a real matrix view is a plain `permutedims` of it), so `op`
+# is always `identity` for a real element type no matter what wrapper the user
+# passes; and `_qs_isconj` short-circuits on `T <: Complex` regardless. Passing
+# `conjA = true` on a real eltype therefore cannot even create a new `execute!`
+# specialisation: `plan.atransform === plan.btransform === identity` always.
+
+# Shared prefix of both `tensorcontract!` methods below, in the frozen order
+# (docs/decisions.md, "Required argument-checking order in the adapter", its
+# `StridedView`-based-aliasing addendum, and its second addendum):
+#
+#     eligibility -> argcheck -> dimcheck -> wrap -> aliasing
+#         -> conjugated-C rejection
+#
+# The engine itself performs no aliasing check at all.
+#
+# The conjugated-`C` rejection is performed HERE as well as in
+# `plan_contract`, and the duplication is deliberate. `plan_contract` owns it
+# for direct `contract!`/`plan_contract` callers, who never run this prefix.
+# But both `tensorcontract!` methods below pass `workspace =
+# _qs_task_workspace(...)` (or open an allocator checkpoint) as an *argument*
+# to `plan_contract`, so that argument is evaluated -- acquiring and possibly
+# `reserve!`-growing a pooled workspace -- before `plan_contract`'s own
+# rejection can fire. Leaving it to the engine alone would therefore mutate
+# process-visible state for a call that is about to be rejected, and would put
+# the rejection after a step the frozen order does not even mention. Rejecting
+# here restores the frozen order for adapter callers; the engine keeps its own
+# check so neither entry point depends on the other.
+#
+# `conjA`/`conjB` deliberately do not flow through here. No step of this prefix
+# consumes them, and their sole consumer -- `plan_contract` -- is called
+# directly by each method below, so routing them through would widen this
+# signature and its return tuple without moving any decision closer to the code
+# that makes it. One owner of the fold also means adapter callers and direct
+# `plan_contract` callers run literally the same code.
 @inline function _qs_prepare(C, A, pA, B, pB, pAB, α, β)
     _qs_check_eligible(TO.tensorcontract!, C, A, B)
     TO.argcheck_tensorcontract(C, A, pA, B, pB, pAB)
@@ -178,6 +287,14 @@ end
         "output tensor must not be aliased with an input tensor in $(TO.tensorcontract!)"
     )
 
+    # Same predicate and same reason as `plan_contract`'s; see the note above
+    # this function for why the adapter does not simply defer to it.
+    _qs_isconj(Cv, false) && _qs_throw(
+        "output tensor of $(TO.tensorcontract!) must not be a conjugated view: " *
+            "QuasiStrided writes through to the parent array and does not apply " *
+            "`StridedView.op` on store, so a conjugated `C` would be silently wrong"
+    )
+
     # Equivalent to `TO.standardize_scalartype` here. Discarding `Zero()`/
     # `One()`'s strong semantics is safe: every kernel branches on
     # `iszero(alpha)`/`iszero(beta)` rather than evaluating `β * C`.
@@ -190,14 +307,21 @@ end
     TensorOperations.tensorcontract!(C, A, pA, conjA, B, pB, conjB, pAB, α, β,
                                      ::QuasiStridedBackend, allocator)
 
-Compute `C = β*C + α*permutedims(contract(A, B), pAB)` with QuasiStrided's
-macro-blocking engine.
+Compute `C = β*C + α*permutedims(contract(opA(A), opB(B)), pAB)` with
+QuasiStrided's macro-blocking engine, where `opA`/`opB` are `conj` or
+`identity` per `conjA`/`conjB` folded with each operand's `StridedView.op`.
 
 Throws an `ArgumentError` unless every operand is strided and they share a
-single element type out of `Float32`/`Float64`, and unless `C` is unaliased
-with both `A` and `B`; there is no fallback to another backend. See
-[`QuasiStridedBackend`](@ref) for the full eligibility contract, and
-[`_qs_labels`](@ref) for the index translation.
+single element type out of `Float32`/`Float64`/`ComplexF32`/`ComplexF64`,
+unless `C` is unaliased with both `A` and `B`, and unless `C`'s view is
+unconjugated; there is no fallback to another backend, so a timing taken with
+this backend always measures this engine. See [`QuasiStridedBackend`](@ref) for
+the full eligibility contract, and [`_qs_labels`](@ref) for the index
+translation.
+
+`conjA`/`conjB` are forwarded to `plan_contract`, which folds each with the
+corresponding operand's `StridedView.op`; for a real element type the fold is
+unconditionally `identity`, so the real path is unchanged by them.
 
 Under `TensorOperations.DefaultAllocator` the buffers come from a persistent,
 `reserve!`-grown task-local [`ContractWorkspace`](@ref); any other allocator
@@ -219,6 +343,7 @@ function TO.tensorcontract!(
     # the backend path never needs `execute_tilewise!`'s buffers.
     plan = plan_contract(
         Cv, Av, indA, Bv, indB, indC;
+        conjA = conjA, conjB = conjB,
         workspace = _qs_task_workspace(eltype(C)), allocator = allocator, oracle = false
     )
     execute!(plan, α′, β′)
@@ -240,6 +365,7 @@ function TO.tensorcontract!(
     checkpoint = TO.allocator_checkpoint!(allocator)
     plan = plan_contract(
         Cv, Av, indA, Bv, indB, indC;
+        conjA = conjA, conjB = conjB,
         workspace = nothing, allocator = allocator, oracle = false
     )
     try

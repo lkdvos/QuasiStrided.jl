@@ -10,7 +10,7 @@
 import TensorOperations as TO
 
 """
-    ContractWorkspace{T,VT<:AbstractVector{T}}
+    ContractWorkspace{T,VT<:AbstractVector}
 
 Every buffer [`execute!`](@ref) and `execute_tilewise!` need, sized once at
 construction (or grown by [`reserve!`](@ref)) and never (re)allocated during
@@ -18,11 +18,21 @@ execution. Built by [`plan_contract`](@ref) and held by [`ContractPlan`](@ref);
 pass an existing one back as `plan_contract(...; workspace = ws)` to reuse its
 buffers across contractions of different shapes.
 
-`VT` is the vector type of the two packed macro panels: `Vector{T}` on the
-default, GC-owned, [`reserve!`](@ref)-able path; on an explicit-allocator path
-it is whatever that allocator returns, and the workspace is then scoped to that
-one call -- [`release!`](@ref) it and drop it, never pass it back as
-`workspace = ws` (docs/decisions.md, "Verified allocator behavior").
+`T` is the **storage** element type (`eltype(C)`), which is what the backend's
+workspace pool is keyed by; `VT` is the vector type of the two packed macro
+panels, whose element type is `real(T)` -- the same type on the real path, and
+`Float64`/`Float32` for a complex contraction, since every packed buffer below
+the kernel boundary holds reals (docs/decisions.md, "Buffer element type: the
+`VT` bound relaxes, the arity does not"). The bound on `VT` is therefore only
+`AbstractVector`, with `eltype(VT) === real(T)` enforced by the inner
+constructor; `VT` is still a `where`-bound parameter resolved to a concrete
+vector type at construction, never a `Union`- or `AbstractVector`-typed field.
+
+`VT` is `Vector{real(T)}` on the default, GC-owned, [`reserve!`](@ref)-able
+path; on an explicit-allocator path it is whatever that allocator returns, and
+the workspace is then scoped to that one call -- [`release!`](@ref) it and drop
+it, never pass it back as `workspace = ws` (docs/decisions.md, "Verified
+allocator behavior").
 
 The `tw_*` buffers belong to `execute_tilewise!`, the independent oracle, and
 are allocated only under `oracle = true` -- except the four `MR`/`NR`-sized
@@ -30,7 +40,7 @@ ones, which the beta-only pass of *both* drivers uses.
 
 Field layout is an implementation detail, not part of the frozen interface.
 """
-struct ContractWorkspace{T, VT <: AbstractVector{T}}
+struct ContractWorkspace{T, VT <: AbstractVector}
     # Macro-block-sized offset buffers: one fill_offsets! per jc/pc/ic block,
     # reused by every sliver inside it.
     m_buf_A::Vector{Int}
@@ -63,11 +73,49 @@ struct ContractWorkspace{T, VT <: AbstractVector{T}}
     tw_k_buf_B::Vector{Int}
     tw_packed_a::VT
     tw_packed_b::VT
+
+    # The one invariant the relaxed `VT` bound needs: the packed panels hold
+    # `real(T)`, never `T`. Enforced here so a mis-paired (T, VT) cannot be
+    # constructed at all, rather than failing later inside a packer.
+    function ContractWorkspace{T, VT}(
+            m_buf_A::Vector{Int}, m_buf_C::Vector{Int},
+            n_buf_B::Vector{Int}, n_buf_C::Vector{Int},
+            k_buf_A::Vector{Int}, k_buf_B::Vector{Int},
+            m_desc_A::Vector{BlockDescriptor}, m_desc_C::Vector{BlockDescriptor},
+            n_desc_B::Vector{BlockDescriptor}, n_desc_C::Vector{BlockDescriptor},
+            packed_a::VT, packed_b::VT,
+            tw_m_buf_A::Vector{Int}, tw_m_buf_C::Vector{Int},
+            tw_n_buf_B::Vector{Int}, tw_n_buf_C::Vector{Int},
+            tw_k_buf_A::Vector{Int}, tw_k_buf_B::Vector{Int},
+            tw_packed_a::VT, tw_packed_b::VT
+        ) where {T, VT <: AbstractVector}
+        eltype(VT) === real(T) || throw(
+            ArgumentError(
+                "ContractWorkspace{$T,$VT}: the packed panels must hold $(real(T)) " *
+                    "(the real type of the storage element type $T), got $(eltype(VT))"
+            )
+        )
+        return new{T, VT}(
+            m_buf_A, m_buf_C, n_buf_B, n_buf_C, k_buf_A, k_buf_B,
+            m_desc_A, m_desc_C, n_desc_B, n_desc_C,
+            packed_a, packed_b,
+            tw_m_buf_A, tw_m_buf_C, tw_n_buf_B, tw_n_buf_C,
+            tw_k_buf_A, tw_k_buf_B, tw_packed_a, tw_packed_b,
+        )
+    end
 end
 
 # Element counts every buffer needs for `kernel` at the *effective* `blocking`
 # (the rounded/clamped one `plan_contract` stores on the plan). Shared by the
 # constructors and by `reserve!` so the two can never disagree.
+#
+# Complex-correct as written, deliberately unchanged (docs/decisions.md,
+# "Buffer element type: the `VT` bound relaxes, the arity does not"): the
+# packed lengths come from `packed_a_length`/`packed_b_length`, which already
+# return a count of REALS at the logical `kc` once the descriptor is complex,
+# while the sliver counts use the LOGICAL register extents `mr`/`nr`, which is
+# what `mc`/`nc` are expressed in. The two must not be mixed: `m_slivers` is a
+# count of register tiles, `packed_a` a count of reals.
 @inline function _workspace_sizes(kernel, blocking::Blocking)
     MRk = mr(kernel)
     NRk = nr(kernel)
@@ -110,7 +158,7 @@ end
 @inline function _build_workspace(
         ::Type{T}, s, ntw::Int, ints::F,
         packed_a::VT, packed_b::VT, tw_packed_a::VT, tw_packed_b::VT
-    ) where {T, F, VT <: AbstractVector{T}}
+    ) where {T, F, VT <: AbstractVector}
     return ContractWorkspace{T, VT}(
         ints(s.mc), ints(s.mc),
         ints(s.nc), ints(s.nc),
@@ -136,7 +184,9 @@ entirely (they are left empty), which is what the TensorOperations backend
 path passes.
 
 Under `DefaultAllocator` every buffer is an ordinary `Vector`, so the result is
-a `ContractWorkspace{T,Vector{T}}` that [`reserve!`](@ref) may later grow.
+a `ContractWorkspace{T,Vector{R}}`, `R = realtype(kernel) === real(T)`, that
+[`reserve!`](@ref) may later grow. On the real path `R === T` and this is the
+`ContractWorkspace{T,Vector{T}}` it has always been.
 Under any other allocator the packed panels are acquired once via
 `TensorOperations.tensoralloc(..., Val(true), allocator)`, are never resized,
 and must be handed back with [`release!`](@ref).
@@ -149,11 +199,15 @@ function ContractWorkspace(
         ::Type{T}, kernel, blocking::Blocking, oracle::Bool, ::TO.DefaultAllocator
     ) where {T}
     s = _workspace_sizes(kernel, blocking)
+    # The packed panels hold reals, not storage elements: `R === T` on the real
+    # path, `real(T)` for a complex kernel. `ContractWorkspace`'s inner
+    # constructor re-checks that this matches `T`.
+    R = realtype(kernel)
     return _build_workspace(
         T, s, oracle ? s.kc : 0, n -> Vector{Int}(undef, n),
-        Vector{T}(undef, s.packed_a), Vector{T}(undef, s.packed_b),
-        Vector{T}(undef, oracle ? s.tw_packed_a : 0),
-        Vector{T}(undef, oracle ? s.tw_packed_b : 0),
+        Vector{R}(undef, s.packed_a), Vector{R}(undef, s.packed_b),
+        Vector{R}(undef, oracle ? s.tw_packed_a : 0),
+        Vector{R}(undef, oracle ? s.tw_packed_b : 0),
     )
 end
 
@@ -161,13 +215,15 @@ function ContractWorkspace(
         ::Type{T}, kernel, blocking::Blocking, oracle::Bool, allocator
     ) where {T}
     s = _workspace_sizes(kernel, blocking)
+    R = realtype(kernel)
 
     # Acquisition order matters for arena allocators: `release!` frees in the
-    # exact reverse order.
-    packed_a = _alloc_temp(T, s.packed_a, allocator)
-    packed_b = _alloc_temp(T, s.packed_b, allocator)
-    tw_packed_a = _alloc_temp(T, oracle ? s.tw_packed_a : 0, allocator)
-    tw_packed_b = _alloc_temp(T, oracle ? s.tw_packed_b : 0, allocator)
+    # exact reverse order. Unchanged -- only the element type asked for moved
+    # from the storage type `T` to the packed real type `R`.
+    packed_a = _alloc_temp(R, s.packed_a, allocator)
+    packed_b = _alloc_temp(R, s.packed_b, allocator)
+    tw_packed_a = _alloc_temp(R, oracle ? s.tw_packed_a : 0, allocator)
+    tw_packed_b = _alloc_temp(R, oracle ? s.tw_packed_b : 0, allocator)
 
     return _build_workspace(
         T, s, oracle ? s.kc : 0, n -> _alloc_offsets(n, allocator),
@@ -183,7 +239,7 @@ function ContractWorkspace(
 end
 
 """
-    reserve!(ws::ContractWorkspace{T,Vector{T}}, kernel, blocking::Blocking,
+    reserve!(ws::ContractWorkspace{T,Vector{R}}, kernel, blocking::Blocking,
              oracle::Bool) -> ws
 
 Grow `ws` in place so every buffer is large enough for `kernel` at the
@@ -197,8 +253,8 @@ allocator-provided temporary must never be `resize!`d (docs/decisions.md,
 at construction instead.
 """
 function reserve!(
-        ws::ContractWorkspace{T, Vector{T}}, kernel, blocking::Blocking, oracle::Bool
-    ) where {T}
+        ws::ContractWorkspace{T, Vector{R}}, kernel, blocking::Blocking, oracle::Bool
+    ) where {T, R}
     s = _workspace_sizes(kernel, blocking)
 
     _grow!(ws.m_buf_A, s.mc)

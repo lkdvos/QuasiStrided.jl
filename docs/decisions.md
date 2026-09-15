@@ -2487,3 +2487,144 @@ array in a conjugated `StridedView` and calls the engine directly. Putting it at
 the engine boundary protects both paths and means the adapter does not duplicate
 it. `plan_contract` is also where `conjA`/`conjB` are folded with `.op`, so the
 rejection sits next to the code whose invariant it protects.
+
+## Complex element-type milestone: Phase C integration findings
+
+Five Phase B workers ran in parallel on disjoint files against the Phase A
+freeze. Four of them reported something the freeze got wrong or left
+under-determined. Recorded here at integration rather than at close, because
+three of the four changed shipped code.
+
+### Cliff A bites at the shipped shape: the freeze's register arithmetic was optimistic
+
+**The freeze says** `2*MV*NR + 2*MV + 2 <= nregisters`, and that planar's
+`(MV,NR) = (2,6)` at `24 + 4 + 2 = 30 <= 32` is "tight, consistent with their
+menu putting it first". **Measured on ccqlin038 (Julia 1.12.6, `:avx512`, 32
+zmm), it does not fit.** Counting `%rsp` stores and reloads in `accumulate`'s
+inner loop:
+
+| shape | pressure | stores/K step | reloads |
+| --- | --- | --- | --- |
+| planar `(24,3,8)` / `(48,3,16)` | 26 | 0 | 0 |
+| planar `(8,8,8)` / `(16,8,16)` | 20 | 0 | 0 |
+| real `SIMDKernel` `(32,6,8)`, same NV = 24 (control) | 29 | 0 | 0 |
+| **planar `(16,6,8)` / `(32,6,16)`** | **30** | **26** | **3** |
+| real `SIMDKernel` `(48,6,8)` (control) | 43 | 12 | 12 |
+| planar `(16,6,4)`, deliberately over budget | 58 | 96 | 74 |
+
+The transition sits between **29 and 30**, not at 32, and the shape seeded from
+the reference project's measured menu is on the wrong side of it. The real
+kernel at an *identical* NV = 24 accumulator count is clean, so this is register
+pressure and not a coding defect in the planar body.
+
+Mitigating detail, and the reason this is not being treated as a blocking
+finding: 23 of the 26 are **store-only** -- accumulator vectors written with no
+matching reload, LLVM rematerialising the loop-carried tuple -- so the cost is
+store-port bandwidth rather than a load-use dependency chain. Only 3 are genuine
+B-broadcast spill/reloads.
+
+**What this is really an instance of.** The freeze's own rule -- "the method
+ranking does not transfer between machines" -- turns out to apply to the *shape
+menu* as well, and for a reason the freeze did not anticipate: the reference
+measured `(2,6)` best on this same microarchitecture, but in Rust, with a
+different register allocator. A shape that fits LLVM-via-Rust's allocation need
+not fit LLVM-via-Julia's. The menus stay seeded from that project's
+measurements, because a measured starting point beats a guessed one, but **their
+*order* is now explicitly unvalidated here** and is Phase F's to settle.
+
+**No code changed for this.** The menu order is untouched, the frozen `<= 32`
+assertion is untouched, and no throughput claim is made -- spill counts are not
+timings, and this project does not rank shapes it has not timed. The measured
+table is recorded in `planar_register_pressure`'s docstring in
+`test/test_planar_kernel.jl`. Phase F must decide whether `(16,6)`/`(32,6)`
+stays at the head of the menu or whether `(24,3)`/`(48,3)` (pressure 26, zero
+spills) should lead, **on measured throughput, not on this table.**
+
+### The `vfnmadd` prediction held exactly
+
+The freeze predicted `muladd(-ai, bi, cr)` would fold its `fneg` operand into
+`vfnmadd213pd/ps`, and required verification rather than assumption. Verified on
+Julia 1.12.6, counting `accumulate`'s inner loop at every menu shape: exactly
+`MV*NR` `vfnmadd231` + `3*MV*NR` `vfmadd231` = `4*MV*NR`, with **zero** separate
+negations (the single `vxorp` per function is prologue register-zeroing). The
+hoist of `nai_v` out of the `j` loop is therefore free, not merely cheap, and
+the 1.4% worst case the freeze budgeted for does not arise.
+
+### The adapter's frozen argument-checking order was violated by keyword evaluation
+
+**Found by the blind test author**, which is precisely what that role is for.
+The freeze places the conjugated-`C` rejection in `plan_contract`, on the
+argument that this protects direct `contract!` callers too. It does -- but both
+`TO.tensorcontract!` methods pass `workspace = _qs_task_workspace(eltype(C))`
+(or open an allocator checkpoint) as an **argument** to `plan_contract`, and
+Julia evaluates arguments before the call. So a rejected call would first
+acquire and possibly `reserve!`-grow a pooled workspace: process-visible
+mutation on behalf of a call that is about to throw, at a point the frozen order
+does not mention at all.
+
+Worse, the blind author's own `@test_throws ArgumentError` for the rejection was
+**passing for the wrong reason** -- the kernel-lookup error fired first. A test
+that passes for the wrong reason is worse than a missing one.
+
+**Fixed** by performing the rejection in `_qs_prepare` as well, immediately
+after the aliasing check, which is where the frozen order puts it. The
+duplication with `plan_contract`'s check is deliberate and commented: the engine
+keeps its own so neither entry point depends on the other. The frozen order now
+reads, for adapter callers:
+
+    eligibility -> argcheck -> dimcheck -> wrap -> aliasing -> conjugated-C rejection
+
+### The complex legacy shape is over the AVX2 register budget
+
+`_rule_applies_complex` correctly refuses to *derive* a complex shape off
+`:avx512`, but the legacy fallback would still hand one back -- and `(8,6,4)`
+under planar needs 30 registers against AVX2's 16 ymm, i.e. a guaranteed
+spill. **Fixed** by gating complex kernel *construction* by ISA as well
+(`_complex_default_supported`), so on an unmeasured ISA the engine refuses to
+pick a complex kernel and says why, rather than silently shipping a
+guaranteed-spilling default. An explicitly named `kernel =` is unaffected;
+this governs only what the engine chooses on its own.
+
+This is the same policy as the shape rule and the `:neon` precedent -- derive
+where measured, refuse elsewhere -- extended one step further down.
+
+### `_op_conjugates`' throwing fallback is unreachable through `StridedView`
+
+The freeze says the guard against a silently mishandled `op` is "three things",
+one of them `_op_conjugates`' throwing fallback. That **overstates what the
+fallback contributes**: `StridedViews` bounds its own `F` parameter to
+`Union{typeof(identity), typeof(conj), typeof(adjoint), typeof(transpose)}`, so
+a fifth `op` cannot be constructed at all and the fallback can only be reached
+by calling `_op_conjugates` directly. The guarantee comes from `StridedViews`'
+type bound; the fallback is a total table that documents the reasoning and
+would catch a future widening of that bound.
+
+Kept as written -- a total table is still the right shape, and it costs nothing
+(`@noinline`, unreachable) -- but the claim is corrected here. Two consequences
+for test authors, both now pinned: constructing a `StridedView` with an
+unsupported `op` raises `TypeError`, not `ArgumentError`; and `_qs_isconj`
+short-circuits on `T <: Complex` before consulting the table, so the totality
+guarantee is complex-only. The latter is consistent with "the real path cannot
+change" but the freeze did not say it.
+
+### Also corrected at integration
+
+- `_qs_task_workspace`'s return assertion was `ContractWorkspace{T, Vector{T}}`,
+  which would have **thrown for every complex call** (the packed panels are
+  `Vector{real(T)}`). Now `ContractWorkspace{T, Vector{real(T)}}` -- still fully
+  concrete, correct on both paths. A latent bug the freeze's `VT`-relaxation
+  reasoning implied but did not spell out.
+- The frozen signature `default_blocking(v, ::Type{T}, m::ComplexMethod) where
+  {T<:Complex}` is **ambiguous** with the `RealMethod` method at
+  `(Val, Type{<:Complex}, RealMethod)` -- neither is more specific. Dropping the
+  `T <: Complex` bound resolves it (the `RealMethod` method then strictly wins,
+  and `real(T) === T` makes the arm total). Behaviour is exactly as frozen; only
+  the signature differs.
+- `_reuse_workspace`'s packed-eltype guard is currently **unreachable**: the
+  `ContractWorkspace` inner constructor forces `eltype(VT) === real(T)` and
+  `_plan_contract` checks `scalartype(kernel) === T` first. Kept as
+  defence-in-depth; it becomes load-bearing only if the pool key or the `VT`
+  invariant changes.
+- `execute_tilewise!` needed the third `_pack_sliver!` transform (as the freeze
+  warned) but **not** the `packed_a_per_k` treatment: it hands whole `tw_packed_*`
+  buffers, already sized by `packed_*_length`, which already count reals.

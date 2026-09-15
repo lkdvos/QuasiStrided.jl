@@ -472,18 +472,42 @@ Sonnet-High over everything since Phase A. Neither is spent yet;
       **B2** packing (additive only; `_pack_panel!` untouched). **B3** the
       planar kernel. **B4** the adapter. **B5** adapter tests, authored blind
       against the Phase A freeze.
-- [ ] **Phase C** (integration): merge B1–B5, wire the default complex kernel,
-      budget one reconciliation.
+- [x] **Phase C** (integration): B1–B5 merged; `_complex_kernel_from_shape`'s
+      `PlanarMethod` arm wired (generated over that method's own menu, so every
+      branch builds a concrete kernel from literal `Val`s); the method-generic
+      arm still throws, so an unimplemented method can never silently fall back
+      to planar. Three reconciliations, all recorded in `docs/decisions.md`'s
+      "Phase C integration findings": the adapter's frozen argcheck order was
+      violated by keyword evaluation (a pooled workspace was acquired before a
+      rejected call could throw — found by the blind test author, whose own
+      assertion was passing for the wrong reason); complex kernel *construction*
+      is now ISA-gated as well as the shape rule, since the legacy complex
+      fallback was over AVX2's register budget; and B1's seam scaffolding test
+      was replaced by its inverse. **20586/20586 passing** (Julia 1.12.6), Runic
+      clean, 0 failed / 0 errored.
 - [ ] **Phase D** (1m).
 - [ ] **Phase E** (remaining test layers, four disjoint files in parallel).
 - [ ] **Phase F** (measurement on `ccqlin038`).
 - [ ] **Phase G** (the two gated reviews).
 - [ ] **Phase H** (close: `docs/decisions.md`, this file, `README.md`).
 
-**Test count at Phase A open: 13299/13299** (Julia 1.12.6). B1's acceptance
-criterion is that this number is unchanged *and* that
-`benchmark/bench_default_vs_legacy.jl` stays inside the canary spread, with no
-complex kernel wired in — B1 is the real-path guard and it lands first.
+**Test count: 13299 at Phase A open → 20586 after Phase C** (Julia 1.12.6).
+B1's acceptance criterion — the real path unchanged with no complex kernel
+wired in — was proved on an isolated tree: pristine `7503fdd` 13299/13299,
+base + B1 alone 13612/13612, 0 failed, 0 errored. The measured half of that
+guard (`benchmark/bench_default_vs_legacy.jl` inside the canary spread) is
+Phase F's first sweep and gates the rest.
+
+Verified end to end at Phase C close, independently of the in-tree suite: all
+four element types against `mul!`; the full 16-combination `conj`×`op`
+cross-product against **both** `StridedNative()` and a hand-written oracle, 0
+mismatches; the xor in isolation (`conj(A)` with `conjA = true` must give the
+*unconjugated* product); a genuine 3-index contraction on permuted/scattered
+operands; conjugated complex output rejected while a real `adjoint` output is
+still accepted; β = 0 not propagating NaN from a poisoned `C`. Backend
+allocation is **4432 B/call for complex, identical to real's 4432** — the
+`plan_contract` bookkeeping the README already documents, so complex adds none
+of its own.
 
 Two notes for anyone picking this up on a fresh checkout of this worktree.
 `Manifest.toml` is gitignored, so the environment must be resolved before

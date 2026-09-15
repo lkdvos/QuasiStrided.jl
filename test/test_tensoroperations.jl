@@ -3,6 +3,20 @@
 # section. Included by `test/runtests.jl`, which already provides
 # `Test`/`Random`/`QuasiStrided`.
 
+# Standalone-run support: `runtests.jl` supplies `Test`/`Random`/`QuasiStrided`
+# before including this file, and `test_driver.jl` supplies the unqualified
+# `plan_contract` binding (see `runtests.jl`'s comment on why it is not restored
+# there). Both are guarded, so including this file on its own works and the
+# `runtests.jl` path is bit-for-bit unaffected.
+if !@isdefined(QuasiStrided)
+    using Test
+    using Random
+    using QuasiStrided
+end
+if !@isdefined(plan_contract)
+    const plan_contract = QuasiStrided.plan_contract
+end
+
 using TensorOperations
 using TensorOperations: StridedNative, StridedBLAS
 using StridedViews: StridedView, isstrided
@@ -18,6 +32,12 @@ const to_blas = StridedBLAS()
 poison!(C) = fill!(C, convert(eltype(C), NaN))
 
 const eltypes = (Float32, Float64)
+# Complex element-type milestone, "Eligibility": the frozen predicate widens to
+# `_QS_ELTYPES = (Float32, Float64, ComplexF32, ComplexF64)`. `eltypes` is kept
+# verbatim so that every real-only assertion below keeps its original meaning,
+# and the complex types are added alongside rather than folded in.
+const complex_eltypes = (ComplexF32, ComplexF64)
+const all_eltypes = (eltypes..., complex_eltypes...)
 
 # `pA, pB, pAB` for the plain matmul C[i,j] = A[i,k]*B[k,j], used by most of
 # the edge-case and hard-reject testsets below.
@@ -30,7 +50,7 @@ const _MATMUL_PAB = ((1,), (2,)), ((1,), (2,)), ((1, 2), ())
     @test QuasiStridedBackend() isa QuasiStridedBackend
 end
 
-@testset "tensorcontract! agrees with StridedNative/StridedBLAS (eltype = $T)" for T in eltypes
+@testset "tensorcontract! agrees with StridedNative/StridedBLAS (eltype = $T)" for T in all_eltypes
     Random.seed!(1234567)
 
     # Same shape/permutation family as the frozen worked example in
@@ -65,7 +85,7 @@ end
     end
 end
 
-@testset "tensorcontract!: another permutation shape (eltype = $T)" for T in eltypes
+@testset "tensorcontract!: another permutation shape (eltype = $T)" for T in all_eltypes
     Random.seed!(7654321)
 
     # A different open/contracted axis ordering than the worked example, to
@@ -90,11 +110,17 @@ end
     end
 end
 
-@testset "conj is a no-op for real eltype (eltype = $T)" for T in eltypes
-    # LOAD-BEARING INVARIANT pin (docs/decisions.md): QuasiStrided ignores
-    # conjA/conjB entirely, which is correct only for real eltypes. Real
-    # operands with conjA/conjB set true must still agree with
-    # StridedNative(), which itself treats conj as a no-op on reals.
+@testset "conj is real conjugation for complex eltype, and still a no-op for real (eltype = $T)" for T in all_eltypes
+    # Real half: the LOAD-BEARING INVARIANT pin required by the original freeze
+    # and *kept, textually unchanged*, by Amendment 3 ("that test stays,
+    # textually unchanged, as the real-path-unchanged guard"). Real operands
+    # with conjA/conjB set true must still agree with StridedNative(), which
+    # itself treats conj as a no-op on reals.
+    #
+    # Complex half: the same loop, now non-trivial. `conjA`/`conjB` are no
+    # longer ignored -- they select `conj` as the operand transform -- and the
+    # result is checked against StridedNative() *and* against an explicitly
+    # conjugated matmul, so the oracle does not rest on TO alone.
     Random.seed!(2468)
     A = randn(T, (3, 4))
     B = randn(T, (4, 5))
@@ -106,10 +132,212 @@ end
         Rn = tensorcontract!(Cn, A, pA, conjA, B, pB, conjB, pAB, one(T), zero(T), to_native)
         Rq = tensorcontract!(Cq, A, pA, conjA, B, pB, conjB, pAB, one(T), zero(T), qsbackend)
         @test Rq ≈ Rn
+        if T <: Complex
+            @test Rq ≈ (conjA ? conj(A) : A) * (conjB ? conj(B) : B)
+            # ... and the flags must actually *do* something: silently dropping
+            # them (the pre-milestone behaviour) would still pass `Rq ≈ Rn`
+            # above if `Rn` were computed the same wrong way.
+            if conjA || conjB
+                @test !isapprox(Rq, A * B)
+            end
+        else
+            # `StridedViews` defines `conj(::StridedView{<:Real}) = a`, so no
+            # conjugation can ever reach the real path, whatever the flags say.
+            @test Rq ≈ A * B
+        end
     end
 end
 
-@testset "tensorcontract! edge cases (eltype = $T)" for T in eltypes
+# =========================================================================
+# Conjugation, the part the flag-only loop above cannot reach.
+#
+# docs/decisions.md, "Conjugation: semantics, and where each piece is
+# absorbed": there are two *independent* sources of conjugation per input --
+# TO's `conjA`/`conjB` flags and `StridedView.op` -- and they compose with
+# **xor**:
+#
+#     _qs_isconj(v, flag) = (eltype(v) <: Complex) && (flag ⊻ _op_conjugates(v.op))
+#
+# `α`/`β` are *not* conjugated. Setting `conjA` alone never sets `op`, so no
+# amount of flag-only testing distinguishes `⊻` from `||`; these testsets do.
+# =========================================================================
+
+@testset "conjugation: StridedView.op x conj flag cross-product (eltype = $T)" for T in complex_eltypes
+    Random.seed!(20260914)
+    pA, pB, pAB = _MATMUL_PAB
+    # Square, so that every wrapper below leaves the matmul well-formed.
+    M = randn(T, (4, 4))
+    N = randn(T, (4, 4))
+
+    wrappers = (identity, adjoint, transpose, conj)
+    # Two families. `Base`'s wrappers around a plain `Array` are what a
+    # TensorOperations user actually passes; the same wrappers around a
+    # `StridedView` are what sets `op` *lazily*. The distinction matters:
+    # `conj(::Matrix)` materialises (the data is conjugated and `op` stays
+    # `identity`), whereas `conj(::StridedView)` only flips `op`.
+    variants(X) = vcat(
+        [w(X) for w in wrappers],
+        [w(StridedView(X)) for w in wrappers],
+    )
+
+    for Aw in variants(M), Bw in variants(N), conjA in (false, true), conjB in (false, true)
+        # Materialised equivalents: `collect` on a `StridedView` applies `op`,
+        # so these carry exactly the values the wrapped operand denotes. The
+        # reference therefore never depends on how any backend treats `op`.
+        Am = collect(Aw)
+        Bm = collect(Bw)
+
+        Cn = fill(convert(T, NaN), (4, 4))
+        Cq = copy(Cn)
+        Rn = tensorcontract!(Cn, Aw, pA, conjA, Bw, pB, conjB, pAB, one(T), zero(T), to_native)
+        Rq = tensorcontract!(Cq, Aw, pA, conjA, Bw, pB, conjB, pAB, one(T), zero(T), qsbackend)
+
+        @test all(isfinite, Rq)
+        @test Rq ≈ Rn
+        @test Rq ≈ (conjA ? conj(Am) : Am) * (conjB ? conj(Bm) : Bm)
+    end
+
+    @testset "the xor, isolated" begin
+        # THE test of this file: `conj(A)` with `conjA = true` must cancel to
+        # the *unconjugated* operand. A `||` in place of the `⊻` passes every
+        # other test in this testset and fails this one.
+        Ac = conj(StridedView(M))
+        @test Ac.op === conj              # lazy, not materialised
+        @test collect(Ac) == conj(M)
+
+        C = fill(convert(T, NaN), (4, 4))
+        R = tensorcontract!(C, Ac, pA, true, N, pB, false, pAB, one(T), zero(T), qsbackend)
+        @test R ≈ M * N
+        @test !isapprox(R, conj(M) * N)
+
+        # And symmetrically on the B operand.
+        Bc = conj(StridedView(N))
+        C2 = fill(convert(T, NaN), (4, 4))
+        R2 = tensorcontract!(C2, M, pA, false, Bc, pB, true, pAB, one(T), zero(T), qsbackend)
+        @test R2 ≈ M * N
+        @test !isapprox(R2, M * conj(N))
+
+        # Both at once: two cancellations, not four conjugations.
+        C3 = fill(convert(T, NaN), (4, 4))
+        R3 = tensorcontract!(C3, Ac, pA, true, Bc, pB, true, pAB, one(T), zero(T), qsbackend)
+        @test R3 ≈ M * N
+    end
+
+    @testset "α and β are not conjugated" begin
+        # The table in the freeze is explicit: "`alpha`, `beta` -- **not**
+        # conjugated", because `conjA` applies to A's *data* only. With a
+        # complex α/β and a conjugated operand, a scalar that was wrongly
+        # conjugated along with the data is visible here and nowhere else.
+        α = convert(T, 0.75 - 1.25im)
+        β = convert(T, -0.5 + 2.0im)
+        Ac = conj(StridedView(M))
+        C0 = randn(T, (4, 4))
+        Cq = copy(C0)
+        R = tensorcontract!(Cq, Ac, pA, false, N, pB, false, pAB, α, β, qsbackend)
+        @test R ≈ β * C0 + α * (conj(M) * N)
+    end
+end
+
+@testset "conjugation: _op_conjugates is the frozen table, with a throwing fallback" begin
+    # The table as a pure function, checked on its own so that it is exercised
+    # independently of whether a complex *kernel* exists yet. An `op` that is
+    # not one of the four must throw rather than be silently treated as
+    # unconjugated ("Hard-reject, never fall back"); TBLIS's `A.op === conj`
+    # test is what this replaces.
+    @test QuasiStrided._op_conjugates(identity) === false
+    @test QuasiStrided._op_conjugates(conj) === true
+    @test QuasiStrided._op_conjugates(transpose) === false
+    @test QuasiStrided._op_conjugates(adjoint) === true
+    @test_throws ArgumentError QuasiStrided._op_conjugates(-)
+end
+
+@testset "conjugation: every StridedView.op is honoured (eltype = $T)" for T in complex_eltypes
+    # `StridedView(parent, size, strides, offset, op)` is directly
+    # constructible for every `op` in `Union{identity, conj, adjoint,
+    # transpose}`, including the two that `StridedViews`' own arithmetic never
+    # produces for a `Number` eltype. TBLIS's `A.op === conj` test would treat
+    # a directly-constructed `adjoint` view as unconjugated -- silently. The
+    # frozen `_op_conjugates` is a total table precisely to close that.
+    Random.seed!(161803)
+    pA, pB, pAB = _MATMUL_PAB
+    M = randn(T, (4, 4))
+    N = randn(T, (4, 4))
+
+    table = (
+        (identity, false),
+        (conj, true),
+        (transpose, false),   # elementwise identity on a `Number`
+        (adjoint, true),
+    )
+
+    for (op, op_conjugates) in table, conjA in (false, true)
+        Av = StridedView(M, size(M), strides(M), 0, op)
+        @test collect(Av) == (op_conjugates ? conj(M) : M)
+
+        expected = ((op_conjugates ⊻ conjA) ? conj(M) : M) * N
+        C = fill(convert(T, NaN), (4, 4))
+        R = tensorcontract!(C, Av, pA, conjA, N, pB, false, pAB, one(T), zero(T), qsbackend)
+        @test all(isfinite, R)
+        @test R ≈ expected
+    end
+
+end
+
+@testset "hard-reject: conjugated output view (eltype = $T)" for T in complex_eltypes
+    # "A conjugated output `C` is rejected this milestone", matching TO's own
+    # TBLIS extension (`isconj(SV(C), false) && throw_conj_output(f)`). Per the
+    # second addendum to the frozen argument-checking order the rejection lives
+    # in `plan_contract` rather than in the adapter, so that a caller reaching
+    # the engine directly is protected too -- but it must still surface as an
+    # `ArgumentError` from `tensorcontract!`.
+    Random.seed!(271828)
+    pA, pB, pAB = _MATMUL_PAB
+    A = randn(T, (4, 4))
+    B = randn(T, (4, 4))
+
+    Cc = conj(StridedView(zeros(T, (4, 4))))
+    @test Cc.op === conj
+    @test_throws ArgumentError tensorcontract!(
+        Cc, A, pA, false, B, pB, false, pAB, one(T), zero(T), qsbackend
+    )
+
+    # Same rejection for the directly-constructed `adjoint` op, which is the
+    # case a `=== conj` test would miss.
+    Ca = StridedView(zeros(T, (4, 4)), (4, 4), (1, 4), 0, adjoint)
+    @test_throws ArgumentError tensorcontract!(
+        Ca, A, pA, false, B, pB, false, pAB, one(T), zero(T), qsbackend
+    )
+
+    # `transpose` does *not* conjugate, so a transposed output view is a
+    # permutation and stays acceptable.
+    Ct = StridedView(zeros(T, (4, 4)), (4, 4), (1, 4), 0, transpose)
+    Rt = tensorcontract!(Ct, A, pA, false, B, pB, false, pAB, one(T), zero(T), qsbackend)
+    @test collect(Rt) ≈ A * B
+end
+
+@testset "real adjoint output is still accepted (eltype = $T)" for T in eltypes
+    # The other half of the pair above, and the place the real path could most
+    # easily break: `StridedViews` defines `conj(::StridedView{<:Real}) = a`,
+    # so `op` is always `identity` for a real eltype and the conjugated-output
+    # rejection must never fire on the real path, however the output is
+    # wrapped.
+    Random.seed!(141421)
+    pA, pB, pAB = _MATMUL_PAB
+    A = randn(T, (4, 4))
+    B = randn(T, (4, 4))
+
+    @test conj(StridedView(zeros(T, (4, 4)))).op === identity
+
+    Cadj = adjoint(zeros(T, (4, 4)))
+    Rq = tensorcontract!(Cadj, A, pA, false, B, pB, false, pAB, one(T), zero(T), qsbackend)
+    @test collect(Rq) ≈ A * B
+
+    Cconj = conj(StridedView(zeros(T, (4, 4))))
+    Rc = tensorcontract!(Cconj, A, pA, false, B, pB, false, pAB, one(T), zero(T), qsbackend)
+    @test collect(Rc) ≈ A * B
+end
+
+@testset "tensorcontract! edge cases (eltype = $T)" for T in all_eltypes
     Random.seed!(13579)
 
     @testset "outer product (no contracted labels)" begin
@@ -177,7 +405,7 @@ end
     end
 end
 
-@testset "@tensor / ncon integration (eltype = $T)" for T in eltypes
+@testset "@tensor / ncon integration (eltype = $T)" for T in all_eltypes
     Random.seed!(112233)
     A = randn(T, (5, 5, 5, 5))
     B = randn(T, (5, 5, 5))
@@ -191,13 +419,94 @@ end
     @test ncon([A, B, C], network; backend = qsbackend) ≈ ncon([A, B, C], network)
 end
 
-@testset "hard-reject: ComplexF64 input" begin
-    A = randn(ComplexF64, (3, 4))
+@testset "accepts complex eltypes" begin
+    # Replaces the former "hard-reject: ComplexF64 input" testset. Amendment 3
+    # widens the frozen eligibility predicate to
+    # `_QS_ELTYPES = (Float32, Float64, ComplexF32, ComplexF64)`, so a complex
+    # contraction must now be *served*, not rejected -- and the rejection must
+    # not survive anywhere as a silent fallback either.
+    pA, pB, pAB = _MATMUL_PAB
+    @testset "eltype = $T" for T in complex_eltypes
+        Random.seed!(31415)
+        A = randn(T, (3, 4))
+        B = randn(T, (4, 5))
+        Cn = fill(convert(T, NaN), (3, 5))
+        Cq = copy(Cn)
+        Rn = tensorcontract!(Cn, A, pA, false, B, pB, false, pAB, one(T), zero(T), to_native)
+        Rq = tensorcontract!(Cq, A, pA, false, B, pB, false, pAB, one(T), zero(T), qsbackend)
+        @test all(isfinite, Rq)
+        @test Rq ≈ Rn
+        @test Rq ≈ A * B
+        @test eltype(Rq) === T
+    end
+end
+
+@testset "hard-reject: residual complex eltypes" begin
+    # "Also rejected, and newly so: `Complex{Float16}`, `Complex{Int}`,
+    # `Complex{BigFloat}` (not in the tuple)". These are the eltypes that
+    # *look* complex but are outside `_QS_ELTYPES`; a widened check that tested
+    # `T <: Complex` instead of membership would wrongly accept them.
+    pA, pB, pAB = _MATMUL_PAB
+
+    @testset "Complex{Float16}" begin
+        A = Complex{Float16}.(randn(ComplexF32, (3, 4)))
+        B = Complex{Float16}.(randn(ComplexF32, (4, 5)))
+        C = zeros(Complex{Float16}, (3, 5))
+        @test_throws ArgumentError tensorcontract!(
+            C, A, pA, false, B, pB, false, pAB, 1, 0, qsbackend
+        )
+    end
+
+    @testset "Complex{Int}" begin
+        A = Complex{Int}.(rand(-9:9, (3, 4)), rand(-9:9, (3, 4)))
+        B = Complex{Int}.(rand(-9:9, (4, 5)), rand(-9:9, (4, 5)))
+        C = zeros(Complex{Int}, (3, 5))
+        @test_throws ArgumentError tensorcontract!(
+            C, A, pA, false, B, pB, false, pAB, 1, 0, qsbackend
+        )
+    end
+
+    @testset "Complex{BigFloat}" begin
+        A = Complex{BigFloat}.(randn(ComplexF64, (3, 4)))
+        B = Complex{BigFloat}.(randn(ComplexF64, (4, 5)))
+        C = zeros(Complex{BigFloat}, (3, 5))
+        @test_throws ArgumentError tensorcontract!(
+            C, A, pA, false, B, pB, false, pAB, 1, 0, qsbackend
+        )
+    end
+end
+
+@testset "hard-reject: mixed complex precisions (ComplexF32 A, ComplexF64 B)" begin
+    # The eltype predicate is `eltype(A) === eltype(B) === eltype(C)`; widening
+    # it to complex must not weaken the *shared*-eltype half of it.
+    A = randn(ComplexF32, (3, 4))
     B = randn(ComplexF64, (4, 5))
     C = zeros(ComplexF64, (3, 5))
     pA, pB, pAB = _MATMUL_PAB
     @test_throws ArgumentError tensorcontract!(
         C, A, pA, false, B, pB, false, pAB, 1, 0, qsbackend
+    )
+end
+
+@testset "hard-reject: mixed real/complex operands (Float64 A, ComplexF64 B)" begin
+    # "Mixed real-A / complex-B is out of scope" -- deliberately, not by
+    # oversight: promotion belongs in TO's `promote_contract` layer, and a
+    # silent materialising promotion here would break the guarantee that a
+    # timing taken with this backend always measures this engine.
+    A = randn(Float64, (3, 4))
+    B = randn(ComplexF64, (4, 5))
+    C = zeros(ComplexF64, (3, 5))
+    pA, pB, pAB = _MATMUL_PAB
+    @test_throws ArgumentError tensorcontract!(
+        C, A, pA, false, B, pB, false, pAB, 1, 0, qsbackend
+    )
+
+    # ... and with the operands the other way round.
+    A2 = randn(ComplexF64, (3, 4))
+    B2 = randn(Float64, (4, 5))
+    C2 = zeros(ComplexF64, (3, 5))
+    @test_throws ArgumentError tensorcontract!(
+        C2, A2, pA, false, B2, pB, false, pAB, 1, 0, qsbackend
     )
 end
 
@@ -297,6 +606,33 @@ end
         A2 = randn(Float64, (5, 5))
         @test_throws ArgumentError tensorcontract!(
             Cpd, A2, pA, false, P, pB, false, pAB, 1, 0, qsbackend
+        )
+    end
+
+    @testset "complex output aliasing an input through a wrapper (eltype = $T)" for T in complex_eltypes
+        # The aliasing check runs on the `StridedView`-wrapped operands (T11
+        # addendum), which unwrap `PermutedDimsArray`/`Adjoint` down to the
+        # shared parent. That must hold for complex operands too -- the
+        # conjugation work added a step *after* aliasing in the frozen order
+        # (eligibility -> argcheck -> dimcheck -> wrap -> aliasing ->
+        # conjugated-C rejection), and reordering it away would let a
+        # conjugated-but-aliased call through with the wrong error, or none.
+        P = randn(T, (5, 5))
+        B = randn(T, (5, 5))
+
+        Cpd = PermutedDimsArray(P, (2, 1))
+        @test !Base.mightalias(Cpd, P)                              # the Base gap
+        @test Base.mightalias(StridedView(Cpd), StridedView(P))     # what closes it
+        @test_throws ArgumentError tensorcontract!(
+            Cpd, P, pA, false, B, pB, false, pAB, 1, 0, qsbackend
+        )
+
+        # Adjoint of a complex parent: `StridedView(P')` unwraps to `P`'s
+        # buffer (with `op === conj`), so this is an aliased *and* conjugated
+        # output. Either rejection is correct; silently proceeding is not.
+        Cadj = P'
+        @test_throws ArgumentError tensorcontract!(
+            Cadj, P, pA, false, B, pB, false, pAB, 1, 0, qsbackend
         )
     end
 end
@@ -497,5 +833,50 @@ end
         @test haskey(pool, Float64)
         @test pool[Float32] isa QuasiStrided.ContractWorkspace{Float32, Vector{Float32}}
         @test pool[Float64] isa QuasiStrided.ContractWorkspace{Float64, Vector{Float64}}
+    end
+end
+
+@testset "workspace pooling: real and complex eltypes share one task-local pool" begin
+    # The complex round of the testset above. Per "Buffer element type: the
+    # `VT` bound relaxes, the arity does not": the pool stays keyed by
+    # `eltype(C)` (so `Float64` and `ComplexF64` get *distinct* workspaces and
+    # cannot couple each other's grow-only `reserve!` footprints), while the
+    # buffer element type is `real(T)` -- i.e. the new instance is
+    # `ContractWorkspace{ComplexF64, Vector{Float64}}`, and the existing
+    # `ContractWorkspace{Float64, Vector{Float64}}` spelling stays valid.
+    Random.seed!(8675309)
+    _qs_with_clean_pool() do
+        for T in (Float64, ComplexF64, Float64, ComplexF64, ComplexF32, Float64)
+            A = randn(T, (12, 7))
+            Bm = randn(T, (7, 9))
+            Cref = A * Bm
+            C = zeros(T, (12, 9))
+            @tensor backend = qsbackend C[i, j] = A[i, k] * Bm[k, j]
+            @test eltype(C) === T
+            @test C ≈ Cref
+        end
+
+        pool = task_local_storage(QuasiStrided._QS_WORKSPACE_KEY)
+        @test haskey(pool, Float64)
+        @test haskey(pool, ComplexF64)
+        @test haskey(pool, ComplexF32)
+        @test pool[Float64] !== pool[ComplexF64]
+        @test pool[ComplexF32] !== pool[ComplexF64]
+        @test pool[Float64] isa QuasiStrided.ContractWorkspace{Float64, Vector{Float64}}
+        @test pool[ComplexF64] isa QuasiStrided.ContractWorkspace{ComplexF64, Vector{Float64}}
+        @test pool[ComplexF32] isa QuasiStrided.ContractWorkspace{ComplexF32, Vector{Float32}}
+
+        # Re-run each eltype once more, after every other eltype has had its
+        # turn at growing its own pooled workspace: a `Float64` result must not
+        # be disturbed by the `ComplexF64` round that ran between its two
+        # invocations, and vice versa.
+        for T in (Float64, ComplexF64, ComplexF32)
+            A = randn(T, (12, 7))
+            Bm = randn(T, (7, 9))
+            C = fill(convert(T, NaN), (12, 9))
+            @tensor backend = qsbackend C[i, j] = A[i, k] * Bm[k, j]
+            @test all(isfinite, C)
+            @test C ≈ A * Bm
+        end
     end
 end

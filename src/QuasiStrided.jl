@@ -26,6 +26,9 @@ include("kernel.jl")
 # --- Phase 3: SIMD kernel + serial driver ---
 include("kernels/simd.jl")
 
+# --- Complex milestone: planar (split-complex) microkernel ---
+include("kernels/planar.jl")
+
 # --- Macro-blocking milestone: BLIS five-loop driver ---
 include("blocking.jl")
 

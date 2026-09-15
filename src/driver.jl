@@ -124,6 +124,11 @@ const NR_DEFAULT = 6
 
 _legacy_shape(::Type{T}) where {T} = (8, 6, _default_lanewidth(T))
 
+# Complex counterpart: same `(8, 6)` register tile in LOGICAL (complex) rows,
+# with the lane width taken from the real type, since every packed buffer and
+# every `SIMD.Vec` below the kernel boundary is made of `real(T)`.
+_legacy_shape(::Type{T}) where {T <: Complex} = (8, 6, _default_lanewidth(real(T)))
+
 # Deliberately empty: after Phase H the rule above is already the measured
 # optimum (1st of 24 for Float32, 2nd of 33 by 0.01% for Float64), so a row
 # here would only pin this package to one machine's noise.
@@ -138,6 +143,15 @@ _rule_applies(::Val{:avx512}) = true
 _rule_applies(::Val{:avx2}) = true
 _rule_applies(::Val) = false
 
+# Complex counterpart, `:avx512` only. Same treatment, and for the same kind of
+# reason, as the `:neon` fallback above: AVX2 has 16 ymm registers, and planar
+# holds separate real and imaginary accumulator planes, so even (MV,NR) = (1,6)
+# leaves exactly zero spare there (docs/decisions.md, "Cliff A"); the
+# reference's AVX2 complex shapes are explicitly marked unmeasured. Derive
+# where measured, fall back everywhere else.
+_rule_applies_complex(::Val{:avx512}) = true
+_rule_applies_complex(::Val) = false
+
 function _derived_shape(profile::TargetProfile, ::Type{T}) where {T}
     vb = profile.vector_bytes
     key = Val(profile.isa)
@@ -146,13 +160,62 @@ function _derived_shape(profile::TargetProfile, ::Type{T}) where {T}
     return ovr === nothing ? (2 * (vb ÷ sizeof(T)), NR_DEFAULT, vb ÷ sizeof(T)) : ovr
 end
 
+# A NEW METHOD, not an edit of the one above: "the real path is bit-identical"
+# is then a `git diff` fact rather than an argument about whether
+# `real(Float64) === Float64`.
+#
+# The one-line Phase G rule survives the complex extension unchanged; only the
+# `sizeof` argument moves to the real type, because `W` is a count of real
+# lanes. `MR = 2W, NR = NR_DEFAULT` with `W = vector_bytes / sizeof(real(T))`
+# gives `(16, 6, 8)` for `ComplexF64` on AVX-512 -- a 16x6 complex tile, which
+# is exactly the reference's measured planar menu head `(MV, NR) = (2, 6)`.
+# `_shape_override` is consulted here symmetrically with the real path, and is
+# equally empty.
+function _derived_shape(profile::TargetProfile, ::Type{T}) where {T <: Complex}
+    R = real(T)
+    vb = profile.vector_bytes
+    key = Val(profile.isa)
+    (_rule_applies_complex(key) && vb > 0 && vb % sizeof(R) == 0) ||
+        return _legacy_shape(T)
+    ovr = _shape_override(key, T)
+    return ovr === nothing ? (2 * (vb ÷ sizeof(R)), NR_DEFAULT, vb ÷ sizeof(R)) : ovr
+end
+
 # Closed set, so compiled SIMDKernel (and driver) specializations are bounded.
 const KERNEL_SHAPES_F64 = ((8, 6, 4), (16, 6, 8))
 const KERNEL_SHAPES_F32 = ((8, 6, 8), (32, 6, 16), (16, 6, 8))
 
+# Complex menus, seeded from the reference's measured AVX-512 shapes
+# (`crates/tensorcontract/src/kernel/x86.rs:182-190`) converted to this
+# project's `(MR, NR, W)` with `MR` in LOGICAL complex rows and `W` in real
+# lanes; at most three each, so the compiled specialization set stays bounded.
+# The 1m menus look "unaligned" (MR = 12 with W = 8) only because the
+# reference's MV counts REAL rows: 1m runs a real microkernel of `2MR` rows, so
+# `2*12 = 24` is what must be a multiple of `W`.
+const KERNEL_SHAPES_C64_PLANAR = ((16, 6, 8), (24, 3, 8), (8, 8, 8))
+const KERNEL_SHAPES_C64_ONEM = ((12, 8, 8), (16, 6, 8), (8, 8, 8))
+const KERNEL_SHAPES_C32_PLANAR = ((32, 6, 16), (48, 3, 16), (16, 8, 16))
+const KERNEL_SHAPES_C32_ONEM = ((24, 8, 16), (32, 6, 16), (16, 8, 16))
+
 kernel_shapes(::Type{Float64}) = KERNEL_SHAPES_F64
 kernel_shapes(::Type{Float32}) = KERNEL_SHAPES_F32
 kernel_shapes(::Type{T}) where {T} = (_legacy_shape(T),)
+
+"""
+    kernel_shapes(T, method::ComplexMethod) -> NTuple{<:Any,NTuple{3,Int}}
+
+Method-aware menu. Each complex method has its own measured menu because each
+has its own packed A format and therefore its own register budget; `RealMethod`
+forwards to the one-argument form so the real path is reached by exactly the
+code it always was.
+"""
+kernel_shapes(::Type{T}, ::RealMethod) where {T} = kernel_shapes(T)
+kernel_shapes(::Type{ComplexF64}, ::PlanarMethod) = KERNEL_SHAPES_C64_PLANAR
+kernel_shapes(::Type{ComplexF64}, ::OneMMethod) = KERNEL_SHAPES_C64_ONEM
+kernel_shapes(::Type{ComplexF32}, ::PlanarMethod) = KERNEL_SHAPES_C32_PLANAR
+kernel_shapes(::Type{ComplexF32}, ::OneMMethod) = KERNEL_SHAPES_C32_ONEM
+# Any other element type / method pair: the legacy shape, never a guess.
+kernel_shapes(::Type{T}, ::ComplexMethod) where {T} = (_legacy_shape(T),)
 
 # Unrolled over `kernel_shapes(T)` so every branch builds a concrete kernel
 # from literal `Val`s; the last shape is the fallback. Generated because a
@@ -175,6 +238,78 @@ end
 
 _default_kernel(::Type{T}) where {T} = _kernel_for(target_profile(), T)
 
+# ----------------------------------------------------------------------------
+# Complex kernel construction
+# ----------------------------------------------------------------------------
+# The complex counterpart of `_kernel_from_shape`, generated over
+# `kernel_shapes(T, method)` for exactly the same reason: every branch must
+# build a concrete kernel from literal `Val`s, because a plain loop would
+# construct `Val(cand[1])` dynamically and widen to `Any`.
+#
+# `OneMMethod` has no constructor yet (src/kernels/onem.jl, Phase D); its arm
+# throws rather than silently falling back to planar, since a silent method
+# substitution would make a planar-vs-1m measurement meaningless.
+@generated function _complex_kernel_from_shape(
+        shape::Tuple{Int, Int, Int}, ::Type{T}, method::PlanarMethod
+    ) where {T}
+    shapes = kernel_shapes(T, PlanarMethod())
+    ex = :(PlanarKernel(Val($(shapes[end][1])), Val($(shapes[end][2])), T, Val($(shapes[end][3]))))
+    for (MR, NR, W) in reverse(shapes[1:(end - 1)])
+        ex = :(
+            shape === ($MR, $NR, $W) ? PlanarKernel(Val($MR), Val($NR), T, Val($W)) : $ex
+        )
+    end
+    return ex
+end
+
+@noinline function _complex_kernel_from_shape(
+        shape::Tuple{Int, Int, Int}, ::Type{T}, method
+    ) where {T}
+    throw(
+        ArgumentError(
+            "no microkernel is available for $T at shape $shape under $(method). " *
+                "Only $(PlanarMethod()) is implemented; $(OneMMethod()) is the " *
+                "complex milestone's Phase D. Pass an explicit `kernel = ...` to " *
+                "plan_contract to use a kernel this engine does not pick itself."
+        )
+    )
+end
+
+# The complex register shapes are budgeted for a 32-register AVX-512 file: a
+# planar kernel holds 2*MV*NR accumulators + 2*MV A vectors + 2 B broadcasts,
+# which even at the smallest menu entry is over what AVX2's 16 ymm registers
+# can hold. `_rule_applies_complex` already refuses to *derive* a shape off
+# `:avx512`, but the legacy fallback would still hand one back, so gate kernel
+# *construction* too rather than shipping a guaranteed-spilling default. An
+# explicitly named `kernel =` still works everywhere -- this governs only what
+# the engine picks on its own.
+_complex_default_supported(::Val{:avx512}) = true
+_complex_default_supported(::Val) = false
+
+@noinline function _complex_unsupported_isa(::Type{T}, profile::TargetProfile) where {T}
+    throw(
+        ArgumentError(
+            "QuasiStrided has no measured complex register shape for the detected " *
+                "vector ISA :$(profile.isa) (only :avx512), so it will not choose a " *
+                "complex kernel for $T on this machine: every candidate shape needs " *
+                "more vector registers than this ISA provides, and a silently " *
+                "spilling default would be worse than an error. Pass an explicit " *
+                "`kernel = ...` to plan_contract if you want one anyway."
+        )
+    )
+end
+
+# The unconditional default; `OneMMethod` is selected only by naming the kernel
+# (docs/decisions.md, "Method ranking does not transfer between machines").
+_default_complex_method(::Type{<:Complex}) = PlanarMethod()
+
+@noinline function _kernel_for(profile::TargetProfile, ::Type{T}) where {T <: Complex}
+    _complex_default_supported(Val(profile.isa)) || _complex_unsupported_isa(T, profile)
+    return _complex_kernel_from_shape(
+        _derived_shape(profile, T), T, _default_complex_method(T)
+    )
+end
+
 # Extent-aware variant, used only when the caller did not name a kernel: a
 # contraction whose M extent cannot fill one register tile pads every
 # micro-tile away, so fall back to the legacy shape. Keys on padding waste (a
@@ -185,6 +320,16 @@ _default_kernel(::Type{T}) where {T} = _kernel_for(target_profile(), T)
     (Qm > 0 && Qm < mr(kernel)) || return kernel
     legacy = _legacy_shape(T)
     return SIMDKernel(Val(legacy[1]), Val(legacy[2]), T, Val(legacy[3]))
+end
+
+# Structurally identical to the real method above, so the demotion rule has one
+# definition in two places rather than two rules; it routes through the same
+# seam.
+@noinline function _default_kernel(::Type{T}, Qm::Int, Qn::Int) where {T <: Complex}
+    kernel = _kernel_for(target_profile(), T)
+    (Qm > 0 && Qm < mr(kernel)) || return kernel
+    legacy = _legacy_shape(T)
+    return _complex_kernel_from_shape(legacy, T, _default_complex_method(T))
 end
 
 # LOAD-BEARING (docs/decisions.md, macro-blocking Phase A findings): `_axis_of`
@@ -202,11 +347,19 @@ end
 # `pack!` is pack_a! or pack_b! (a plain function, specialized on, never a
 # closure); A and B differ only in which of rows/cols is the k axis, which
 # the caller has already resolved.
+#
+# `transform` is the plan's per-operand elementwise transform (`identity` or
+# `conj`), a singleton function value. It gets its OWN bound type parameter
+# `TF`: leaving it unbound reintroduces the Phase 2b finding-5 allocation, for
+# exactly the reason spelled out at src/kernel.jl:30-33. All three call sites
+# -- `_execute_nest!`'s two and `execute_tilewise!`'s one -- must pass the
+# matching operand's transform; missing the third would make the in-tree
+# ORACLE silently wrong for conjugated inputs.
 @inline function _pack_sliver!(
         pack!::PF, packed::PK, storage::S, base::Int,
-        rows::R, cols::C, kernel
-    ) where {PF, PK, S, R <: Axis, C <: Axis}
-    pack!(packed, SourceTile(storage, base, rows, cols), kernel, identity)
+        rows::R, cols::C, kernel, transform::TF
+    ) where {PF, PK, S, R <: Axis, C <: Axis, TF}
+    pack!(packed, SourceTile(storage, base, rows, cols), kernel, transform)
     return nothing
 end
 
@@ -238,6 +391,13 @@ end
 end
 
 # Same addressing as `_sliver_range`, as a borrowed pointer. Keep in step.
+#
+# `reg_tile` here is a count of REALS per logical K step --
+# `packed_a_per_k(kernel)`/`packed_b_per_k(kernel)`, not `mr`/`nr`. The two
+# coincide for every real kernel (pinned by a test in test/test_target.jl), so
+# this is the identity on the real path; for a complex kernel the panel holds
+# `reals_per_element` planes per element and only the packed count addresses it
+# correctly.
 @inline function _sliver_panel(buffer, reg_tile::Int, kc_len::Int, s::Int)
     stride = reg_tile * kc_len
     return packed_panel(buffer, s * stride + 1, stride)
@@ -286,6 +446,46 @@ function _scale_all_of_C!(plan, betaT::T, MRk::Int, NRk::Int, Qm::Int, Qn::Int) 
     return nothing
 end
 
+# ----------------------------------------------------------------------------
+# Conjugation: folding `conjA`/`conjB` with each view's `.op`
+# ----------------------------------------------------------------------------
+# These live here, in the engine, rather than in the TensorOperations adapter,
+# because the invariant they protect is an engine invariant: the engine never
+# goes through `StridedView` indexing at all (`_plan_contract` takes
+# `parent`/`offset` and addresses the parent directly), so a view's `.op` is
+# silently dropped on all three operands unless it is folded in here. A caller
+# who wraps a complex array in a conjugated `StridedView` and calls
+# `plan_contract`/`contract!` directly, with no adapter in sight, is exposed to
+# exactly the same silent wrongness. `src/tensoroperations.jl` uses these.
+#
+# A TOTAL table with a throwing fallback, not TensorOperations' TBLIS
+# extension's `A.op === conj` test: `StridedView(p, sz, st, off, adjoint)` is
+# directly constructible, and `=== conj` would silently treat it as
+# unconjugated -- precisely the silent-wrong-answer class this milestone exists
+# to close. The fallback is `@noinline` and unreachable for every `op`
+# `StridedViews` itself constructs, so it costs nothing.
+_op_conjugates(::typeof(identity)) = false
+_op_conjugates(::typeof(conj)) = true
+# Elementwise identity on a `Number`: these permute axes, they do not touch
+# values, and the engine has already resolved axes into `AxisGroup`s.
+_op_conjugates(::typeof(transpose)) = false
+_op_conjugates(::typeof(adjoint)) = true
+@noinline _op_conjugates(f) = throw(
+    ArgumentError(
+        "unsupported StridedView.op $f: QuasiStrided folds a view's `op` into the " *
+            "packing transform and recognizes only identity/conj/transpose/adjoint"
+    )
+)
+
+# The two sources of conjugation are independent and compose with XOR: the
+# flag conjugates the operand's data, and so does the view's `op`, so applying
+# both is the identity. `false` unconditionally for a real element type --
+# `StridedViews` defines `conj(::StridedView{<:Real}) = a`, so a real view's
+# `op` can never conjugate anyway, and the real path therefore always gets
+# `identity` and no new `execute!` specialization, even with `conjA = true`.
+_qs_isconj(v::StridedView{T}, flag::Bool) where {T} =
+    (T <: Complex) && (flag ⊻ _op_conjugates(v.op))
+
 """
     ContractPlan
 
@@ -293,15 +493,16 @@ Reusable plan from [`plan_contract`](@ref): resolved M/N/K `AxisGroup`s,
 kernel, operand storage/base, the effective [`Blocking`](@ref), and the
 [`ContractWorkspace`](@ref) holding every buffer
 [`execute!`](@ref)/[`execute_tilewise!`](@ref) need -- sized once during
-planning, never (re)allocated during execution. `VT` is the workspace's
-packed-panel vector type (`Vector{T}` on the default allocator path), a
-`where`-bound parameter resolved at construction, so every plan instance is
-concretely typed. Field layout is an implementation detail, not part of the
-frozen interface.
+planning, never (re)allocated during execution, plus the per-operand packing
+transforms `atransform`/`btransform`. `VT` is the workspace's packed-panel
+vector type (`Vector{real(T)}` on the default allocator path, so `Vector{T}`
+on the real path), a `where`-bound parameter resolved at construction, so
+every plan instance is concretely typed. Field layout is an implementation
+detail, not part of the frozen interface.
 """
 struct ContractPlan{
         T, Kern, GM <: AxisGroup, GN <: AxisGroup, GK <: AxisGroup, SA, SB, SC,
-        VT <: AbstractVector{T},
+        TA, TB, VT <: AbstractVector,
     }
     kernel::Kern
     mgroup::GM
@@ -315,6 +516,16 @@ struct ContractPlan{
     Cstorage::SC
     Cbase::Int
 
+    # Elementwise transform applied to each source element as it is packed:
+    # `identity` or `conj`, as singleton function VALUES with their own type
+    # parameters. Not a `Bool` field and not a `Val{Bool}`: either would cross
+    # `_pack_sliver!` as a `Union` or need mapping to a function at the pack
+    # site, which is Phase 2b finding 5 and its ~80 B/call of dynamic dispatch
+    # (docs/decisions.md, "Conjugation: semantics, and where each piece is
+    # absorbed").
+    atransform::TA
+    btransform::TB
+
     # Every buffer both drivers use (docs/decisions.md, "Amendment 1").
     workspace::ContractWorkspace{T, VT}
 end
@@ -324,6 +535,7 @@ end
                   B::StridedView, indB::NTuple{NB,Int},
                   indC::NTuple{NC,Int};
                   kernel = SIMDKernel(Val(8), Val(6), eltype(C)),
+                  conjA = false, conjB = false,
                   mc = nothing, kc = nothing, nc = nothing,
                   workspace = nothing,
                   allocator = TensorOperations.DefaultAllocator(),
@@ -351,12 +563,23 @@ Buffers (docs/decisions.md, "Amendment 1"):
     [`release!`](@ref) to the caller.
   * `oracle = false` skips `execute_tilewise!`'s own buffers entirely, making
     that oracle unavailable for this plan. `execute!` is unaffected.
+
+Conjugation: `conjA`/`conjB` request `conj` on A's/B's elements, TensorOperations'
+semantics (`alpha`/`beta` are never conjugated). Each flag is folded here with
+the corresponding view's `op` -- they compose with XOR, so a `conj`-wrapped view
+with `conjA = true` is unconjugated -- and the result is stored on the plan as a
+singleton transform applied during packing. A conjugated *output* view is
+rejected: the engine addresses `parent(C)` directly and would silently ignore
+it. For a real element type both transforms are `identity` no matter what the
+flags say, so the real path gains no specialization.
 """
 function plan_contract(
         C::StridedView, A::StridedView, indA::NTuple{NA, Int},
         B::StridedView, indB::NTuple{NB, Int},
         indC::NTuple{NC, Int};
         kernel = nothing,
+        conjA::Bool = false,
+        conjB::Bool = false,
         mc::Union{Int, Nothing} = nothing,
         kc::Union{Int, Nothing} = nothing,
         nc::Union{Int, Nothing} = nothing,
@@ -369,6 +592,22 @@ function plan_contract(
         throw(ArgumentError("eltype(A) = $(eltype(A)) does not match eltype(C) = $T"))
     eltype(B) === T ||
         throw(ArgumentError("eltype(B) = $(eltype(B)) does not match eltype(C) = $T"))
+
+    # Fold each flag with its view's `op`. The engine never indexes through a
+    # `StridedView`, so `op` would otherwise be dropped on all three operands;
+    # for C there is nowhere to absorb it, hence the rejection rather than a
+    # transform (docs/decisions.md, "A conjugated output `C` is rejected this
+    # milestone"). These are `Union{typeof(identity),typeof(conj)}` here and
+    # die at the `_plan_contract` function barrier below, exactly as
+    # `_default_kernel`'s Union already does.
+    _qs_isconj(C, false) && throw(
+        ArgumentError(
+            "plan_contract: cannot write into a conjugated view (C has op $(C.op)); " *
+                "writing a conjugated output is not supported"
+        )
+    )
+    atransform = _qs_isconj(A, conjA) ? conj : identity
+    btransform = _qs_isconj(B, conjB) ? conj : identity
 
     mlabels, nlabels, klabels = _classify_labels(indA, indB, indC)
 
@@ -385,19 +624,22 @@ function plan_contract(
     resolved = kernel === nothing ? _default_kernel(T, Qm, Qn) : kernel
     return _plan_contract(
         C, A, B, indC, mgroup, ngroup, kgroup, Qm, Qn, Qk,
-        resolved, mc, kc, nc, workspace, allocator, oracle
+        resolved, atransform, btransform, mc, kc, nc, workspace, allocator, oracle
     )
 end
 
-# Function barrier: the small Union from `_default_kernel` dies here, so
-# `ContractPlan`'s `Kern` is concrete and `execute!` sees no abstract type.
+# Function barrier: the small Unions from `_default_kernel` and from the
+# `conj`/`identity` transforms die here, so `ContractPlan`'s `Kern`, `TA` and
+# `TB` are concrete and `execute!` sees no abstract type. `TA`/`TB` each get
+# their own bound parameter for the same reason `K` does.
 function _plan_contract(
         C::StridedView, A::StridedView, B::StridedView, indC::NTuple{NC, Int},
         mgroup, ngroup, kgroup, Qm::Int, Qn::Int, Qk::Int,
-        kernel::K, mc::Union{Int, Nothing}, kc::Union{Int, Nothing},
+        kernel::K, atransform::TA, btransform::TB,
+        mc::Union{Int, Nothing}, kc::Union{Int, Nothing},
         nc::Union{Int, Nothing}, workspace::Union{Nothing, ContractWorkspace},
         allocator, oracle::Bool
-    ) where {NC, K}
+    ) where {NC, K, TA, TB}
     T = eltype(C)
     scalartype(kernel) === T ||
         throw(ArgumentError("kernel scalar type $(scalartype(kernel)) does not match eltype(C) = $T"))
@@ -437,7 +679,8 @@ function _plan_contract(
 
     return ContractPlan(
         kernel, mgroup, ngroup, kgroup, blocking,
-        Astorage, Abase, Bstorage, Bbase, Cstorage, Cbase, ws
+        Astorage, Abase, Bstorage, Bbase, Cstorage, Cbase,
+        atransform, btransform, ws
     )
 end
 
@@ -472,11 +715,27 @@ function _resolve_workspace(
     return ContractWorkspace(T, kernel, blocking, oracle, allocator)
 end
 
+# `R` is the PACKED element type, `real(T)` by `ContractWorkspace`'s own
+# invariant. The extra guard is what stops a pooled workspace of one precision
+# serving a plan of another: the backend's pool is keyed by `eltype(C)` alone,
+# so `T` matching is not by itself enough once the packed type is a separate
+# notion. `R` is a type parameter and `realtype(kernel)` is a compile-time
+# constant, so this folds away entirely.
 @inline function _reuse_workspace(
-        ::Type{T}, ws::ContractWorkspace{T, Vector{T}}, kernel, blocking::Blocking,
+        ::Type{T}, ws::ContractWorkspace{T, Vector{R}}, kernel, blocking::Blocking,
         oracle::Bool
-    ) where {T}
+    ) where {T, R}
+    R === realtype(kernel) || _throw_packed_eltype_mismatch(T, ws, kernel)
     return reserve!(ws, kernel, blocking, oracle)
+end
+
+@noinline function _throw_packed_eltype_mismatch(::Type{T}, ws, kernel) where {T}
+    throw(
+        ArgumentError(
+            "plan_contract: cannot reuse a $(typeof(ws)) whose packed panels hold " *
+                "$(eltype(ws.packed_a)) for a kernel packing $(realtype(kernel))"
+        )
+    )
 end
 
 @noinline function _reuse_workspace(
@@ -485,8 +744,9 @@ end
     throw(
         ArgumentError(
             "plan_contract: cannot reuse a $(typeof(ws)) for an eltype-$T contraction " *
-                "on the default allocator; only a ContractWorkspace{$T,Vector{$T}} is " *
-                "`reserve!`-able"
+                "on the default allocator; only a " *
+                "ContractWorkspace{$T,Vector{$(realtype(kernel))}} -- storage element " *
+                "type $T, packed panels of $(realtype(kernel)) -- is `reserve!`-able"
         )
     )
 end
@@ -549,6 +809,19 @@ function _execute_nest!(
         Qm::Int, Qn::Int, Qk::Int, mc_eff::Int, kc_eff::Int, nc_eff::Int,
         alphaT::T, betaT::T
     ) where {T, K}
+    # Reals per sliver per LOGICAL K step, which is what addresses the packed
+    # panels. `MRk`/`NRk` keep their existing meaning everywhere else in this
+    # function -- sliver counts, block extents, `_classify_slivers!` -- and are
+    # NOT interchangeable with these: one counts register-tile rows, the other
+    # counts reals. For every real kernel `MRp === MRk` and `NRp === NRk`
+    # (pinned in test/test_target.jl), so the substitution below is provably
+    # the identity on the real path.
+    MRp = packed_a_per_k(kernel)
+    NRp = packed_b_per_k(kernel)
+
+    atransform = plan.atransform
+    btransform = plan.btransform
+
     # --- loop 5: jc over N in steps of nc_eff ---
     jc = 0
     while jc < Qn
@@ -577,8 +850,11 @@ function _execute_nest!(
             for s in 0:(n_slivers - 1)
                 sfirst = s * NRk
                 colsB = _axis_of(ws.n_desc_B[s + 1], ws.n_buf_B, sfirst)
-                bpanel = _sliver_panel(ws.packed_b, NRk, kblock, s)
-                _pack_sliver!(pack_b!, bpanel, plan.Bstorage, plan.Bbase, rowsB_k, colsB, kernel)
+                bpanel = _sliver_panel(ws.packed_b, NRp, kblock, s)
+                _pack_sliver!(
+                    pack_b!, bpanel, plan.Bstorage, plan.Bbase, rowsB_k, colsB,
+                    kernel, btransform
+                )
             end
 
             # --- loop 3: ic over M in steps of mc_eff ---
@@ -596,19 +872,22 @@ function _execute_nest!(
                 for r in 0:(m_slivers - 1)
                     rfirst = r * MRk
                     rowsA = _axis_of(ws.m_desc_A[r + 1], ws.m_buf_A, rfirst)
-                    apanel = _sliver_panel(ws.packed_a, MRk, kblock, r)
-                    _pack_sliver!(pack_a!, apanel, plan.Astorage, plan.Abase, rowsA, colsA_k, kernel)
+                    apanel = _sliver_panel(ws.packed_a, MRp, kblock, r)
+                    _pack_sliver!(
+                        pack_a!, apanel, plan.Astorage, plan.Abase, rowsA, colsA_k,
+                        kernel, atransform
+                    )
                 end
 
                 # --- loop 2: jr over N-slivers; loop 1: ir over M-slivers ---
                 for s in 0:(n_slivers - 1)
                     sfirst = s * NRk
                     colsC = _axis_of(ws.n_desc_C[s + 1], ws.n_buf_C, sfirst)
-                    bpanel = _sliver_panel(ws.packed_b, NRk, kblock, s)
+                    bpanel = _sliver_panel(ws.packed_b, NRp, kblock, s)
                     for r in 0:(m_slivers - 1)
                         rfirst = r * MRk
                         rowsC = _axis_of(ws.m_desc_C[r + 1], ws.m_buf_C, rfirst)
-                        apanel = _sliver_panel(ws.packed_a, MRk, kblock, r)
+                        apanel = _sliver_panel(ws.packed_a, MRp, kblock, r)
                         _execute_micro_tile!(
                             kernel, plan.Cstorage, plan.Cbase, rowsC, colsC,
                             apanel, bpanel, kblock, alphaT, beta_eff
@@ -699,8 +978,20 @@ function execute_tilewise!(plan::ContractPlan{T}, alpha::Number, beta::Number) w
                 colsK_A = _axis_of(dK_A, ws.tw_k_buf_A, 0)
                 rowsK_B = _axis_of(dK_B, ws.tw_k_buf_B, 0)
 
-                _pack_sliver!(pack_a!, ws.tw_packed_a, plan.Astorage, plan.Abase, rowsA, colsK_A, kernel)
-                _pack_sliver!(pack_b!, ws.tw_packed_b, plan.Bstorage, plan.Bbase, rowsK_B, colsB, kernel)
+                # The third `_pack_sliver!` call site. The oracle must apply the
+                # same transforms as `execute!`, or it silently disagrees on
+                # conjugated inputs and the disagreement presents as an engine
+                # bug. No `_sliver_panel` here: these are whole buffers, sized
+                # by `packed_a_length`/`packed_b_length`, which already count
+                # reals -- so this driver needs no `MRp`/`NRp` treatment.
+                _pack_sliver!(
+                    pack_a!, ws.tw_packed_a, plan.Astorage, plan.Abase, rowsA, colsK_A,
+                    kernel, plan.atransform
+                )
+                _pack_sliver!(
+                    pack_b!, ws.tw_packed_b, plan.Bstorage, plan.Bbase, rowsK_B, colsB,
+                    kernel, plan.btransform
+                )
 
                 beta_eff = firstpanel ? betaT : one(T)
                 _execute_micro_tile!(
