@@ -55,7 +55,13 @@ mkpath(OUTDIR)
 # run-to-run noise floor is established, and a noise floor measured from one
 # run is not a noise floor).
 const RUN_TAG = let
-    c = git_commit()
+    # `QS_GUARD_LABEL` exists because the whole point of this script is to
+    # compare two trees, and the tree that is NOT the working copy is usually
+    # an extracted one (`git archive`) where `git_commit()` cannot work. Label
+    # it explicitly so the artefacts say which engine they measured -- without
+    # this, a reviewer finds four identically-tagged CSVs and cannot tell a
+    # two-tree comparison from a same-tree noise measurement. That happened.
+    c = get(ENV, "QS_GUARD_LABEL", git_commit())
     # `git_commit()` returns a human sentence on failure ("unknown (git
     # rev-parse failed)"), which is how a tree extracted with `git archive`
     # reports -- exactly the situation this script is built for. Keep the

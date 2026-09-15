@@ -227,13 +227,22 @@ end
 #     re-deriving the beta-applied-once argument under
 #     `beta_eff = firstpanel ? betaT : one(T)`.
 #
-# Both the fold and the rejection live in `plan_contract`, not here:
-# `plan_contract`/`contract!` are public entry points reachable without this
-# adapter, and a caller who hands the engine a conjugated complex `StridedView`
-# directly is exposed to the identical silent wrongness. Putting the check at
-# the engine boundary protects both paths, and the adapter does not duplicate
-# it (docs/decisions.md, "Second addendum to 'Required argument-checking order
-# in the adapter (frozen)'"). It also makes the plan/view mismatch hazard
+# The *fold* lives in `plan_contract`, not here, and the rejection lives in
+# BOTH. `plan_contract`/`contract!` are public entry points reachable without
+# this adapter, and a caller who hands the engine a conjugated complex
+# `StridedView` directly is exposed to the identical silent wrongness, so the
+# engine must check. The adapter checks as well, because it passes
+# `workspace = _qs_task_workspace(...)` as an *argument* to `plan_contract`
+# and Julia evaluates arguments first -- so relying on the engine alone would
+# acquire (and possibly `reserve!`-grow) a pooled workspace on behalf of a call
+# that is about to be rejected, at a point the frozen order does not mention.
+# See `_qs_prepare` below, and docs/decisions.md's "Second addendum to
+# 'Required argument-checking order in the adapter (frozen)'" together with its
+# correction in "Phase C integration findings". Both sites call the identical
+# `_qs_isconj(Cv, false)`, so the two cannot diverge in behaviour, and each has
+# its own pinning test.
+#
+# Keeping the fold single-owned also makes the plan/view mismatch hazard
 # unrepresentable rather than merely detected: `execute!(plan, α, β)` takes no
 # operands, so there is nothing to re-supply with a different `op`.
 #

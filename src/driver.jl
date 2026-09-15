@@ -604,12 +604,21 @@ end
     plan_contract(C::StridedView, A::StridedView, indA::NTuple{NA,Int},
                   B::StridedView, indB::NTuple{NB,Int},
                   indC::NTuple{NC,Int};
-                  kernel = SIMDKernel(Val(8), Val(6), eltype(C)),
+                  kernel = nothing,
                   conjA = false, conjB = false,
                   mc = nothing, kc = nothing, nc = nothing,
                   workspace = nothing,
                   allocator = TensorOperations.DefaultAllocator(),
                   oracle = true) -> ContractPlan
+
+`kernel = nothing` (the default) resolves the kernel *after* the M/N/K groups
+are built, via `_default_kernel(T, Qm, Qn)`, because the extent-aware demotion
+needs `Qm`. For a real element type that is a [`SIMDKernel`](@ref) at the
+hardware-derived shape; for a complex one a [`PlanarKernel`](@ref) at the
+swept shape (and on a vector ISA with no complex measurement, an
+`ArgumentError` rather than a guaranteed-spilling default -- pass `kernel`
+explicitly to override). [`OneMKernel`](@ref) is never selected automatically;
+naming it is the only way to use 1m.
 
 Planning phase of [`contract!`](@ref): resolves labels into M/N/K
 `AxisGroup`s, validates matched axis lengths and eltypes, and preallocates

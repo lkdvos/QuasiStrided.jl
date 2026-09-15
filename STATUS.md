@@ -515,12 +515,106 @@ Sonnet-High over everything since Phase A. Neither is spent yet;
       they apply on `:avx512` only. Complex-efficiency geomean went
       **1.256 → 1.829** (`ComplexF64`) and **1.457 → 1.910** (`ComplexF32`),
       and the sub-1.0 dip at the large compute-bound sizes disappeared
-      (`ComplexF64` 512³ 40.5 → 73.7 GF/s, +82%). Real-path guard: no
-      regression, pooled geomean 0.988 over four runs per tree, though the
-      honest reading is that the effect is below that measurement's ~5%
-      resolution. Planar stays the default; 1m stays selectable only by name.
-- [ ] **Phase G** (the two gated reviews).
-- [ ] **Phase H** (close: `docs/decisions.md`, this file, `README.md`).
+      (`ComplexF64` 512³ 40.5 → 73.7 GF/s, +82%). Real-path guard: **no regression
+      detectable at the instrument's ~5-6% resolution**, which is all it can
+      support — the earlier "pooled geomean 0.988" is retracted, since the
+      between-tree effect (2.0%) is smaller than the same-tree run-to-run
+      noise (up to 6.3% geomean) and the sign flips between rounds. No
+      systematic one-sided shift, and the resolved kernel shape is identical
+      at every point in both trees. Planar stays the default; 1m stays selectable only by name.
+- [x] **Phase G** (the two gated reviews, both spent —
+      `fable_review_complex_used: true`). The Fable pass found **no blocking
+      numerical finding**: 1352 adapter + 512 direct-engine + 4 macro cases
+      against oracles it wrote itself, zero failures, and it hand-verified the
+      1e conjugated layout via the observation that the 2×2 block is the real
+      matrix representation of "multiply by z", so substituting `conj(z)` gives
+      exactly `M(z)ᵀ`. It also established something stronger than the freeze
+      claimed: **xor is TensorOperations' own semantics**, forced by TO
+      realising `conjA` as `conj(SV(A))` and StridedViews flipping `op` through
+      its `_conj` table — not merely TBLIS's convention. Four record/doc
+      defects found and fixed (two false claims in Amendment 3, a
+      self-contradicting source comment, a stale docstring default).
+      The Sonnet pass found **one blocking finding and it was right**: the
+      real-path guard's quoted geomean was not substantiated by the artefacts
+      on disk. The number is retracted and the conclusion narrowed — see below.
+      It independently re-measured zero allocation in all 24 (method × shape ×
+      precision × function) cells on a *scattered* fixture.
+- [x] **Phase H** (close): `docs/decisions.md` carries the freeze, Amendments
+      3 and 4, the Phase C/D/F findings and corrections, and the Phase G
+      disposition; `README.md` describes complex support as a capability
+      (including the measured efficiency ratio and the one machine-specific
+      constant in the package) and narrows its "Not implemented" list to what
+      is genuinely still out of scope; this section is the closing record.
+
+**Milestone closed.** `ComplexF32`/`ComplexF64` work through both `contract!`
+and `@tensor backend = QuasiStridedBackend()`, with `conjA`/`conjB` and
+`StridedView.op` composed by xor and absorbed at pack time.
+
+### What shipped
+
+- `src/complex_format.jl` (new): the packed formats (`RealFormat`,
+  `PlanarFormat` = BLIS "1r", `OneEFormat` = BLIS "1e"), the method singletons,
+  `ComplexKernelDescriptor`, and the accessors that keep every generic total on
+  the real path (`realtype`, `packed_a_per_k`, `packed_b_per_k`,
+  `complex_method`). `src/kernel_descriptor.jl` is **untouched**: the frozen
+  packed format is preserved as the `RealFormat` instance of a more general
+  offset formula, not redefined.
+- `src/kernels/planar.jl` (new): the default. A genuinely complex microkernel,
+  four real FMAs per (A-vector, B-scalar) pair with no shuffles, flat
+  `NTuple{2NV,Vec{W,real(T)}}` accumulator, every body `@generated` with
+  literal tuple indices.
+- `src/kernels/onem.jl` (new): Van Zee's induced method, reusing the **real**
+  `SIMDKernel` verbatim over `2*kc` real steps. Selectable only by naming it.
+- Conjugation through the `transform` seam that already existed, folded with
+  `.op` at plan time and stored as `ContractPlan`'s `TA`/`TB`; a conjugated
+  *output* is rejected.
+- `ContractWorkspace{T,VT}`'s bound relaxed (not extended) so every existing
+  `ContractWorkspace{Float64,Vector{Float64}}` spelling still type-checks.
+- The one machine-specific constant in the package: `_shape_override` for
+  complex on `:avx512` only.
+
+### Measured (ccqlin038, Cascade Lake, Julia 1.12.6, 21 reps)
+
+- **Complex efficiency geomean 1.83 (`ComplexF64`) / 1.91 (`ComplexF32`)** —
+  complex GFLOP/s over the same engine's real GFLOP/s at the same shape, with
+  complex charged the textbook 8 flops/MAC. Above 1.0 means complex is treated
+  *better* than real, as twice the arithmetic intensity predicts.
+- **No real-path regression detectable** at the guard's ~5-6% resolution.
+- **Zero allocation** in all 24 (method × shipped shape × precision ×
+  `accumulate`/`execute_tile!`) cells on a scattered fixture, independently
+  re-measured at review.
+
+### The two things most worth remembering
+
+1. **The hardware-derived register-shape rule did not survive the complex
+   extension.** It is arithmetically sound and reproduces the reference
+   project's measured shape, yet on this machine through Julia's register
+   allocator it selects the *worst* planar configuration by 38-41%. Phase C's
+   spill analysis predicted that before Phase F measured it. The lesson is the
+   project's own "ranking does not transfer between machines", applying one
+   level lower than it was written for: a shape validated through one
+   compiler's register allocator need not hold under another's.
+2. **A claim about evidence failed review where no claim about code did.**
+   Both passes probed the conjugation logic hard and found nothing wrong with
+   it; the one blocking finding was that the real-path guard's quoted number
+   was not substantiated by the files on disk. It was retracted. Benchmark
+   artefacts that do not say which tree they measured are not evidence.
+
+### Still out of scope on the complex side
+
+3m; mixed real/complex operands; writing into a conjugated output `C`; complex
+register shapes for AVX2 or NEON (the engine refuses to pick a complex kernel
+on an unmeasured ISA rather than ship a guaranteed-spilling default); the
+unit-stride plane-to-interleave store (measurement-gated, not yet justified);
+complex `tensoradd!`/`tensortrace!` (contraction-only is unchanged).
+
+### Open, deliberately
+
+"Which spill detector is right" — Phase C's versus Phase D's — is not settled
+and no longer needs to be: Phase F ranked on measured throughput, which
+supersedes the spill-count question, and both detectors agreed on the shape
+that mattered. It is a disagreement about an instrument nothing shipped now
+depends on.
 
 **Phase D also corrected Phase C.** Phase C's planar spill table presented
 spilling as monotone in a single pressure number; Phase D's detector — which

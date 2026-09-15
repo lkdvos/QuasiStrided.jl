@@ -1316,13 +1316,23 @@ nothing in it; it exists so the list can be read in one place at close.
   add/permute or trace step therefore cannot run wholesale under
   `backend=QuasiStridedBackend()`. Known and accepted; `README.md` says so
   plainly.
-- **Complex element types.** Blocked by the load-bearing conj/`op`
-  invariant under "Eligibility predicate, and the conjugation invariant":
-  QuasiStrided ignores `StridedView.op` and `conjA`/`conjB` entirely, which
-  is correct *only* for real `Float32`/`Float64`. Widening
-  `_qs_eltype_ok` without first handling `op`/`conj` explicitly would
-  produce silently wrong results, not an error. Do not treat this as a
-  one-line change.
+- **Complex element types.** ~~Blocked by the load-bearing conj/`op`
+  invariant~~ — **no longer true as of the complex element-type milestone;
+  see "Amendment 3" and the milestone sections at the end of this file.**
+  `ComplexF32`/`ComplexF64` are supported, `conjA`/`conjB` are folded with
+  each operand's `StridedView.op` by xor, and a conjugated *output* is
+  rejected. What remains out of scope on the complex side is narrower: the
+  3m method, mixed real/complex operands, and writing into a conjugated
+  output view.
+
+  The original text is struck rather than deleted because the reasoning it
+  recorded — that widening `_qs_eltype_ok` without first handling `op`/`conj`
+  would produce silently wrong results rather than an error — was correct
+  about the code as it then stood, and is exactly why the milestone had to do
+  that work first. Amendment 3 claimed this bullet had already been struck
+  while it was in fact still standing and asserting the opposite of the
+  shipped behaviour; that was caught by the milestone's gated review and is
+  fixed here.
 - **Threading.** Deferred. The state layout does not preclude it — see the
   macro-blocking "Phase D" finding 4 above (`ContractPlan`'s `(jc,pc)` and
   per-`ic` state are already disjoint fields; parallelizing over `ic` would
@@ -2458,10 +2468,16 @@ What is **amended**:
   a derived complex row rather than a hand-tabulated one.
 - **The bullet requiring "a test that pins it (real operands with
   `conjA`/`conjB` set true still give results identical to `StridedNative()`)".**
-  Kept and *strengthened*: that test stays, textually unchanged, as the
-  real-path-unchanged guard, and is now joined by its complex counterpart and by
-  the type-level assertion that `typeof(plan.atransform) === typeof(identity)` for
-  real `T` even when `conjA = true`.
+  **Kept and strengthened** — but *not* textually unchanged, which an earlier
+  revision of this amendment wrongly claimed. The testset was renamed ("conj is
+  a no-op for real eltype" -> "conj is real conjugation for complex eltype, and
+  still a no-op for real"), its loop widened from `eltypes` to `all_eltypes`,
+  and a `T <: Complex` branch added. The real-path *assertion* (`Rq ≈ Rn`)
+  survives and gained `Rq ≈ A * B`, so the guard is intact and stronger; only
+  the claim about its text was wrong. It is now joined by its complex
+  counterpart and by the type-level assertion that
+  `typeof(plan.atransform) === typeof(identity)` for real `T` even when
+  `conjA = true`.
 
 In the closing summary's "Explicitly NOT done" list, the **Complex element types**
 bullet is struck and replaced by a pointer to this milestone plus the residual
@@ -2479,6 +2495,15 @@ The order gains a **conjugated-output rejection**, and it necessarily runs
 aliasing check had to move there:
 
     eligibility -> argcheck -> dimcheck -> wrap -> aliasing -> conjugated-C rejection
+
+> **Superseded in part — see "Phase C integration findings" below.** The
+> placement argued for here (the check in `plan_contract` only, the adapter not
+> duplicating it) turned out to be violated by Julia's keyword-argument
+> evaluation: the adapter passes `workspace = _qs_task_workspace(...)` as an
+> *argument* to `plan_contract`, so a pooled workspace was acquired before
+> `plan_contract`'s own rejection could fire. The adapter now performs the
+> rejection too. The reasoning below still stands for *why* the engine keeps a
+> check; it is no longer the only one.
 
 The check itself lives in **`plan_contract`, not in `_qs_prepare`**.
 `plan_contract` and `contract!` are public entry points reachable without the
@@ -2862,19 +2887,50 @@ this run is evidence against that.
 `benchmark/bench_real_path_guard.jl` (new) runs the real default path across two
 trees -- the working tree and the milestone base `114e594` -- because that
 comparison cannot be made in one process, both trees defining a module named
-`QuasiStrided`. Four runs per tree, pooled:
+`QuasiStrided`.
 
-    overall geomean new/base = 0.9883      (Float64 1.0155, Float32 0.9617)
-    slower on 6 of 18 points, min 0.807, max 1.149
+**Corrected after the gated review.** An earlier revision of this section quoted
+"overall geomean new/base = 0.9883" from four runs per tree. That number is
+**retracted**: it does not reproduce. Re-run in ABBA order with both trees
+explicitly labelled (`QS_GUARD_LABEL`, added for this reason), the same
+comparison gives
 
-**No regression.** But the honest reading is that the effect is *below this
-measurement's resolution*, not that a 1.2% speedup was found: within-tree
-run-to-run variation reached 8.9% (new tree, runs 1 to 3) against a 1.2%
-between-tree difference, and the two dtypes disagree in sign. The defensible
-claim is no real-path regression at roughly 5% resolution, which is what the
-acceptance criterion needs -- there is no systematic one-sided shift, which is
-what a lost specialization would look like, and the resolved kernel shape is
-identical at every point in both trees.
+    same-tree run-to-run noise:  base geomean 0.985 (range 0.922-1.059)
+                                 head geomean 0.937 (range 0.698-1.079)
+    between-tree effect, pooled: overall 1.020   (Float64 1.027, Float32 1.014)
+                                 slower on 13 of 18, range 0.957-1.089
+    per round:                   1.045 and 0.994  -- the sign flips
+
+The between-tree difference (2.0%) is **smaller than the same-tree
+run-to-run noise** (up to 6.3% on geomean, 30% on a single point), and the
+sign flips both between rounds within a session and between sessions (0.988
+then 1.020). So the only claim this instrument supports is:
+
+> **No real-path regression detectable at this measurement's resolution, which
+> is roughly 5-6% on geomean.** There is no systematic one-sided shift -- which
+> is what a lost specialization would look like -- and the resolved kernel shape
+> is identical at every point in both trees.
+
+That is sufficient for the acceptance criterion, which asks for absence of
+regression rather than a precise figure. It is not sufficient to claim a
+speedup, and the earlier revision should not have quoted one.
+
+Two things the review was right to object to, both now fixed:
+
+- **The artefacts did not identify which tree they measured.** `results_dir()`
+  is keyed by host and date, and `git_commit()` returns a human sentence in a
+  `git archive`-extracted tree, so all four files carried the same tag and were
+  indistinguishable from a same-tree noise run. A reviewer reading
+  `benchmark/results/` could not verify the claim -- and was correct not to take
+  it on trust. Filenames now carry an explicit label, and both trees' artefacts
+  are preserved side by side under the same results directory.
+- **The base-tree run lived only in ephemeral scratch.** Note that
+  `benchmark/results/` is gitignored by long-standing project convention, so
+  *no* benchmark evidence in this package is committed; the fix is that the two
+  sides are now co-located and self-identifying on disk, not that they are in
+  git. Anyone re-deriving this needs to extract `114e594`, copy in the current
+  `benchmark/` directory (the instrument must be shared, only the engine
+  differs), and set `QS_GUARD_LABEL`.
 
 Three methodological notes, recorded because each cost time to find:
 
@@ -2894,6 +2950,25 @@ Three methodological notes, recorded because each cost time to find:
   machine that the six-canary efficiency sweep measured at 0.4%. Judge
   quietness from the middle/end pair; the start canary is a cross-run reference
   only. Documented in the script header.
+
+### Arm 2's ranking is block-sequential, which bounds how finely it can be read
+
+Raised by the gated review and accepted. `bench_complex_efficiency.jl`'s arm 2
+loops `for method, for shape: time every case`, so all six configurations for a
+given element type run back to back over minutes rather than interleaved. That
+is the same class of confound the real-path guard was re-run in ABBA order to
+remove, and arm 2 did not get the same treatment.
+
+What bounds it: the canary bracket immediately around each element type's arm-2
+window reads 0.4-3.0%, so drift cannot manufacture the 38-41% headline effect,
+nor most of the finer ordering. What it does *not* bound: a ~6% gap between
+adjacently ranked configurations -- planar `24x3` at 1.055 against 1m `16x6` at
+1.116 -- is only about twice the canary-bounded drift. **So the headline result
+(the derived shape is the worst planar configuration, and `24x3`/`48x3` is the
+best) is load-bearing; the finer ordering between planar's winner and 1m's
+winner is not.** Nothing in the shipped code depends on that finer ordering:
+planar is the default for reasons the freeze fixed in advance, and no
+auto-dispatch rule is derived from any of it.
 
 ### Harness defects fixed en route
 
@@ -2942,3 +3017,112 @@ of any `ContractPlan` a user inspects, and in the error message when a shape or
 ISA is rejected. A name a user is shown should be a name a user may write.
 
 Nothing is exported. The single export remains `QuasiStridedBackend`.
+
+## Complex element-type milestone: Phase G gated review disposition
+
+Two gated passes, both spent; `fable_review_complex_used: true`. Neither may be
+relaunched for this milestone.
+
+### Pass 1 (Fable) — conjugation semantics and record integrity
+
+Scoped deliberately narrow, to the one area whose failure mode is a *silently
+wrong number* rather than an error. **No blocking numerical finding.** The
+reviewer could not make the engine produce a wrong answer through any
+combination of `conjA`/`conjB`, the four `op` values, either operand, either
+element type, either complex kernel, either driver, the adapter, or `@tensor` --
+1352 adapter cases, 512 direct-engine cases (each run through both `execute!`
+and `execute_tilewise!`), and 4 macro cases, all against oracles the reviewer
+wrote rather than against this suite. Zero failures.
+
+Worth recording because it strengthens the freeze's own argument: **xor is
+TensorOperations' semantics, not merely TBLIS's convention.** TO 5.8.0's
+`StridedNative` realises `conjA` as `conj(SV(A))`, and StridedViews 0.5.2
+realises `conj` on a view by flipping `op` through its `_conj` table
+(`identity<->conj`, `adjoint<->transpose`). That is conjugation *parity* by
+construction, which is xor. The freeze inferred the rule from TBLIS; it turns
+out to be forced by the upstream implementation.
+
+Also independently hand-verified, by an argument worth preserving: the 1e 2x2
+block `[[re,-im],[im,re]]` is the real matrix representation `M(z)` of
+"multiply by z". Substituting `conj(z) = (re,-im)` yields
+`[[re,im],[-im,re]] = M(conj z) = M(z)ᵀ` -- so "negate the imaginary part
+before applying the layout" and "apply the layout to `conj(z)`" *coincide*,
+which is exactly what the restated `transform` contract requires. Confirmed
+numerically: the conj-packed panel is bit-equal to a hand-written layout, and
+read back as the real 4x4 matrix the 1m inner kernel sees, times a
+planar-packed B, it reproduces `conj(A)*B` exactly and differs from `A*B`.
+Padding writes literal `+0.0`, not `-0.0`, in all four 1e reals.
+
+Findings, all fixed:
+
+- **B1 (record).** Amendment 3 claimed the "Complex element types" bullet in
+  the closing summary's "Explicitly NOT done" list had been struck. It had not.
+  A reader landing there was told complex was blocked and that `op` is ignored
+  entirely -- both false of the shipped code. The bullet is now struck in
+  place, with the original reasoning retained (struck, not deleted) because it
+  was true of the code as it then stood and is why the work was necessary.
+- **B2 (record).** Amendment 3 claimed the real-path conjugation pin test
+  "stays, textually unchanged". It was renamed, its loop widened, and a
+  complex branch added. The real-path *assertion* survives and gained
+  `Rq ≈ A * B`, so the guard is intact and stronger -- but the claim about its
+  text was false, and the freeze's "git diff shows additions, not edits" proof
+  does not hold for that file. Reworded to "kept and strengthened".
+- **S1 (source).** `src/tensoroperations.jl` contradicted itself twenty lines
+  apart: the pre-Phase-C comment still said "the adapter does not duplicate
+  it", while the Phase C comment below said the duplication is deliberate and
+  why. Phase C corrected the record but not the comment. Rewritten.
+- **S2 (record).** The "Second addendum" stood uncorrected in place while Phase
+  C reversed it 70 lines later. Now carries an in-place forward pointer, which
+  is how every other superseded section in this file is handled.
+- **N3 (docs).** `plan_contract`'s docstring still advertised
+  `kernel = SIMDKernel(Val(8), Val(6), eltype(C))` as the default; the real
+  default has been `nothing` (resolved after the M/N/K groups exist, so the
+  extent-aware demotion can see `Qm`) since Phase G. Corrected, and extended to
+  say what it resolves to per element type and that 1m is never automatic.
+
+Accepted without action: on a non-`:avx512` machine an *eligible* complex
+adapter call throws from the workspace argument's `_default_kernel` before
+`plan_contract` runs -- an `ArgumentError`, never silent, but a step the frozen
+order does not mention. It is the same keyword-evaluation ordering quirk Phase C
+found, in a case where the outcome is a loud error either way.
+
+### Pass 2 (Sonnet-High) — everything else
+
+**One blocking finding, and it was right**: the real-path regression guard's
+quoted geomean was not substantiated by the artefacts on disk. See "The
+real-path regression guard" above for the correction -- the number is retracted,
+the conclusion narrowed to what the instrument can resolve, and the artefacts
+now identify which tree they measured. This is the most valuable finding of
+either pass, because it was a claim about *evidence* rather than about code, and
+the evidence did not support it.
+
+One should-fix on arm 2's block-sequential ordering, accepted and recorded above.
+
+Independently re-measured and confirmed, with numbers, rather than taken on
+trust: **zero allocation in all 24 cells** of (2 methods x 3 shipped shapes x 2
+precisions x `accumulate`/`execute_tile!`) on a *scattered* destination -- the
+fixture class that hid a real 24 KB regression in this project before. Also
+verified by direct reading: the planar arithmetic and its plane indices across
+`zero_accumulator`/accumulate/store; 1m's adjacency argument and `(2u+1, 2u+2)`
+lane extraction, with no shipped menu entry violating it; that no complex
+accumulate or store uses a runtime tuple index; that the relaxed
+`ContractWorkspace` bound leaves no field abstract and cannot be bypassed
+(immutable struct, single constructor path, pool keyed on `T` so `real(T)` is
+fixed); that `_workspace_sizes` genuinely needs no change; that logical `kc` and
+real counts are nowhere mixed, including at `OneEFormat` edge slivers; that the
+menu reorder left the specialization *set* unchanged (pinned by a test, not
+prose); and that all 16 `skip=(VERSION < v"1.11")` markers sit on allocation
+assertions only, never shielding a correctness assertion.
+
+The reviewer also confirmed the packing tests' "guard on the guard" is real: a
+positive assertion that the conj and identity packings genuinely differ, so the
+main bitwise pin is capable of failing.
+
+### The one open item, deliberately left open
+
+"Which spill detector is right" (Phase C's versus Phase D's) is **not settled**,
+and no longer needs to be. Phase F ranked the shapes on measured throughput,
+which supersedes the spill-count question as its own tie-breaker, and both
+detectors agreed on the shape that matters. Recorded so a future reader does not
+mistake the disagreement for a live risk: it is a disagreement about an
+instrument nothing shipped now depends on.
