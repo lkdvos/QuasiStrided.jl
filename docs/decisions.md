@@ -3263,3 +3263,68 @@ text at none of that risk.
 The independent oracles in `test/` were not shrunk: several deliberately
 re-implement a packed format so they can catch the implementation being wrong,
 and they are the evidence this pass is safe.
+
+### Amendment 5: the engine fits a complex shape to the register file; it does not refuse
+
+Amends the Phase C finding "The complex legacy shape is over the AVX2 register
+budget" and its `_complex_default_supported` gate.
+
+**Phase C was wrong, and CI proved it within minutes of the first push.** That
+gate refused to pick a complex kernel on any ISA but `:avx512`, on the argument
+that "an error beats a guaranteed-spilling default". Three of five CI jobs
+failed on it: every Linux runner is AVX2 and every macOS runner is `:neon`, so
+complex support was **unavailable through `@tensor` on every machine this
+project tests on** -- and on most machines anyone would run it on. The two
+jobs that passed were the one configuration the work was developed against.
+
+The priority was backwards. "An error beats a guaranteed spill" is defensible
+only when the user has an alternative; here they did not, and a
+slow-but-correct kernel beats no complex support at all. `_shape_override`'s
+38-41% result had also made spilling feel more expensive than it is -- a spill
+costs tens of percent, while a refusal costs everything.
+
+**What ships instead.** Off `:avx512`, `_complex_fitted_shape` selects the
+largest shape **from the menu** that this host can actually run, subject to two
+necessary conditions: `W <= hardware lanes` (a `Vec{8,Float64}` on 128-bit NEON
+is emulated across four registers, so a shape that "fits" on paper would not)
+and `_planar_pressure <= nregisters`, with an unrecognised CPU assuming 16, the
+conservative x86 baseline. On AVX2 `ComplexF64` that lands on `(4, 6, 4)` at
+pressure 16, exactly the ymm budget.
+
+Two details that are load-bearing rather than incidental:
+
+- **Selection is from the menu, not free computation.**
+  `_complex_kernel_from_shape` is `@generated` over the menu and falls through
+  to its *last* entry on no match, so a freely computed shape absent from the
+  menu would silently build a different kernel than was asked for -- worse than
+  either a spill or an error. An earlier revision of this fix did compute
+  freely, and the test that sweeps synthetic `(vector_bytes, nregisters)` pairs
+  caught it. Selecting from the menu makes the membership invariant hold by
+  construction rather than by having enumerated the right hardware.
+- **Each planar menu gained one `MV = 1` entry per lane width** (so six
+  entries, still bounded), which is what guarantees something always fits: at
+  `MV = 1, NR = 6` the pressure is `2*6 + 4 = 16`. The 1m menus are unchanged
+  at three, since 1m is never selected automatically.
+
+The extent-aware demotion also stops falling back to `_legacy_shape`, which for
+`ComplexF64` is `(8, 6, 4)` at pressure 30 -- over AVX2's budget. It now
+demotes to the fitted shape.
+
+**These off-`:avx512` shapes are unmeasured** and are not claimed to be good,
+only to run without spilling by the budget's own reckoning. The measured
+`:avx512` rows are untouched.
+
+**The pattern, recurring for the third time.** `docs/decisions.md`'s Phase G
+already recorded: "making a constant hardware-derived silently converts every
+test that asserted its old value into a platform-dependent test." Phase C made
+the complex *default* hardware-gated and thereby converted every test that asks
+for a default complex kernel into a platform-dependent test -- roughly 50 of
+them, across four files. The lesson generalises one step further than Phase G
+put it: **gating a capability on detected hardware makes the capability itself
+platform-dependent, not merely the tests.** A local suite on the one machine the
+work was developed on cannot see either.
+
+Also fixed here: the complex packing allocation assertions were missing the
+`skip=(VERSION < v"1.11")` marker that every other allocation assertion in this
+suite carries, so Julia 1.10 LTS failed on the documented compiler gap rather
+than skipping it. Marked, not weakened.

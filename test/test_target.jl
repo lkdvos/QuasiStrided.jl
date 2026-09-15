@@ -11,8 +11,11 @@ using QuasiStrided: TargetProfile, CacheLevel, target_profile, cache_topology,
     RealMethod, PlanarMethod, OneMMethod, accumulator_planes, a_reals, b_reals
 
 const VALID_ISAS = (:avx512, :avx2, :neon, :unknown)
-synthetic(isakey, vb) = TargetProfile(
-    isakey, Sys.ARCH, "synthetic", vb, 32, CacheLevel(), CacheLevel(), CacheLevel()
+# `nregisters` defaults to 32 so every pre-existing caller is unchanged; the
+# complex shape-fitting tests pass the real per-ISA count.
+synthetic(isakey, vb; nregisters::Int = 32) = TargetProfile(
+    isakey, Sys.ARCH, "synthetic", vb, nregisters,
+    CacheLevel(), CacheLevel(), CacheLevel()
 )
 
 # Permuted A / negative-stride B / sliced-with-offset C, the fixture shape
@@ -254,10 +257,19 @@ end
             first(kernel_shapes(T, PlanarMethod()))
         @test _derived_shape(synthetic(:avx512, 64), T) in kernel_shapes(T, PlanarMethod())
 
-        # Reordering the menu must not change the SET, or the compiled
-        # specialization count moves with it.
-        @test Set(kernel_shapes(T, PlanarMethod())) ==
-            Set(((2 * W, NR_DEFAULT, W), swept, (2 * W ÷ 2, 8, W)))
+        # The menu is the three AVX-512 shapes plus three `MV = 1` entries --
+        # one per lane width the package compiles -- which is what guarantees
+        # `_complex_fitted_shape` always finds something that fits off
+        # `:avx512`. Pinned as a SET so a reorder cannot change the compiled
+        # specialization count silently, and so adding a shape is a deliberate
+        # edit here rather than a side effect.
+        @test Set(kernel_shapes(T, PlanarMethod())) == Set(
+            (
+                (2 * W, NR_DEFAULT, W), swept, (2 * W ÷ 2, 8, W),
+                (W ÷ 2, NR_DEFAULT, W ÷ 2), (W ÷ 2, NR_DEFAULT, W ÷ 4),
+                (W ÷ 4, NR_DEFAULT, W ÷ 4),
+            )
+        )
 
         # The override is AVX-512-only; every other ISA takes the rule, and in
         # fact does not even reach it (`_rule_applies_complex` is false there),
@@ -281,22 +293,40 @@ end
     end
 end
 
-@testset "the complex rule applies on :avx512 only, and falls back elsewhere" begin
+@testset "the complex rule applies on :avx512 only, and fits elsewhere" begin
     @test _rule_applies_complex(Val(:avx512))
     for T in (ComplexF64, ComplexF32)
-        # AVX2's 16 ymm registers leave planar zero spare, and the reference's
-        # AVX2 complex shapes are explicitly unmeasured: fall back, never guess.
+        # The measured *rule* (and its swept override) is :avx512-only. Off it,
+        # the shape is fitted to the register file rather than derived -- and,
+        # since CI, rather than refused. What must hold is that the result fits
+        # the budget and is in the menu; the exact shape is an implementation
+        # detail of `_complex_fitted_shape` and is deliberately not pinned here.
         for key in (:avx2, :neon, :unknown, :somethingelse)
             @test !_rule_applies_complex(Val(key))
-            for vb in (0, 16, 32, 64)   # width must not matter off :avx512
-                @test _derived_shape(synthetic(key, vb), T) === _legacy_shape(T)
+            for vb in (0, 16, 32, 64), nreg in (0, 16, 32)
+                shape = _derived_shape(synthetic(key, vb; nregisters = nreg), T)
+                MR, NR, W = shape
+                @test QuasiStrided._planar_pressure(MR, NR, W) <=
+                    (nreg > 0 ? nreg : 16)
+                @test shape in kernel_shapes(T, PlanarMethod())
             end
         end
-        # ... and on :avx512 with nothing detected, likewise.
-        @test _derived_shape(synthetic(:avx512, 0), T) === _legacy_shape(T)
-        # The complex legacy shape is the real one's (8, 6) tile in LOGICAL
-        # complex rows, with the lane width of the real type.
+        # On :avx512 with no width detected, the rule cannot apply either, so
+        # this also takes the fitted path.
+        @test _derived_shape(synthetic(:avx512, 0), T) in
+            kernel_shapes(T, PlanarMethod())
+        # The complex legacy shape is still defined -- the real one's (8, 6)
+        # tile in LOGICAL complex rows -- but is no longer what the resolver
+        # falls back to. For `ComplexF64` that is because it does not fit:
+        # (8, 6, 4) is `MV = 2`, pressure 30, against AVX2's 16. For
+        # `ComplexF32` (8, 6, 8) is `MV = 1` and lands exactly on 16, so it
+        # would have been admissible -- the resolver does not special-case
+        # either, it just asks the budget.
         @test _legacy_shape(T) === (8, NR_DEFAULT, _legacy_shape(real(T))[3])
+    end
+    @test QuasiStrided._planar_pressure(_legacy_shape(ComplexF64)...) == 30
+    @test QuasiStrided._planar_pressure(_legacy_shape(ComplexF32)...) == 16
+    for T in (ComplexF64, ComplexF32)
     end
     # The real rule still applies on AVX2 -- this is the `:neon` precedent, not
     # a narrowing of anything that already shipped.
@@ -336,9 +366,13 @@ end
             @test planes * mv * NR + planes * mv + planes <= nreg
         end
     end
-    # Menus are bounded so the compiled specialization set is.
-    for T in (ComplexF64, ComplexF32), m in (PlanarMethod(), OneMMethod())
-        @test length(kernel_shapes(T, m)) <= 3
+    # Menus stay bounded so the compiled specialization set does. Planar's is
+    # six: three measured AVX-512 shapes plus one `MV = 1` entry per lane width
+    # for `_complex_fitted_shape` to land on off `:avx512`. 1m's is three --
+    # it is never selected automatically, so it needs no fitted entries.
+    for T in (ComplexF64, ComplexF32)
+        @test length(kernel_shapes(T, PlanarMethod())) <= 6
+        @test length(kernel_shapes(T, OneMMethod())) <= 3
     end
     # `RealMethod` forwards to the one-argument form: the real menus are
     # reached by exactly the code they always were.
@@ -433,23 +467,39 @@ end
     end
 end
 
-@testset "the engine picks no complex kernel on an unmeasured ISA" begin
-    # The complex shapes are budgeted for a 32-register AVX-512 file; every
-    # candidate needs more vector registers than AVX2's 16 ymm provide. The
-    # shape *rule* already refuses to derive off :avx512, but the legacy
-    # fallback would still hand back a shape, so kernel construction is gated
-    # too: an error beats a guaranteed-spilling default. Naming a kernel
-    # explicitly is unaffected -- this governs only what the engine picks.
-    @test QuasiStrided._complex_default_supported(Val(:avx512))
-    for isakey in (:avx2, :neon, :unknown)
-        @test !QuasiStrided._complex_default_supported(Val(isakey))
-        err = try
-            QuasiStrided._complex_unsupported_isa(ComplexF64, synthetic(isakey, 32))
-        catch e
-            e
+@testset "the engine fits a complex shape to the register file on every ISA" begin
+    # Phase C gated complex kernel *construction* to :avx512 and threw
+    # elsewhere, on the argument that an error beats a guaranteed spill. CI
+    # refuted that: every runner is AVX2 (Linux) or NEON (macOS), so complex
+    # support was unavailable through `@tensor` on every machine the project
+    # tests on. A slow-but-correct kernel beats no complex support.
+    #
+    # So off :avx512 the shape is fitted to the detected register file, and the
+    # two things that must hold are (1) it fits, and (2) it is in the menu --
+    # `_complex_kernel_from_shape` is `@generated` over the menu and falls
+    # through to the LAST entry on no match, so a fitted shape absent from the
+    # menu would silently build a different kernel than was asked for.
+    for (isakey, vb, nreg) in (
+            (:avx512, 64, 32), (:avx2, 32, 16), (:neon, 16, 32), (:unknown, 0, 0),
+        )
+        profile = synthetic(isakey, vb; nregisters = nreg)
+        for T in (ComplexF64, ComplexF32)
+            shape = _derived_shape(profile, T)
+            MR, NR, W = shape
+            budget = nreg > 0 ? nreg : 16
+            @test QuasiStrided._planar_pressure(MR, NR, W) <= budget
+            @test shape in kernel_shapes(T, PlanarMethod())
+            # Constructible, and at the shape asked for -- not the menu tail.
+            k = QuasiStrided._complex_kernel_from_shape(shape, T, PlanarMethod())
+            @test (mr(k), nr(k), lanewidth(k)) === shape
         end
-        @test err isa ArgumentError
-        @test occursin(string(isakey), err.msg)
+    end
+    # And the engine now picks a complex kernel on the *actual* host, whatever
+    # it is, rather than throwing. This is the assertion CI was failing.
+    for T in (ComplexF64, ComplexF32)
+        @test _default_kernel(T) isa QuasiStrided.PlanarKernel
+        @test _default_kernel(T, 1024, 1024) isa QuasiStrided.PlanarKernel
+        @test _default_kernel(T, 1, 1) isa QuasiStrided.PlanarKernel   # demotion path
     end
     # The real path derives or falls back on every ISA, never throws.
     for isakey in (:avx512, :avx2, :neon, :unknown), T in (Float64, Float32)

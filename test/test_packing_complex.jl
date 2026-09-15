@@ -484,10 +484,15 @@ probe_b(packed, src, kernel, f) =
         )
     end
 
-    @test all(iszero, run(ComplexF64, PlanarFormat(), PlanarFormat()))
-    @test all(iszero, run(ComplexF64, OneEFormat(), PlanarFormat()))
-    @test all(iszero, run(ComplexF32, PlanarFormat(), PlanarFormat()))
-    @test all(iszero, run(ComplexF32, OneEFormat(), PlanarFormat()))
+    # `skip` on Julia 1.10 for the same documented reason the SIMD kernel's
+    # allocation assertions carry it: the older compiler does not keep this
+    # code allocation-free. Marked rather than weakened, so the gap stays
+    # visible -- CI on 1.10 LTS is what found these were missing it.
+    sk = VERSION < v"1.11"
+    @test all(iszero, run(ComplexF64, PlanarFormat(), PlanarFormat())) skip = sk
+    @test all(iszero, run(ComplexF64, OneEFormat(), PlanarFormat())) skip = sk
+    @test all(iszero, run(ComplexF32, PlanarFormat(), PlanarFormat())) skip = sk
+    @test all(iszero, run(ComplexF32, OneEFormat(), PlanarFormat())) skip = sk
 end
 
 # =====================================================================

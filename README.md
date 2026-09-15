@@ -180,9 +180,10 @@ Gold 6244 / Cascade Lake):
   The complex register shape is the one place in the package with a swept,
   machine-specific constant: the shape the hardware rule *derives* turned out
   to be the worst planar configuration measured, by 38–41%, because it spills
-  accumulators. `_shape_override` carries the swept winner on AVX-512 only;
-  every other ISA refuses to pick a complex kernel rather than ship a
-  guaranteed-spilling default. See `docs/decisions.md`'s "Phase F measurement".
+  accumulators. `_shape_override` carries the swept winner on AVX-512 only; every
+  other ISA gets the largest menu shape that fits its register file, which is
+  correct and unmeasured rather than fast and machine-specific. See
+  `docs/decisions.md`'s "Phase F measurement" and "Amendment 5".
 - Zero steady-state allocation for `SIMDKernel` through the full driver on
   Julia >= 1.11. On Julia 1.10 (LTS), `SIMDKernel`'s `accumulate`/
   `execute_tile!` allocate tens of KB per call instead — a compiler
@@ -246,11 +247,11 @@ Gold 6244 / Cascade Lake):
 - On the complex side specifically: the **3m** (Karatsuba) method; **mixed
   real/complex operands** (promotion belongs in TensorOperations'
   `promote_contract` layer, not here); writing into a **conjugated output**
-  view; complex register shapes for **AVX2 or NEON** (the engine refuses to
-  pick a complex kernel on an ISA it has no measurement for, rather than
-  shipping a guaranteed-spilling default — pass `kernel=` explicitly to
-  override); and the unit-stride plane-to-interleave store, which is
-  measurement-gated and not yet justified.
+  view; **measured** complex register shapes for AVX2 or NEON (complex
+  *works* there — the engine selects the largest shape that fits the detected
+  register file — but those shapes are fitted, not swept, and no throughput
+  claim is made for them); and the unit-stride plane-to-interleave store, which
+  is measurement-gated and not yet justified.
 
 See the companion design specs and `docs/decisions.md` for the full
 deferred list. `benchmark/bench_tensoroperations.jl` (results in

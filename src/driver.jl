@@ -184,8 +184,10 @@ function _derived_shape(profile::TargetProfile, ::Type{T}) where {T <: Complex}
     R = real(T)
     vb = profile.vector_bytes
     key = Val(profile.isa)
+    # Off the measured ISA, fit to the register file rather than refuse or hand
+    # back a shape that cannot fit (see `_complex_fitted_shape`).
     (_rule_applies_complex(key) && vb > 0 && vb % sizeof(R) == 0) ||
-        return _legacy_shape(T)
+        return _complex_fitted_shape(profile, T)
     ovr = _shape_override(key, T)
     return ovr === nothing ? _complex_rule_shape(vb, T) : ovr
 end
@@ -202,9 +204,24 @@ const KERNEL_SHAPES_F32 = ((8, 6, 8), (32, 6, 16), (16, 6, 8))
 # winner first, so the menu head and the shape the engine resolves to agree
 # (see `_shape_override`); the SET is unchanged, only the order, so no
 # specialization is added or removed (pinned by a test).
-const KERNEL_SHAPES_C64_PLANAR = ((24, 3, 8), (16, 6, 8), (8, 8, 8))
+#
+# The last three entries of each PLANAR menu exist for
+# `_complex_fitted_shape` to select off `:avx512`: an `MV = 1` tile at each
+# lane width the package compiles, so that for any (lane count, register
+# budget >= 16) pair at least one entry fits. They are here
+# because `_complex_kernel_from_shape` is `@generated` over this menu and falls
+# through to the LAST entry on no match: a resolver that returned a shape
+# absent from the menu would silently get a different kernel than it asked for,
+# which is worse than either a spill or an error. A test pins that every ISA's
+# fitted shape is present. They are unmeasured and are not claimed to be good,
+# only to fit.
+const KERNEL_SHAPES_C64_PLANAR = (
+    (24, 3, 8), (16, 6, 8), (8, 8, 8), (4, 6, 4), (4, 6, 2), (2, 6, 2),
+)
 const KERNEL_SHAPES_C64_ONEM = ((12, 8, 8), (16, 6, 8), (8, 8, 8))
-const KERNEL_SHAPES_C32_PLANAR = ((48, 3, 16), (32, 6, 16), (16, 8, 16))
+const KERNEL_SHAPES_C32_PLANAR = (
+    (48, 3, 16), (32, 6, 16), (16, 8, 16), (8, 6, 8), (8, 6, 4), (4, 6, 4),
+)
 const KERNEL_SHAPES_C32_ONEM = ((24, 8, 16), (32, 6, 16), (16, 8, 16))
 
 kernel_shapes(::Type{Float64}) = KERNEL_SHAPES_F64
@@ -305,27 +322,75 @@ end
     )
 end
 
-# The complex register shapes are budgeted for a 32-register AVX-512 file;
-# even the smallest menu entry exceeds AVX2's 16 ymm. `_rule_applies_complex`
-# refuses to *derive* a shape off `:avx512`, but the legacy fallback would
-# still hand one back, so kernel *construction* is gated too rather than
-# shipping a guaranteed-spilling default (docs/decisions.md, "The complex
-# legacy shape is over the AVX2 register budget"). An explicitly named
-# `kernel =` still works everywhere.
-_complex_default_supported(::Val{:avx512}) = true
-_complex_default_supported(::Val) = false
+"""
+    _planar_pressure(MR, NR, W) -> Int
 
-@noinline function _complex_unsupported_isa(::Type{T}, profile::TargetProfile) where {T}
-    throw(
-        ArgumentError(
-            "QuasiStrided has no measured complex register shape for the detected " *
-                "vector ISA :$(profile.isa) (only :avx512), so it will not choose a " *
-                "complex kernel for $T on this machine: every candidate shape needs " *
-                "more vector registers than this ISA provides, and a silently " *
-                "spilling default would be worse than an error. Pass an explicit " *
-                "`kernel = ...` to plan_contract if you want one anyway."
-        )
-    )
+Vector registers a planar kernel holds live per K step: `2*MV*NR`
+accumulators (two planes) + `2*MV` A vectors (two planes) + 2 B broadcasts,
+with `MV = MR ÷ W`.
+
+A *necessary* condition only, not a predictor. Phase D measured that spilling
+is not monotone in this number -- planar `(24,3,8)` at 26 is clean while
+`(8,8,8)` at 20 spills -- so it is used below to *exclude* shapes that cannot
+possibly fit, never to rank the ones that can.
+"""
+_planar_pressure(MR::Int, NR::Int, W::Int) = 2 * (MR ÷ W) * NR + 2 * (MR ÷ W) + 2
+
+# Largest MENU shape that this host can actually run, for use off `:avx512`.
+#
+# AMENDS Phase C's decision to refuse a complex default off `:avx512`
+# entirely. That was wrong, and CI said so: every runner this package has is
+# AVX2 (Linux) or NEON (macOS), so refusing made complex support unavailable
+# through `@tensor` on every machine the project tests on, and on most machines
+# anyone would run it on. The priority was backwards -- a slow-but-correct
+# kernel beats no complex support at all, and "an error beats a guaranteed
+# spill" is only defensible when the user has an alternative, which they did
+# not.
+#
+# It selects **from the menu** rather than computing a shape freely, so
+# "whatever this returns is in the menu" holds by construction rather than by
+# having enumerated the right hardware. That matters because
+# `_complex_kernel_from_shape` is `@generated` over the menu and falls through
+# to its LAST entry on no match: a freely computed shape absent from the menu
+# would silently build a different kernel than was asked for. An earlier
+# revision did compute freely, and the test that sweeps synthetic
+# `(vector_bytes, nregisters)` pairs caught exactly that.
+#
+# Two constraints, both necessary:
+#
+#   * `W <= hardware lanes` -- a `Vec{8,Float64}` on 128-bit NEON is emulated
+#     across four registers, so a shape whose pressure "fits" on paper would
+#     not fit at all.
+#   * `_planar_pressure <= nregisters` -- see that function; a necessary
+#     condition, never used here to rank.
+#
+# `nregisters == 0` (unrecognised CPU) assumes 16, the conservative x86
+# baseline, matching the conservatism `_legacy_shape` already applies.
+#
+# The selected shapes are UNMEASURED off `:avx512` and are not claimed to be
+# good, only to run without spilling by the budget's own reckoning.
+function _complex_fitted_shape(profile::TargetProfile, ::Type{T}) where {T <: Complex}
+    R = real(T)
+    vb = profile.vector_bytes
+    lanes = (vb > 0 && vb % sizeof(R) == 0) ? vb ÷ sizeof(R) : _default_lanewidth(R)
+    budget = profile.nregisters > 0 ? profile.nregisters : 16
+    best = nothing
+    for shape in kernel_shapes(T, PlanarMethod())
+        MR, NR, W = shape
+        (W <= lanes && MR % W == 0) || continue
+        _planar_pressure(MR, NR, W) <= budget || continue
+        # Largest logical tile wins; ties by the wider vector.
+        if best === nothing || (MR * NR, W) > (best[1] * best[2], best[3])
+            best = shape
+        end
+    end
+    # Unreachable for any budget >= 16 at any lane width the package compiles:
+    # each menu carries an `MV = 1` entry per width, whose pressure is
+    # `2*NR + 4 = 16` at `NR = 6`. Kept as a total fallback rather than an
+    # assertion because returning a correct-but-slow kernel is always better
+    # than throwing here -- this is the code path that CI proved must not
+    # refuse.
+    return best === nothing ? last(kernel_shapes(T, PlanarMethod())) : best
 end
 
 # The unconditional default; `OneMMethod` is selected only by naming the kernel
@@ -333,7 +398,6 @@ end
 _default_complex_method(::Type{<:Complex}) = PlanarMethod()
 
 @noinline function _kernel_for(profile::TargetProfile, ::Type{T}) where {T <: Complex}
-    _complex_default_supported(Val(profile.isa)) || _complex_unsupported_isa(T, profile)
     return _complex_kernel_from_shape(
         _derived_shape(profile, T), T, _default_complex_method(T)
     )
@@ -355,10 +419,14 @@ end
 # definition in two places rather than two rules; it routes through the same
 # seam.
 @noinline function _default_kernel(::Type{T}, Qm::Int, Qn::Int) where {T <: Complex}
-    kernel = _kernel_for(target_profile(), T)
+    profile = target_profile()
+    kernel = _kernel_for(profile, T)
     (Qm > 0 && Qm < mr(kernel)) || return kernel
-    legacy = _legacy_shape(T)
-    return _complex_kernel_from_shape(legacy, T, _default_complex_method(T))
+    # Demote to the budget-fitted shape, NOT to `_legacy_shape`: the latter is
+    # `(8, 6, W)` at pressure 30, which is over AVX2's 16 ymm. The fitted shape
+    # is the smallest thing guaranteed to be constructible on this host.
+    small = _complex_fitted_shape(profile, T)
+    return _complex_kernel_from_shape(small, T, _default_complex_method(T))
 end
 
 # GUARDRAIL, load-bearing (docs/decisions.md, macro-blocking Phase A
