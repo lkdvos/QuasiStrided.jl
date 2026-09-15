@@ -4,14 +4,16 @@
 # accumulators -- works exclusively in `real(T)`, which is what makes the planar
 # (split-complex) strategy fall out of the design rather than being bolted on.
 #
-# The frozen packed format in kernel_descriptor.jl is NOT redefined or extended.
-# This file introduces a strictly more general offset formula,
+# GUARDRAIL: the frozen packed format in kernel_descriptor.jl is NOT redefined
+# or extended. This file introduces a strictly more general offset formula,
 #
 #     p * reg_tile * rpe  +  plane * reg_tile  +  i
 #
-# under new names on a new type. At `rpe == 1, plane == 0` it reduces exactly to
-# the frozen `i + MR*p`, so the frozen layout is the `RealFormat` instance of
-# the general formula and every existing caller is untouched.
+# under new names on a new type, and at `rpe == 1, plane == 0` it reduces
+# EXACTLY to the frozen `i + MR*p`. That reduction is what makes the
+# frozen-format claim true rather than asserted: the frozen layout *is* the
+# `RealFormat` instance of the general formula, so every existing caller is
+# untouched. Check it before changing either formula.
 
 # ----------------------------------------------------------------------------
 # Packed formats
@@ -76,13 +78,11 @@ Which complex-arithmetic method a kernel implements. Singleton types, so
 `default_blocking` and the shape menus dispatch on them without a runtime
 branch.
 
-**No auto-dispatch rule is derived from any measurement.** The sibling project
-`tensorcontract-rs` measured four different method orderings on four machines
-(Cascade Lake, Ice Lake, portable scalar, Apple M3 Max -- where 3m wins
-outright), and records "ranking anything below planar without naming the machine
-is a mistake this project has made twice". [`PlanarMethod`](@ref) is the
-unconditional default; [`OneMMethod`](@ref) is selected only by naming the
-kernel. Same reasoning, same precedent, as `_shape_override` in src/driver.jl.
+**No auto-dispatch rule is derived from any measurement**: the sibling project
+measured four different method orderings on four machines.
+[`PlanarMethod`](@ref) is the unconditional default; [`OneMMethod`](@ref) is
+selected only by naming the kernel (docs/decisions.md, "Method ranking does not
+transfer between machines").
 """
 abstract type ComplexMethod end
 
@@ -119,9 +119,9 @@ struct OneMMethod <: ComplexMethod end
     b_reals(::ComplexMethod) -> Int
 
 Reals per element in the packed A / B panel under this method. These are what
-`default_blocking` divides the measured real `mc`/`nc` by, so that every method
-gets the *same packed byte budget* rather than the same element count -- the
-1m `mc` halving is derived from this, never tabulated.
+`default_blocking` divides the measured real `mc`/`nc` by, so every method gets
+the *same packed byte budget* rather than the same element count -- 1m's `mc`
+halving is derived from this, never tabulated.
 """
 a_reals(::RealMethod) = 1
 b_reals(::RealMethod) = 1
@@ -154,7 +154,7 @@ Complex counterpart of [`KernelDescriptor`](@ref). `MR`/`NR` are the **logical**
 (`ComplexF32`/`ComplexF64`); `FA`/`FB` are the packed formats of the A and B
 panels.
 
-Three types are distinct here that coincide on the real path, and conflating
+Three notions are distinct here that coincide on the real path, and conflating
 them is the main hazard in this file:
 
 | notion | accessor | `ComplexF64` planar | `ComplexF64` 1m |
@@ -171,10 +171,7 @@ driver loop bound.
 """
 struct ComplexKernelDescriptor{MR, NR, T, FA <: PackFormat, FB <: PackFormat}
     function ComplexKernelDescriptor{MR, NR, T, FA, FB}() where {MR, NR, T, FA, FB}
-        MR isa Int && NR isa Int ||
-            throw(ArgumentError("ComplexKernelDescriptor requires Int type parameters MR, NR"))
-        MR > 0 || throw(ArgumentError("ComplexKernelDescriptor requires MR > 0, got MR = $MR"))
-        NR > 0 || throw(ArgumentError("ComplexKernelDescriptor requires NR > 0, got NR = $NR"))
+        _check_reg_tile("ComplexKernelDescriptor", MR, NR)
         T === ComplexF32 || T === ComplexF64 ||
             throw(
             ArgumentError(
@@ -224,10 +221,9 @@ realtype(::ComplexKernelDescriptor{MR, NR, T}) where {MR, NR, T} = real(T)
 
 Reals in one A / B sliver per **logical** K step: `mr(kernel)` and `nr(kernel)`
 for a real kernel, scaled by [`reals_per_element`](@ref) of the operand's format
-otherwise. The Julia counterpart of `tensorcontract-rs`'s `Ukr::a_per_k`, and
-the only new quantity the driver's sliver addressing reads -- for every real
-kernel it is identically `mr`/`nr`, so the substitution at those call sites is
-provably the identity.
+otherwise. The only new quantity the driver's sliver addressing reads -- and for
+every real kernel it is identically `mr`/`nr`, so the substitution at those call
+sites is provably the identity.
 """
 packed_a_per_k(::KernelDescriptor{MR}) where {MR} = MR
 packed_b_per_k(::KernelDescriptor{MR, NR}) where {MR, NR} = NR
@@ -255,8 +251,8 @@ logical K step `p`:
     p * packed_*_per_k + plane * reg_tile + index
 
 At `RealFormat` (one plane, `reals_per_element == 1`) this is exactly the frozen
-`i + MR*p`. The packer and the microkernel both address through these, so the
-layout is written down once.
+`i + MR*p` -- see the file header. The packer and the microkernel both address
+through these, so the layout is written down once.
 """
 @inline packed_a_plane_offset(d::ComplexKernelDescriptor{MR}, plane::Int, i::Int, p::Int) where {MR} =
     p * packed_a_per_k(d) + plane * MR + i

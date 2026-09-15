@@ -1,10 +1,9 @@
-# Buffer workspace for the contraction driver, split out of `ContractPlan` per
-# docs/decisions.md, "Amendment 1: `ContractWorkspace` and the `allocator`
-# keyword". Frozen typing discipline from that milestone's workspace/allocator
-# design-constraints section: `VT` is a `where`-bound parameter resolved at
-# construction (never a `Union`- or `AbstractVector`-typed field), and the
-# offset buffers stay concretely `Vector{Int}` -- acquired as non-temporaries,
-# so only the packed panels genuinely route through the allocator.
+# Buffer workspace for the contraction driver, split out of `ContractPlan`
+# (docs/decisions.md, "Amendment 1"). Frozen typing discipline: `VT` is a
+# `where`-bound parameter resolved at construction (never a `Union`- or
+# `AbstractVector`-typed field), and the offset buffers stay concretely
+# `Vector{Int}` -- acquired as non-temporaries, so only the packed panels
+# genuinely route through the allocator.
 #
 # Frozen import convention: TensorOperations is always reached as `TO.<name>`.
 import TensorOperations as TO
@@ -20,13 +19,13 @@ buffers across contractions of different shapes.
 
 `T` is the **storage** element type (`eltype(C)`), which is what the backend's
 workspace pool is keyed by; `VT` is the vector type of the two packed macro
-panels, whose element type is `real(T)` -- the same type on the real path, and
+panels, whose element type is `real(T)` -- the same type on the real path,
 `Float64`/`Float32` for a complex contraction, since every packed buffer below
 the kernel boundary holds reals (docs/decisions.md, "Buffer element type: the
 `VT` bound relaxes, the arity does not"). The bound on `VT` is therefore only
-`AbstractVector`, with `eltype(VT) === real(T)` enforced by the inner
-constructor; `VT` is still a `where`-bound parameter resolved to a concrete
-vector type at construction, never a `Union`- or `AbstractVector`-typed field.
+`AbstractVector`, with the `eltype(VT) === real(T)` invariant enforced by the
+inner constructor; `VT` is still a `where`-bound parameter resolved to a
+concrete vector type at construction.
 
 `VT` is `Vector{real(T)}` on the default, GC-owned, [`reserve!`](@ref)-able
 path; on an explicit-allocator path it is whatever that allocator returns, and
@@ -74,9 +73,9 @@ struct ContractWorkspace{T, VT <: AbstractVector}
     tw_packed_a::VT
     tw_packed_b::VT
 
-    # The one invariant the relaxed `VT` bound needs: the packed panels hold
-    # `real(T)`, never `T`. Enforced here so a mis-paired (T, VT) cannot be
-    # constructed at all, rather than failing later inside a packer.
+    # GUARDRAIL, the one invariant the relaxed `VT` bound needs: the packed
+    # panels hold `real(T)`, NEVER `T`. Enforced here so a mis-paired (T, VT)
+    # cannot be constructed at all, rather than failing later inside a packer.
     function ContractWorkspace{T, VT}(
             m_buf_A::Vector{Int}, m_buf_C::Vector{Int},
             n_buf_B::Vector{Int}, n_buf_C::Vector{Int},
@@ -109,13 +108,12 @@ end
 # (the rounded/clamped one `plan_contract` stores on the plan). Shared by the
 # constructors and by `reserve!` so the two can never disagree.
 #
-# Complex-correct as written, deliberately unchanged (docs/decisions.md,
-# "Buffer element type: the `VT` bound relaxes, the arity does not"): the
-# packed lengths come from `packed_a_length`/`packed_b_length`, which already
-# return a count of REALS at the logical `kc` once the descriptor is complex,
-# while the sliver counts use the LOGICAL register extents `mr`/`nr`, which is
-# what `mc`/`nc` are expressed in. The two must not be mixed: `m_slivers` is a
-# count of register tiles, `packed_a` a count of reals.
+# GUARDRAIL: complex-correct as written and deliberately unchanged. The packed
+# lengths come from `packed_a_length`/`packed_b_length`, which already return a
+# count of REALS at the logical `kc` once the descriptor is complex, while the
+# sliver counts use the LOGICAL register extents `mr`/`nr`, which is what
+# `mc`/`nc` are expressed in. Do not mix them: `m_slivers` counts register
+# tiles, `packed_a` counts reals.
 @inline function _workspace_sizes(kernel, blocking::Blocking)
     MRk = mr(kernel)
     NRk = nr(kernel)
@@ -152,7 +150,7 @@ end
 # `_classify_slivers!` writes entry `s+1` before the same iteration reads it.
 @inline _alloc_descriptors(n::Int) = Vector{BlockDescriptor}(undef, n)
 
-# The 18-field layout, written out exactly once for both constructors below:
+# The 20-field layout, written out exactly once for both constructors below:
 # `ints` allocates a `Vector{Int}` of a given length, while the packed panels
 # arrive already allocated because their type is what fixes `VT`.
 @inline function _build_workspace(
@@ -185,9 +183,8 @@ path passes.
 
 Under `DefaultAllocator` every buffer is an ordinary `Vector`, so the result is
 a `ContractWorkspace{T,Vector{R}}`, `R = realtype(kernel) === real(T)`, that
-[`reserve!`](@ref) may later grow. On the real path `R === T` and this is the
-`ContractWorkspace{T,Vector{T}}` it has always been.
-Under any other allocator the packed panels are acquired once via
+[`reserve!`](@ref) may later grow; on the real path `R === T`. Under any other
+allocator the packed panels are acquired once via
 `TensorOperations.tensoralloc(..., Val(true), allocator)`, are never resized,
 and must be handed back with [`release!`](@ref).
 
@@ -199,9 +196,7 @@ function ContractWorkspace(
         ::Type{T}, kernel, blocking::Blocking, oracle::Bool, ::TO.DefaultAllocator
     ) where {T}
     s = _workspace_sizes(kernel, blocking)
-    # The packed panels hold reals, not storage elements: `R === T` on the real
-    # path, `real(T)` for a complex kernel. `ContractWorkspace`'s inner
-    # constructor re-checks that this matches `T`.
+    # Reals, not storage elements; the inner constructor re-checks against `T`.
     R = realtype(kernel)
     return _build_workspace(
         T, s, oracle ? s.kc : 0, n -> Vector{Int}(undef, n),
@@ -218,8 +213,7 @@ function ContractWorkspace(
     R = realtype(kernel)
 
     # Acquisition order matters for arena allocators: `release!` frees in the
-    # exact reverse order. Unchanged -- only the element type asked for moved
-    # from the storage type `T` to the packed real type `R`.
+    # exact reverse order.
     packed_a = _alloc_temp(R, s.packed_a, allocator)
     packed_b = _alloc_temp(R, s.packed_b, allocator)
     tw_packed_a = _alloc_temp(R, oracle ? s.tw_packed_a : 0, allocator)

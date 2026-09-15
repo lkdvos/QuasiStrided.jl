@@ -112,14 +112,12 @@ function _build_pair_group(
     return AxisGroup(lens, (s1, s2))
 end
 
-# Engine-wide default kernel (docs/decisions.md: "Amendment 2" for
-# `SIMDKernel`, Phase G for the derived shape, Phase H for why NV stays 12).
-#
-# Shape from one detected capability, the vector register width:
-#   W = vector_bytes/sizeof(T),  MR = 2W,  NR = NR_DEFAULT  =>  NV = 12.
-# Reproduces the swept optimum for both dtypes on AVX-512 and reduces to the
-# previous hardcoded (8,6,4) on AVX2. NV = 12 is also the only setting that
-# fits a 16-register AVX2 machine and Julia 1.10's register allocation.
+# Engine-wide default kernel: shape from ONE detected capability, the vector
+# register width -- `W = vector_bytes/sizeof(T)`, `MR = 2W`, `NR = NR_DEFAULT`,
+# so `NV = 12`. Reproduces the swept optimum for both dtypes on AVX-512 and
+# reduces to the previous hardcoded (8,6,4) on AVX2; NV = 12 is also the only
+# setting that fits a 16-register AVX2 machine and Julia 1.10's register
+# allocation (docs/decisions.md, Amendment 2 and Phases G/H).
 const NR_DEFAULT = 6
 
 _legacy_shape(::Type{T}) where {T} = (8, 6, _default_lanewidth(T))
@@ -134,54 +132,31 @@ _legacy_shape(::Type{T}) where {T <: Complex} = (8, 6, _default_lanewidth(real(T
 # Float64), so a row here would only pin this package to one machine's noise.
 _shape_override(::Val, ::Type) = nothing
 
-# For COMPLEX types the rule is overridden, and this is the one place in the
-# package where a swept row beats the derived rule by enough to be worth the
-# machine-specificity. Measured on ccqlin038 (Cascade Lake, `:avx512`, Julia
-# 1.12.6), 21 reps, canary spread 0.4%, `benchmark/bench_complex_efficiency.jl`
-# arm 2, ranked by geomean of per-shape time normalised to the best at that
-# shape:
+# For COMPLEX types the rule IS overridden, and these two rows are the only
+# swept constants in the package. The derived `MR = 2W, NR = 6` shape measured
+# as the *worst* planar configuration -- 38% (`ComplexF64`) / 41%
+# (`ComplexF32`) off the best -- and `24x3`/`48x3` won outright. Ranking table,
+# canary spread and the spill mechanism that predicted it: docs/decisions.md,
+# "The register shape: the derived rule was wrong for complex by 38-41%".
 #
-#   ComplexF64          ComplexF32
-#   planar 24x3  1.055  planar 48x3  1.104   <- overridden to these
-#   1m     16x6  1.116  1m     16x8  1.170
-#   1m     12x8  1.179  1m     24x8  1.172
-#   1m      8x8  1.224  1m     32x6  1.202
-#   planar 16x6  1.452  planar 16x8  1.311
-#   planar  8x8  1.502  planar 32x6  1.562   <- what the rule derives
-#
-# The derived `MR = 2W, NR = 6` shape is the *worst* planar configuration
-# measured, by 38% (`ComplexF64`) and 41% (`ComplexF32`) against the best. That
-# is not noise at a 0.4% canary spread, and it has a mechanism: Phase C
-# measured the derived shape spilling 24-26 accumulator stores per K step while
-# `24x3`/`48x3` is spill-free (docs/decisions.md, "Phase C integration
-# findings" and its Phase D correction). The spill analysis predicted the
-# ranking before the ranking was measured.
-#
-# Why an override rather than changing the rule: the rule is shared with the
-# real path, where it is the measured optimum and must not move. Why a row here
-# is acceptable when the real path deliberately has none: the real rule was
-# within noise of its sweep's best, so a row would have encoded noise; this one
-# corrects a 38-41% error. The cost is honest and stated -- these two rows are
-# ccqlin038 measurements, and on any other microarchitecture the engine falls
-# back to the derived rule via `_rule_applies_complex`, which is `:avx512`-only.
+# These are ccqlin038 measurements and are reached only on `:avx512`
+# (`_rule_applies_complex`), so no other microarchitecture is handed them.
 _shape_override(::Val{:avx512}, ::Type{ComplexF64}) = (24, 3, 8)
 _shape_override(::Val{:avx512}, ::Type{ComplexF32}) = (48, 3, 16)
 
 # The rule applies only to the ISAs it was validated on. `:neon` is detected
-# but deliberately gets the legacy shape: there is no aarch64 measurement, and
-# the rule would pick MR = 2W = 4 with 128-bit lanes, using 12 of 32 NEON
-# registers -- narrower and smaller than the legacy (8,6,4), not obviously
-# better. Derive where measured, fall back everywhere else.
+# but deliberately gets the legacy shape: no aarch64 measurement exists, and
+# the rule would pick MR = 2W = 4 on 128-bit lanes -- narrower and smaller than
+# the legacy (8,6,4), not obviously better. Derive where measured, fall back
+# everywhere else.
 _rule_applies(::Val{:avx512}) = true
 _rule_applies(::Val{:avx2}) = true
 _rule_applies(::Val) = false
 
-# Complex counterpart, `:avx512` only. Same treatment, and for the same kind of
-# reason, as the `:neon` fallback above: AVX2 has 16 ymm registers, and planar
-# holds separate real and imaginary accumulator planes, so even (MV,NR) = (1,6)
-# leaves exactly zero spare there (docs/decisions.md, "Cliff A"); the
-# reference's AVX2 complex shapes are explicitly marked unmeasured. Derive
-# where measured, fall back everywhere else.
+# Complex counterpart, `:avx512` only, for the same kind of reason as the
+# `:neon` fallback above: AVX2 has 16 ymm and planar holds separate real and
+# imaginary accumulator planes, so even (MV,NR) = (1,6) leaves zero spare
+# there (docs/decisions.md, "Cliff A").
 _rule_applies_complex(::Val{:avx512}) = true
 _rule_applies_complex(::Val) = false
 
@@ -193,22 +168,15 @@ function _derived_shape(profile::TargetProfile, ::Type{T}) where {T}
     return ovr === nothing ? (2 * (vb ÷ sizeof(T)), NR_DEFAULT, vb ÷ sizeof(T)) : ovr
 end
 
-# A NEW METHOD, not an edit of the one above: "the real path is bit-identical"
-# is then a `git diff` fact rather than an argument about whether
+# A NEW METHOD, not an edit of the one above, so that "the real path is
+# bit-identical" is a `git diff` fact rather than an argument about whether
 # `real(Float64) === Float64`.
 #
-# The one-line Phase G rule survives the complex extension unchanged; only the
-# `sizeof` argument moves to the real type, because `W` is a count of real
-# lanes. `MR = 2W, NR = NR_DEFAULT` with `W = vector_bytes / sizeof(real(T))`
-# gives `(16, 6, 8)` for `ComplexF64` on AVX-512 -- a 16x6 complex tile, which
-# is exactly the reference's measured planar menu head `(MV, NR) = (2, 6)`.
-# `_shape_override` is consulted here symmetrically with the real path, but --
-# unlike the real path -- it is NOT empty: Phase F measured the derived
-# `(16, 6, 8)` / `(32, 6, 16)` shape to be the worst planar configuration by
-# 38-41%, and the override carries the swept winner. See `_shape_override`.
-# The rule, factored out of `_derived_shape` so that it can be tested
-# independently of the override layered on top of it. `W` is a count of REAL
-# lanes, which is the whole complex adaptation.
+# The Phase G rule survives unchanged; only the `sizeof` argument moves to the
+# real type, because `W` is a count of REAL lanes -- the whole complex
+# adaptation. Factored out of `_derived_shape` so it can be tested
+# independently of the override layered on top of it (see `_shape_override`,
+# which unlike the real path is NOT empty here).
 _complex_rule_shape(vb::Int, ::Type{T}) where {T <: Complex} =
     (2 * (vb ÷ sizeof(real(T))), NR_DEFAULT, vb ÷ sizeof(real(T)))
 
@@ -226,16 +194,14 @@ end
 const KERNEL_SHAPES_F64 = ((8, 6, 4), (16, 6, 8))
 const KERNEL_SHAPES_F32 = ((8, 6, 8), (32, 6, 16), (16, 6, 8))
 
-# Complex menus, seeded from the reference's measured AVX-512 shapes
-# (`crates/tensorcontract/src/kernel/x86.rs:182-190`) converted to this
-# project's `(MR, NR, W)` with `MR` in LOGICAL complex rows and `W` in real
-# lanes; at most three each, so the compiled specialization set stays bounded.
-# The 1m menus look "unaligned" (MR = 12 with W = 8) only because the
-# reference's MV counts REAL rows: 1m runs a real microkernel of `2MR` rows, so
-# `2*12 = 24` is what must be a multiple of `W`.
-# Ordered with the Phase F winner first, so the menu head and the shape the
-# engine actually resolves to agree (see `_shape_override`). The set is
-# unchanged -- only the order -- so no specialization is added or removed.
+# Complex menus, seeded from the reference's measured AVX-512 shapes, with `MR`
+# in LOGICAL complex rows and `W` in real lanes; at most three each, so the
+# compiled specialization set stays bounded. The 1m menus look "unaligned"
+# (MR = 12 at W = 8) only because 1m runs a real microkernel of `2MR` rows, so
+# it is `2*12 = 24` that must be a multiple of `W`. Ordered with the Phase F
+# winner first, so the menu head and the shape the engine resolves to agree
+# (see `_shape_override`); the SET is unchanged, only the order, so no
+# specialization is added or removed (pinned by a test).
 const KERNEL_SHAPES_C64_PLANAR = ((24, 3, 8), (16, 6, 8), (8, 8, 8))
 const KERNEL_SHAPES_C64_ONEM = ((12, 8, 8), (16, 6, 8), (8, 8, 8))
 const KERNEL_SHAPES_C32_PLANAR = ((48, 3, 16), (32, 6, 16), (16, 8, 16))
@@ -262,10 +228,10 @@ kernel_shapes(::Type{ComplexF32}, ::OneMMethod) = KERNEL_SHAPES_C32_ONEM
 kernel_shapes(::Type{T}, ::ComplexMethod) where {T} = (_legacy_shape(T),)
 
 # Unrolled over `kernel_shapes(T)` so every branch builds a concrete kernel
-# from literal `Val`s; the last shape is the fallback. Generated because a
-# plain loop would construct `Val(cand[1])` dynamically and widen to `Any`.
-# Costs one dynamic dispatch per `plan_contract`, none per tile or K step:
-# `_plan_contract` specializes, so `execute!` sees no abstract type.
+# from literal `Val`s (the last shape is the fallback); a plain loop would
+# construct `Val(cand[1])` dynamically and widen to `Any`. Costs one dynamic
+# dispatch per `plan_contract`, none per tile or K step -- `_plan_contract`
+# specializes, so `execute!` sees no abstract type.
 @generated function _kernel_from_shape(shape::Tuple{Int, Int, Int}, ::Type{T}) where {T}
     shapes = kernel_shapes(T)
     ex = :(SIMDKernel(Val($(shapes[end][1])), Val($(shapes[end][2])), T, Val($(shapes[end][3]))))
@@ -285,11 +251,8 @@ _default_kernel(::Type{T}) where {T} = _kernel_for(target_profile(), T)
 # ----------------------------------------------------------------------------
 # Complex kernel construction
 # ----------------------------------------------------------------------------
-# The complex counterpart of `_kernel_from_shape`, generated over
-# `kernel_shapes(T, method)` for exactly the same reason: every branch must
-# build a concrete kernel from literal `Val`s, because a plain loop would
-# construct `Val(cand[1])` dynamically and widen to `Any`.
-#
+# The complex counterpart of `_kernel_from_shape`, generated for the same
+# reason: every branch must build a concrete kernel from literal `Val`s.
 # An unimplemented method's arm throws rather than silently falling back to
 # planar, since a silent method substitution would make a planar-vs-1m
 # measurement meaningless.
@@ -306,19 +269,16 @@ _default_kernel(::Type{T}) where {T} = _kernel_for(target_profile(), T)
     return ex
 end
 
-# The 1m arm, structurally identical to the planar one above and generated over
-# 1m's OWN menu -- each method has its own measured shapes because each has its
-# own packed A format and therefore its own register budget. Deliberately a
-# second method rather than a shared generic over `M <: ComplexMethod`: keeping
-# the planar arm byte-identical is a `git diff` fact rather than an argument.
+# The 1m arm, over 1m's OWN menu (each method has its own packed A format and
+# therefore its own register budget). Deliberately a second method rather than
+# a shared generic over `M <: ComplexMethod`, so the planar arm stays
+# byte-identical.
 #
-# Reaching this arm requires `_default_complex_method` to return `OneMMethod()`,
-# which it never does -- `PlanarMethod()` is the unconditional default and 1m is
-# selectable ONLY by naming the kernel (docs/decisions.md, "Method ranking does
-# not transfer between machines"). No auto-dispatch, no env var, no shape-driven
-# rule. The arm exists so that `_complex_kernel_from_shape(shape, T,
-# OneMMethod())` is total for callers -- benchmarks, and a future explicit
-# request -- that name the method themselves.
+# Nothing in the engine reaches this arm: `_default_complex_method` always
+# returns `PlanarMethod()` and 1m is selectable ONLY by naming the kernel (no
+# auto-dispatch, no env var, no shape rule -- docs/decisions.md, "Method
+# ranking does not transfer between machines"). It exists so the function is
+# total for callers that name the method themselves.
 @generated function _complex_kernel_from_shape(
         shape::Tuple{Int, Int, Int}, ::Type{T}, method::OneMMethod
     ) where {T}
@@ -345,14 +305,13 @@ end
     )
 end
 
-# The complex register shapes are budgeted for a 32-register AVX-512 file: a
-# planar kernel holds 2*MV*NR accumulators + 2*MV A vectors + 2 B broadcasts,
-# which even at the smallest menu entry is over what AVX2's 16 ymm registers
-# can hold. `_rule_applies_complex` already refuses to *derive* a shape off
-# `:avx512`, but the legacy fallback would still hand one back, so gate kernel
-# *construction* too rather than shipping a guaranteed-spilling default. An
-# explicitly named `kernel =` still works everywhere -- this governs only what
-# the engine picks on its own.
+# The complex register shapes are budgeted for a 32-register AVX-512 file;
+# even the smallest menu entry exceeds AVX2's 16 ymm. `_rule_applies_complex`
+# refuses to *derive* a shape off `:avx512`, but the legacy fallback would
+# still hand one back, so kernel *construction* is gated too rather than
+# shipping a guaranteed-spilling default (docs/decisions.md, "The complex
+# legacy shape is over the AVX2 register budget"). An explicitly named
+# `kernel =` still works everywhere.
 _complex_default_supported(::Val{:avx512}) = true
 _complex_default_supported(::Val) = false
 
@@ -382,8 +341,8 @@ end
 
 # Extent-aware variant, used only when the caller did not name a kernel: a
 # contraction whose M extent cannot fill one register tile pads every
-# micro-tile away, so fall back to the legacy shape. Keys on padding waste (a
-# countable quantity known at plan time), not on a cache estimate -- which is
+# micro-tile away, so fall back to the legacy shape. Keys on padding waste -- a
+# countable quantity known at plan time -- not on a cache estimate, which is
 # what distinguishes it from the refuted depth-adaptive MC.
 @noinline function _default_kernel(::Type{T}, Qm::Int, Qn::Int) where {T}
     kernel = _kernel_for(target_profile(), T)
@@ -402,29 +361,30 @@ end
     return _complex_kernel_from_shape(legacy, T, _default_complex_method(T))
 end
 
-# LOAD-BEARING (docs/decisions.md, macro-blocking Phase A findings): `_axis_of`
-# produces a Union{AffineAxis,ScatterAxis}, and each consumer below is a
-# `where {R<:Axis, C<:Axis}` barrier method that Julia specializes per concrete
-# (R,C), so no partially-applied (boxing) QSTile is ever built. Do not collapse
-# these helpers into their call sites, and do not let a union cross any other
-# boundary.
-# Both arms are isbits, so this Union needs no heap box (see PtrScatterAxis).
+# GUARDRAIL, load-bearing (docs/decisions.md, macro-blocking Phase A
+# findings): `_axis_of` returns a `Union{AffineAxis,PtrScatterAxis}`, and each
+# consumer below is a `where {R<:Axis, C<:Axis}` barrier method that Julia
+# specializes per concrete (R,C), so no partially-applied -- heap-boxed --
+# `QSTile` is ever built. **Do not** collapse these helpers into their call
+# sites, and do not let a union cross any other boundary.
+# Both arms are isbits, so this Union itself needs no heap box (see
+# PtrScatterAxis).
 @inline function _axis_of(d::BlockDescriptor, buffer::Vector{Int}, first::Int)
     return d.regular ? AffineAxis(d.base, d.stride, d.count) :
         PtrScatterAxis(pointer(buffer, first + 1), d.count)
 end
 
 # `pack!` is pack_a! or pack_b! (a plain function, specialized on, never a
-# closure); A and B differ only in which of rows/cols is the k axis, which
-# the caller has already resolved.
+# closure); A and B differ only in which of rows/cols is the k axis, which the
+# caller has already resolved. `transform` is the plan's per-operand
+# `identity`/`conj` singleton.
 #
-# `transform` is the plan's per-operand elementwise transform (`identity` or
-# `conj`), a singleton function value. It gets its OWN bound type parameter
-# `TF`: leaving it unbound reintroduces the Phase 2b finding-5 allocation, for
-# exactly the reason spelled out at src/kernel.jl:30-33. All three call sites
-# -- `_execute_nest!`'s two and `execute_tilewise!`'s one -- must pass the
-# matching operand's transform; missing the third would make the in-tree
-# ORACLE silently wrong for conjugated inputs.
+# GUARDRAIL: every argument here has its OWN bound type parameter, `transform`
+# included. Leaving `TF` unbound reintroduces the Phase 2b finding-5 ~80 B/call
+# dynamic dispatch, for the reason spelled out at `pack_a!` in src/kernel.jl.
+# And all THREE call sites -- `_execute_nest!`'s two and `execute_tilewise!`'s
+# one -- must pass the matching operand's transform: missing the third makes
+# the in-tree ORACLE silently wrong for conjugated inputs.
 @inline function _pack_sliver!(
         pack!::PF, packed::PK, storage::S, base::Int,
         rows::R, cols::C, kernel, transform::TF
@@ -462,11 +422,10 @@ end
 
 # Same addressing as `_sliver_range`, as a borrowed pointer. Keep in step.
 #
-# `reg_tile` here is a count of REALS per logical K step --
-# `packed_a_per_k(kernel)`/`packed_b_per_k(kernel)`, not `mr`/`nr`. The two
-# coincide for every real kernel (pinned by a test in test/test_target.jl), so
-# this is the identity on the real path; for a complex kernel the panel holds
-# `reals_per_element` planes per element and only the packed count addresses it
+# GUARDRAIL: `reg_tile` here is a count of REALS per logical K step --
+# `packed_a_per_k`/`packed_b_per_k`, NOT `mr`/`nr`. They coincide for every
+# real kernel (pinned in test/test_target.jl), so this is the identity on the
+# real path; for a complex kernel only the packed count addresses the panel
 # correctly.
 @inline function _sliver_panel(buffer, reg_tile::Int, kc_len::Int, s::Int)
     stride = reg_tile * kc_len
@@ -491,9 +450,9 @@ end
 
 # Apply beta once to every element of C at MR x NR granularity, without
 # reading A or B. Shared by both drivers' Qk==0/alpha==0 short-circuit; uses
-# the tw_* (MR/NR-sized) buffers, since a beta-only pass needs no blocking.
-# That is why those four buffers -- unlike the kc-sized tw_k_buf_*/tw_packed_*
-# ones -- are allocated even under `oracle = false`: they are not oracle-only.
+# the tw_* (MR/NR-sized) buffers, since a beta-only pass needs no blocking --
+# which is why those four, unlike the kc-sized tw_k_buf_*/tw_packed_* ones, are
+# allocated even under `oracle = false`.
 function _scale_all_of_C!(plan, betaT::T, MRk::Int, NRk::Int, Qm::Int, Qn::Int) where {T}
     ws = plan.workspace
     m_bufs = (ws.tw_m_buf_A, ws.tw_m_buf_C)
@@ -519,21 +478,20 @@ end
 # ----------------------------------------------------------------------------
 # Conjugation: folding `conjA`/`conjB` with each view's `.op`
 # ----------------------------------------------------------------------------
-# These live here, in the engine, rather than in the TensorOperations adapter,
-# because the invariant they protect is an engine invariant: the engine never
-# goes through `StridedView` indexing at all (`_plan_contract` takes
-# `parent`/`offset` and addresses the parent directly), so a view's `.op` is
-# silently dropped on all three operands unless it is folded in here. A caller
-# who wraps a complex array in a conjugated `StridedView` and calls
-# `plan_contract`/`contract!` directly, with no adapter in sight, is exposed to
-# exactly the same silent wrongness. `src/tensoroperations.jl` uses these.
+# These live in the ENGINE, not the adapter, because the invariant is an engine
+# invariant: the engine never indexes through a `StridedView` (`_plan_contract`
+# takes `parent`/`offset`), so a view's `.op` is silently dropped on all three
+# operands unless folded in here -- and a caller reaching `plan_contract`
+# directly, with no adapter in sight, is exposed to the same silent wrongness.
+# Semantics and rejected alternatives: docs/decisions.md, "Conjugation:
+# semantics, and where each piece is absorbed".
 #
-# A TOTAL table with a throwing fallback, not TensorOperations' TBLIS
-# extension's `A.op === conj` test: `StridedView(p, sz, st, off, adjoint)` is
-# directly constructible, and `=== conj` would silently treat it as
-# unconjugated -- precisely the silent-wrong-answer class this milestone exists
-# to close. The fallback is `@noinline` and unreachable for every `op`
-# `StridedViews` itself constructs, so it costs nothing.
+# GUARDRAIL: a TOTAL table with a throwing fallback, NOT TensorOperations'
+# TBLIS extension's `A.op === conj` test. `StridedView(p, sz, st, off,
+# adjoint)` is directly constructible, and `=== conj` classifies it as
+# *unconjugated* -- the silent-wrong-answer class this milestone exists to
+# close. The fallback is `@noinline` and unreachable for every `op`
+# `StridedViews` itself constructs, so totality costs nothing.
 _op_conjugates(::typeof(identity)) = false
 _op_conjugates(::typeof(conj)) = true
 # Elementwise identity on a `Number`: these permute axes, they do not touch
@@ -547,12 +505,13 @@ _op_conjugates(::typeof(adjoint)) = true
     )
 )
 
-# The two sources of conjugation are independent and compose with XOR: the
-# flag conjugates the operand's data, and so does the view's `op`, so applying
-# both is the identity. `false` unconditionally for a real element type --
-# `StridedViews` defines `conj(::StridedView{<:Real}) = a`, so a real view's
-# `op` can never conjugate anyway, and the real path therefore always gets
-# `identity` and no new `execute!` specialization, even with `conjA = true`.
+# GUARDRAIL: `⊻`, not `||`. The flag and the view's `op` are two INDEPENDENT
+# requests to conjugate the same data, and `conj` is involutive, so applying
+# both is the identity and only the parity survives. `false` unconditionally
+# for a real element type -- `StridedViews` defines
+# `conj(::StridedView{<:Real}) = a`, so a real view's `op` can never conjugate
+# anyway, and the real path therefore always gets `identity` and no new
+# `execute!` specialization, even with `conjA = true`.
 _qs_isconj(v::StridedView{T}, flag::Bool) where {T} =
     (T <: Complex) && (flag ⊻ _op_conjugates(v.op))
 
@@ -586,13 +545,10 @@ struct ContractPlan{
     Cstorage::SC
     Cbase::Int
 
-    # Elementwise transform applied to each source element as it is packed:
     # `identity` or `conj`, as singleton function VALUES with their own type
-    # parameters. Not a `Bool` field and not a `Val{Bool}`: either would cross
-    # `_pack_sliver!` as a `Union` or need mapping to a function at the pack
-    # site, which is Phase 2b finding 5 and its ~80 B/call of dynamic dispatch
-    # (docs/decisions.md, "Conjugation: semantics, and where each piece is
-    # absorbed").
+    # parameters. GUARDRAIL: not a `Bool` field and not a `Val{Bool}` -- either
+    # would cross `_pack_sliver!` as a `Union` or need mapping to a function at
+    # the pack site, i.e. Phase 2b finding 5 and its ~80 B/call.
     atransform::TA
     btransform::TB
 
@@ -672,13 +628,14 @@ function plan_contract(
     eltype(B) === T ||
         throw(ArgumentError("eltype(B) = $(eltype(B)) does not match eltype(C) = $T"))
 
-    # Fold each flag with its view's `op`. The engine never indexes through a
-    # `StridedView`, so `op` would otherwise be dropped on all three operands;
-    # for C there is nowhere to absorb it, hence the rejection rather than a
-    # transform (docs/decisions.md, "A conjugated output `C` is rejected this
-    # milestone"). These are `Union{typeof(identity),typeof(conj)}` here and
-    # die at the `_plan_contract` function barrier below, exactly as
-    # `_default_kernel`'s Union already does.
+    # Fold each flag with its view's `op`. GUARDRAIL: a conjugated `C` is
+    # REJECTED, not supported -- there is nowhere to absorb its `op` (the
+    # engine writes through to the parent), so it would be silently wrong;
+    # supporting it would also thread a flag through `store_tile!` and force
+    # re-deriving the beta-applied-once argument (docs/decisions.md, "A
+    # conjugated output `C` is rejected this milestone"). The two transforms
+    # are `Union{typeof(identity),typeof(conj)}` here and die at the
+    # `_plan_contract` barrier below, as `_default_kernel`'s Union already does.
     _qs_isconj(C, false) && throw(
         ArgumentError(
             "plan_contract: cannot write into a conjugated view (C has op $(C.op)); " *
@@ -765,11 +722,9 @@ end
 
 # Build or reuse the plan's workspace. Dispatching on the allocator type (not
 # an `isa` branch on a value) keeps both paths concretely typed and makes the
-# unreachable one disappear at compile time.
-#
-# Default path: a plain, GC-owned `ContractWorkspace{T,Vector{T}}`, reused via
-# `reserve!` when one is handed in -- the zero-steady-state-allocation fast
-# path (docs/decisions.md's workspace/allocator design-constraints section).
+# unreachable one disappear at compile time. Default path: a plain, GC-owned
+# workspace, reused via `reserve!` when one is handed in -- the
+# zero-steady-state-allocation fast path (docs/decisions.md, Amendment 1).
 function _resolve_workspace(
         ::Type{T}, workspace, kernel, blocking::Blocking, oracle::Bool,
         allocator::TO.DefaultAllocator
@@ -795,11 +750,10 @@ function _resolve_workspace(
 end
 
 # `R` is the PACKED element type, `real(T)` by `ContractWorkspace`'s own
-# invariant. The extra guard is what stops a pooled workspace of one precision
-# serving a plan of another: the backend's pool is keyed by `eltype(C)` alone,
-# so `T` matching is not by itself enough once the packed type is a separate
-# notion. `R` is a type parameter and `realtype(kernel)` is a compile-time
-# constant, so this folds away entirely.
+# invariant. The extra guard stops a pooled workspace of one precision serving
+# a plan of another: the pool is keyed by `eltype(C)` alone, so `T` matching is
+# not enough once the packed type is a separate notion. Both sides are
+# compile-time constants, so this folds away entirely.
 @inline function _reuse_workspace(
         ::Type{T}, ws::ContractWorkspace{T, Vector{R}}, kernel, blocking::Blocking,
         oracle::Bool
@@ -888,13 +842,12 @@ function _execute_nest!(
         Qm::Int, Qn::Int, Qk::Int, mc_eff::Int, kc_eff::Int, nc_eff::Int,
         alphaT::T, betaT::T
     ) where {T, K}
-    # Reals per sliver per LOGICAL K step, which is what addresses the packed
-    # panels. `MRk`/`NRk` keep their existing meaning everywhere else in this
-    # function -- sliver counts, block extents, `_classify_slivers!` -- and are
-    # NOT interchangeable with these: one counts register-tile rows, the other
-    # counts reals. For every real kernel `MRp === MRk` and `NRp === NRk`
-    # (pinned in test/test_target.jl), so the substitution below is provably
-    # the identity on the real path.
+    # GUARDRAIL: reals per sliver per LOGICAL K step, which is what addresses
+    # the packed panels. NOT interchangeable with `MRk`/`NRk`, which keep their
+    # meaning everywhere else here (sliver counts, block extents,
+    # `_classify_slivers!`): one counts register-tile rows, the other reals.
+    # `MRp === MRk` for every real kernel (pinned in test/test_target.jl), so
+    # the substitution below is provably the identity on the real path.
     MRp = packed_a_per_k(kernel)
     NRp = packed_b_per_k(kernel)
 
@@ -1057,12 +1010,11 @@ function execute_tilewise!(plan::ContractPlan{T}, alpha::Number, beta::Number) w
                 colsK_A = _axis_of(dK_A, ws.tw_k_buf_A, 0)
                 rowsK_B = _axis_of(dK_B, ws.tw_k_buf_B, 0)
 
-                # The third `_pack_sliver!` call site. The oracle must apply the
-                # same transforms as `execute!`, or it silently disagrees on
-                # conjugated inputs and the disagreement presents as an engine
-                # bug. No `_sliver_panel` here: these are whole buffers, sized
-                # by `packed_a_length`/`packed_b_length`, which already count
-                # reals -- so this driver needs no `MRp`/`NRp` treatment.
+                # The third `_pack_sliver!` call site: the oracle must apply
+                # the same transforms as `execute!` or it silently disagrees on
+                # conjugated inputs. No `_sliver_panel` here -- these are whole
+                # buffers sized by `packed_a_length`/`packed_b_length`, which
+                # already count reals, so no `MRp`/`NRp` treatment is needed.
                 _pack_sliver!(
                     pack_a!, ws.tw_packed_a, plan.Astorage, plan.Abase, rowsA, colsK_A,
                     kernel, plan.atransform

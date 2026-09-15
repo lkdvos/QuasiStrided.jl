@@ -5,42 +5,23 @@
 #
 #     accumulate(kernel.inner, acc, packed_a, packed_b, 2 * kc)
 #
-# i.e. exactly `real::<MV,NR>(2*kc, a, b, ab)` in the reference project
-# (`crates/tensorcontract/src/kernel/simd.rs:170-177`). That is the whole point:
-# one kernel body written once and parameterised, so that a planar-vs-1m
-# measurement compares two *methods* rather than two hand-tunings (their
-# D17/D24). If a future edit finds itself writing an inner loop here, the
-# comparison has already been invalidated.
+# i.e. one kernel body written once and parameterised, so that a planar-vs-1m
+# measurement compares two *methods* rather than two hand-tunings. If a future
+# edit finds itself writing an inner loop here, the comparison has already been
+# invalidated.
 #
-# WHY IT WORKS. `OneEFormat` A at logical K step `p` occupies `4*MR` reals laid
-# out as two consecutive real K steps of `2*MR`:
+# Why the real kernel computes the right thing -- the `Ar`/`Br` product
+# derivation, and why accumulator real row `2i` is the real part of complex row
+# `i` -- is in docs/decisions.md, "why the induced method works". The `2*kc`
+# doubling is confined to this file's own delegation and never appears in a
+# length, an offset or a driver loop bound.
 #
-#     reals   0 .. 2MR-1 :  re_0, im_0, re_1, im_1, ...
-#     reals 2MR .. 4MR-1 : -im_0, re_0, -im_1, re_1, ...
-#
-# and `PlanarFormat` B at that step occupies `2*NR` reals as two real K steps of
-# `NR` (`re_0..re_{NR-1}`, then `im_0..im_{NR-1}`). A real `SIMDKernel{2MR,NR}`
-# addresses A at `i' + 2MR*p'` and B at `j + NR*p'`, which walks both buffers
-# linearly -- so it reads exactly those blocks, with real step `p' = 2p` the
-# first and `p' = 2p+1` the second. The real product it computes is therefore
-#
-#     Ar[2t,   2p] =  re(A[t,p])   Ar[2t,   2p+1] = -im(A[t,p])
-#     Ar[2t+1, 2p] =  im(A[t,p])   Ar[2t+1, 2p+1] =  re(A[t,p])
-#     Br[j,    2p] =  re(B[p,j])   Br[j,    2p+1] =  im(B[p,j])
-#
-# whose row `2t` sums `re*re - im*im` (the real part) and whose row `2t+1` sums
-# `im*re + re*im` (the imaginary part). Hence the accumulator's real row `2i` is
-# the real part and real row `2i+1` the imaginary part of complex row `i`.
-#
-# `accumulate` takes the LOGICAL (complex) `kc`; the `2*kc` doubling is confined
-# to this file's own delegation and never appears in a length, an offset or a
-# driver loop bound (their D16).
-#
-# Cliff B (Julia heap-allocating a dynamically indexed `NTuple` above NV = 16,
-# 24576 B per `execute!` measured in Phase H) applies here exactly as it does to
-# planar: the store below is `@generated` with literal tuple indices including
-# the lane tail, and the real path's runtime-indexed `_acc_lane` helper is not
-# used. `accumulate` inherits the real kernel's already-`@generated` body.
+# Cliff B (Julia heap-allocating a dynamically indexed `NTuple` above NV = 16;
+# see src/kernels/simd.jl for the measured number) applies here exactly as it
+# does to planar: the store below is `@generated` with literal tuple indices
+# including the lane tail, and the real path's runtime-indexed `_acc_lane`
+# helper is not used. `accumulate` inherits the real kernel's already-
+# `@generated` body.
 
 using SIMD: Vec
 
@@ -58,9 +39,8 @@ Van Zee's induced 1m microkernel, implementing [`OneMMethod`](@ref): a real
 the *real* type. Note the shape bookkeeping: `mr(kernel) == MR` while
 `mr(kernel.inner) == 2MR`, and it is `2MR` -- not `MR` -- that must be a
 multiple of `W`. That is why the shipped menu contains `MR = 12` at `W = 8`:
-`2*12 = 24` is the multiple. `W` must additionally be **even**, which is what
-makes the two halves of a complex row adjacent lanes of one `Vec` (see
-[`store_tile!`](@ref)).
+`2*12 = 24` is the multiple. `W` must additionally be **even** (see the
+constructor).
 
 The field is named `descriptor`, so `mr`/`nr`/`scalartype`/`packed_a_length`/
 `packed_b_length`/`realtype`/`packed_a_per_k`/`packed_b_per_k`/`a_format`/
@@ -85,11 +65,12 @@ struct OneMKernel{MR, NR, T, W, KI <: SIMDKernel} <: DescriptorKernel{MR, NR, T}
             descriptor::ComplexKernelDescriptor{MR, NR, T, OneEFormat, PlanarFormat},
             inner::KI
         ) where {MR, NR, T, W, KI <: SIMDKernel}
-        W isa Int && W > 0 ||
-            throw(ArgumentError("OneMKernel requires an Int vector width W > 0, got W = $W"))
-        # Even `W` is load-bearing, not cosmetic: the accumulator is read back
-        # as complex row `i` from lanes `2u+1`/`2u+2` of one vector, which is
-        # only sound when vectors start at even real rows.
+        _check_lanewidth("OneMKernel", W)
+        # GUARDRAIL: even `W` is load-bearing, not cosmetic. An ODD `W` can
+        # satisfy `mod(2MR, W) == 0` (MR = 3, W = 3 does) while a complex row
+        # straddles a vector boundary, silently breaking the tile reader below,
+        # which reads complex row `i` from lanes `2u+1`/`2u+2` of ONE vector.
+        # Wrong answer, not an error -- hence checked here.
         iseven(W) ||
             throw(
             ArgumentError(
@@ -168,44 +149,18 @@ Vector registers live at the bottom of the inner real kernel's K loop:
 
 with `MV = 2*mr(kernel) ÷ lanewidth(kernel)`. This is the **real** kernel's
 budget, unchanged -- 1m holds one accumulator plane over a doubled real row
-count where planar holds two planes over `MR` rows, so at equal `(MV, NR)`
-1m needs a little over half of planar's registers. **Cliff A**: it must be
-`<=` the architectural register count (`target_profile().nregisters`; 32 zmm
-under AVX-512).
+count where planar holds two planes over `MR` rows, so at equal `(MV, NR)` 1m
+needs a little over half of planar's registers. **Cliff A**: it must be `<=`
+the architectural register count (`target_profile().nregisters`; 32 zmm under
+AVX-512).
 
-**Measured**, because Phase C found the freeze's register arithmetic optimistic
-once already and a spill count is not something to assume. `@code_native` on
-the inner loop of `accumulate` (Julia 1.12.6, ccqlin038, cascadelake
-`:avx512`, 32 zmm), per **real** K step. `reloads` counts stack memory operands
-used as sources, folded FMA operands (`vfmadd213pd zmm, zmm, [rbp-N]`)
-included; `stores` counts stack memory operands written.
-
-Measured on `kernel.inner`: `accumulate(::OneMKernel, ...)` does not inline
-into its caller, so the code that actually runs the K loop *is* the real
-path's `accumulate(::SIMDKernel{2MR,NR,real(T),W}, ...)`, byte for byte. That
-is the reuse being confirmed rather than a limitation of the measurement.
-
-| shape (MR,NR,W) | MV | pressure | stores | reloads | FMAs |
-| --- | --- | --- | --- | --- | --- |
-| 1m (12,8,8) CF64 / (24,8,16) CF32 | 3 | 28 | 0 | 0 | 24 |
-| 1m (16,6,8) CF64 / (32,6,16) CF32 | 4 | 29 | 0 | 0 | 24 |
-| 1m ( 8,8,8) CF64 / (16,8,16) CF32 | 2 | 19 | 0 | 0 | 16 |
-| 1m ( 8,4,4) CF64 (small fixture)  | 4 | 21 | 0 | 0 | 16 |
-
-Every shipped 1m shape is spill-free, at exactly `MV*NR` FMAs per real K step
-(so `2*MV*NR` per *logical* complex K step). The same instrument reproduces
-Phase C's real controls exactly -- real `(32,6,8)` clean at pressure 29, real
-`(48,6,8)` at 12 stores / 12 reloads at pressure 43 -- and on planar it reports
-`(16,6,8)`/`(32,6,16)` at 24 stores / 6 reloads and `(24,3,8)`/`(48,3,16)`
-clean, close to but not identical with the table in
-`planar_register_pressure`. It does *not* reproduce that table's planar
-`(8,8,8)`/`(16,8,16)` row: this instrument measures 15 stores and 8 reloads
-there, at pressure 20, while `(24,3,8)` at pressure 26 is clean. Recorded here
-as a disagreement to be settled in Phase F, not worked around; it does not
-affect 1m, whose rows are zero throughout.
-
-**This is not a throughput or ranking claim.** Spill counts are not timings;
-ranking planar against 1m is Phase F's, on measured throughput.
+**Measured, not assumed**: every shipped 1m shape is spill-free -- 0 stack
+stores and 0 reloads at `(12,8,8)`, `(16,6,8)`, `(8,8,8)` and `(8,4,4)`, at
+exactly `MV*NR` FMAs per *real* K step. Measured on `kernel.inner`, because the
+code running 1m's K loop **is** the real path's `accumulate`, byte for byte --
+which is the reuse confirmed as an executed fact. Numbers, instruments and the
+planar comparison: docs/decisions.md, "Every shipped 1m shape is spill-free".
+Spill counts are not timings; ranking is Phase F's, on measured throughput.
 """
 onem_register_pressure(::OneMKernel{MR, NR, T, W}) where {MR, NR, T, W} =
     ((2 * MR) ÷ W) * NR + ((2 * MR) ÷ W) + 1
@@ -259,24 +214,19 @@ end
 # The `OneM` tile reader. The accumulator is the inner real kernel's, holding a
 # real `2MR x NR` tile; complex row `i` is real rows `2i` (re) and `2i+1` (im).
 #
-# ADJACENCY. Accumulator vector `v` covers real rows `v*W .. v*W+W-1`. `W` is
-# even (enforced at construction) and `2MR` is a multiple of `W`, so `v*W` is
-# even and `MR = MV*(W÷2)` exactly -- the complex rows partition cleanly across
-# vectors, `W÷2` per vector, with none split across a vector boundary.
-# Therefore the two halves of complex row `i = v*(W÷2) + u` are lanes `2u+1`
-# and `2u+2` (1-based `SIMD.Vec` indexing) of vector `v`, always adjacent, in
-# one vector. This is the cheapest of the recombinations: no cross-vector
+# ADJACENCY, which is what the even-`W` constructor check buys: accumulator
+# vector `v` covers real rows `v*W .. v*W+W-1`, and with `W` even and `2MR` a
+# multiple of `W`, `v*W` is even and `MR == MV*(W÷2)` exactly -- complex rows
+# partition cleanly, `W÷2` per vector, none split across a vector boundary. So
+# the two halves of complex row `i = v*(W÷2) + u` are lanes `2u+1` and `2u+2`
+# (1-based) of vector `v`: always adjacent, in one vector. No cross-vector
 # shuffle, no second load.
 #
 # `@generated` with literal tuple indices (Cliff B), unrolled over `(v, j)`
 # exactly as `_store_tile_scattered!` (src/kernels/simd.jl) and
-# `_store_tile_planar!` (src/kernels/planar.jl); only the lane index inside a
-# single `Vec` is a runtime value, which stays on the stack.
-#
-# Scattered/scalar path only, delegating to the existing generic
-# `_axpby_tile!` (src/kernel.jl) for the alpha/beta shortcuts. The unit-stride
-# interleaved-store fast path is the same deliberately deferred,
-# measurement-gated follow-on it is for planar, and is NOT built here.
+# `_store_tile_planar!` (src/kernels/planar.jl). Scattered/scalar path only;
+# the unit-stride interleaved store is the same deliberately deferred,
+# measurement-gated follow-on it is for planar.
 @generated function _store_tile_onem!(
         destination::QSTile, acc::NTuple{NV, Vec{W, R}},
         alpha::T, beta::T, kernel::OneMKernel{MR, NR, T, W},
@@ -352,15 +302,8 @@ function store_tile!(
         destination::QSTile, acc::NTuple{NV, Vec{W, R}},
         alpha::T, beta::T, kernel::OneMKernel{MR, NR, T, W}
     ) where {MR, NR, T, W, R, NV}
-    m = nrows(destination)
-    n = ncols(destination)
+    m, n = _store_prologue!(destination, alpha, beta)
     (m == 0 || n == 0) && return destination
-
-    if iszero(alpha)
-        scale_tile!(destination, beta)
-        return destination
-    end
-
     return _store_tile_onem!(destination, acc, alpha, beta, kernel, m, n)
 end
 
@@ -368,50 +311,19 @@ end
     execute_tile!(kernel::OneMKernel, destination::QSTile, packed_a, packed_b, kc::Int, alpha, beta) -> destination
 
 1m counterpart of `SIMDKernel`'s `execute_tile!`; same validation order and
-short-circuits. `kc` is the **logical** (complex) K depth, and the
-buffer-length checks go through `packed_a_length`/`packed_b_length`, which take
-a logical `kc` and return a count of **reals** (`4*MR*kc` and `2*NR*kc`). The
-`2*kc` real-step doubling lives inside `accumulate` and is not visible here.
+short-circuits (both are `_execute_tile_prologue!`'s). `kc` is the **logical**
+(complex) K depth, and the buffer-length checks go through
+`packed_a_length`/`packed_b_length`, which take a logical `kc` and return a
+count of **reals** (`4*MR*kc` and `2*NR*kc`). The `2*kc` real-step doubling
+lives inside `accumulate` and is not visible here.
 """
 function execute_tile!(
         kernel::OneMKernel{MR, NR, T, W}, destination::QSTile,
         packed_a::PA, packed_b::PB, kc::Int, alpha, beta
     ) where {MR, NR, T, W, PA, PB}
-    m = nrows(destination)
-    n = ncols(destination)
-    m <= MR || throw(ArgumentError("destination valid row extent $m exceeds mr(kernel) = $MR"))
-    n <= NR || throw(ArgumentError("destination valid column extent $n exceeds nr(kernel) = $NR"))
-    kc >= 0 || throw(ArgumentError("execute_tile! requires kc >= 0, got kc = $kc"))
-
-    alphaT = convert(T, alpha)
-    betaT = convert(T, beta)
-
-    (m == 0 || n == 0) && return destination
-
-    checked_tile_storage_bounds(destination)  # bounds before any unchecked path
-
-    if kc == 0 || iszero(alphaT)
-        scale_tile!(destination, betaT)
-        return destination
-    end
-
-    length(packed_a) >= packed_a_length(kernel, kc) ||
-        throw(
-        DimensionMismatch(
-            "execute_tile!: packed_a has length $(length(packed_a)), " *
-                "need at least packed_a_length(kernel, kc=$kc) = $(packed_a_length(kernel, kc))"
-        )
-    )
-    length(packed_b) >= packed_b_length(kernel, kc) ||
-        throw(
-        DimensionMismatch(
-            "execute_tile!: packed_b has length $(length(packed_b)), " *
-                "need at least packed_b_length(kernel, kc=$kc) = $(packed_b_length(kernel, kc))"
-        )
-    )
-
-    acc = zero_accumulator(kernel)
-    acc = accumulate(kernel, acc, packed_a, packed_b, kc)
-    store_tile!(destination, acc, alphaT, betaT, kernel)
-    return destination
+    run, alphaT, betaT =
+        _execute_tile_prologue!(kernel, destination, packed_a, packed_b, kc, alpha, beta)
+    run || return destination
+    acc = accumulate(kernel, zero_accumulator(kernel), packed_a, packed_b, kc)
+    return store_tile!(destination, acc, alphaT, betaT, kernel)
 end

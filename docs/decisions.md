@@ -3126,3 +3126,140 @@ which supersedes the spill-count question as its own tie-breaker, and both
 detectors agreed on the shape that matters. Recorded so a future reader does not
 mistake the disagreement for a live risk: it is a disagreement about an
 instrument nothing shipped now depends on.
+
+## Comment/structure cleanup pass (post-milestone)
+
+A readability and de-duplication pass over the whole tree, with no behaviour
+change: no new features, no changed defaults, no changed error messages, and
+the suite unchanged at 34480/34480. Recorded because it moved material *into*
+this file and left pointers behind, which is a change a future reader can
+otherwise mistake for lost knowledge.
+
+**The rule applied.** This project keeps `docs/decisions.md` as the
+authoritative record of *why* and source comments as pointers to it. The
+milestone that just closed wrote a great deal of narrative into the source that
+this file already held -- the planar and 1m spill tables, the `vfnmadd`
+verification, the `_shape_override` ranking, the conjugation essay, the
+real-path guard's how-to-read notes, the two bytes-per-flop metrics. Those
+source blocks were condensed to a pointer plus the load-bearing number. Two
+pieces of material lived **only** in the source and are transcribed below
+before being condensed there.
+
+**Guardrail comments were deliberately kept in place, in the source**, tightened
+but never removed: the per-argument bound-type-parameter rule (`src/kernel.jl`,
+`_pack_sliver!`), the "do not collapse the barrier methods" warning, the
+borrowed-pointer-not-`view` result (`src/panel.jl`), the literal-tuple-index
+rule (Cliff B, 24576 B), `muladd(-ai, bi, c)` over `c - ai*bi`, 1m's even-`W`
+requirement, `complex_format.jl`'s reduction-to-the-frozen-format argument,
+`ContractWorkspace`'s `eltype(VT) === real(T)` invariant, and Amendment 3's
+three conjugation comments. A guardrail is one sharp sentence in the source, not
+a pointer to this file, because the reader who needs it is editing the line
+above it.
+
+### Transcribed from `src/kernels/onem.jl`: why the induced method works
+
+`OneEFormat` A at logical K step `p` occupies `4*MR` reals laid out as two
+consecutive *real* K steps of `2*MR`:
+
+    reals   0 .. 2MR-1 :  re_0, im_0, re_1, im_1, ...
+    reals 2MR .. 4MR-1 : -im_0, re_0, -im_1, re_1, ...
+
+and `PlanarFormat` B at that step occupies `2*NR` reals as two real K steps of
+`NR` (`re_0..re_{NR-1}`, then `im_0..im_{NR-1}`). A real `SIMDKernel{2MR,NR}`
+addresses A at `i' + 2MR*p'` and B at `j + NR*p'`, which walks both buffers
+linearly -- so it reads exactly those blocks, with real step `p' = 2p` the first
+and `p' = 2p+1` the second. The real product it computes is therefore
+
+    Ar[2t,   2p] =  re(A[t,p])   Ar[2t,   2p+1] = -im(A[t,p])
+    Ar[2t+1, 2p] =  im(A[t,p])   Ar[2t+1, 2p+1] =  re(A[t,p])
+    Br[j,    2p] =  re(B[p,j])   Br[j,    2p+1] =  im(B[p,j])
+
+whose row `2t` sums `re*re - im*im` (the real part) and whose row `2t+1` sums
+`im*re + re*im` (the imaginary part). Hence the accumulator's real row `2i` is
+the real part and real row `2i+1` the imaginary part of complex row `i`, which
+is what the `(2u+1, 2u+2)` lane pair in `_store_tile_onem!` reads back.
+
+The `2*kc` doubling is confined to 1m's own `accumulate` and never appears in a
+length, an offset or a driver loop bound.
+
+### Transcribed from `src/kernels/planar.jl`: the per-shape `vfnmadd` count
+
+Phase C recorded that `muladd(-ai, bi, cr)` folds its `fneg` into
+`vfnmadd231pd`/`ps` with zero separate negations. The per-shape table behind
+that claim lived only in the source. `@code_native` on the inner loop of
+`accumulate` (Julia 1.12.6, ccqlin038, cascadelake `:avx512`), per logical K
+step -- which is the shipped form, since `execute_tile!` calls out to
+`accumulate` rather than inlining it, on the real path too:
+
+| (MR,NR,W) | eltype | vfnmadd231 | vfmadd231 | vxorp | vsubp | vmulp |
+| --- | --- | --- | --- | --- | --- | --- |
+| (16,6,8) | `ComplexF64` | 12 | 36 | 0 | 0 | 0 |
+| (24,3,8) | `ComplexF64` | 9 | 27 | 0 | 0 | 0 |
+| ( 8,8,8) | `ComplexF64` | 8 | 24 | 0 | 0 | 0 |
+| (32,6,16) | `ComplexF32` | 12 | 36 | 0 | 0 | 0 |
+| (48,3,16) | `ComplexF32` | 9 | 27 | 0 | 0 | 0 |
+| (16,8,16) | `ComplexF32` | 8 | 24 | 0 | 0 | 0 |
+
+i.e. exactly `MV*NR` vfnmadd + `3*MV*NR` vfmadd = `4*MV*NR` FMAs and **zero**
+separate negations at every menu shape, so hoisting `nai_v = -ai_v` out of the
+`j` loop is free rather than merely cheap.
+
+### What was unified, and what was deliberately left alone
+
+Unified, each as one `@inline` helper with per-argument bound type parameters so
+no specialization is lost:
+
+- `execute_tile!`'s validation sequence, previously four near-identical copies
+  (`ScalarKernel`, `SIMDKernel`, `PlanarKernel`, `OneMKernel`) -- extent checks,
+  `kc >= 0`, the `convert`s, the empty short-circuit,
+  `checked_tile_storage_bounds`, both buffer-length checks, and the
+  `kc == 0 || iszero(alpha)` branch -- as `_execute_tile_prologue!`.
+- `store_tile!`'s alpha/beta preamble across the same four, as
+  `_store_prologue!`.
+- The `pack_a!`/`pack_b!` validation preambles across all four packer methods
+  (real and complex descriptors), as `_check_pack_a`/`_check_pack_b`. The
+  *loops* are untouched, which is what keeps the real path's generated code
+  provably unchanged.
+- Constructor validation: `_check_reg_tile` (shared by `KernelDescriptor` and
+  `ComplexKernelDescriptor`), `_check_lanewidth` (all three vector kernels) and
+  `_check_mr_multiple` (`SIMDKernel` and `PlanarKernel`). Every message is
+  byte-identical to what it replaced.
+Attempted and REVERTED, with a number, because this is the interesting one:
+
+- The two `TO.tensorcontract!` methods differ only in allocator handling, and
+  merging them into a single method over a dispatched `_qs_run!` helper reads
+  better and removes a duplicated 10-line signature. It also **measures
+  worse**: `+32 B/call` (`Float64`) and `+64 B/call` (`ComplexF64`) against the
+  two-method form, on *both* allocator regimes, reproducibly, and reverting the
+  merge restores the two-method numbers exactly (3952 / 8144 B and 3952 /
+  8624 B on a 40x40x40 `@tensor` call). The extra frame changes what escapes,
+  so the `ContractPlan` stops being elided. Dispatching on the allocator was
+  preserved in the merged form, so this is not the hazard the original split
+  was guarding -- it is a new one, found only because it was measured.
+
+  Left as two methods, with a comment in `src/tensoroperations.jl` carrying the
+  numbers so the merge is not re-proposed. **Worth generalising**: "reads
+  better" and "allocates the same" are independent properties in this
+  codebase, and a readability refactor of a plan-constructing entry point needs
+  an allocation measurement even when nothing about its typing changed.
+
+Everything else below was verified allocation-neutral: zero allocations in all
+21 cells of (17 shipped kernel configurations + 4 default paths) x `execute!`
+on a **scattered** fixture -- permuted A, negative-stride B, sliced C, the
+fixture class that hid a real 24 KB regression in this project before -- and
+the shared `_execute_tile_prologue!` infers to a concrete `Tuple{Bool,T,T}`
+with a concrete `execute_tile!` return at every shipped kernel type crossed
+with every `(rows, cols)` axis-kind pair.
+
+**Left alone deliberately.** `_pack_panel!` and `_pack_panel_complex!`
+(`src/packing.jl`) are parallel loops and stay parallel. The milestone kept them
+separate so that "the real path is byte-identical" is a `git diff` fact rather
+than an argument, and unifying them would require *proving* the real path's
+generated code unchanged -- which a hoisted `emit` callback cannot be shown to
+do without a per-shape `@code_native` comparison this pass did not run. The
+shared validation was extracted instead, which captures most of the duplicated
+text at none of that risk.
+
+The independent oracles in `test/` were not shrunk: several deliberately
+re-implement a packed format so they can catch the implementation being wrong,
+and they are the evidence this pass is safe.

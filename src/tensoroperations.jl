@@ -181,82 +181,50 @@ end
 # is absorbed", and Amendment 3, which discharges the former invariant)
 # ----------------------------------------------------------------------------
 #
-# `conjA`/`conjB` are NOT dropped: both `tensorcontract!` methods below forward
-# them to `plan_contract` as its `conjA`/`conjB` keywords, and the engine folds
-# each one with the corresponding view's `.op` through `_qs_isconj`
-# (src/driver.jl), converts the result to a singleton `identity`/`conj`, and
-# applies it in the packing pass via the existing `transform` seam. Three facts
-# about that split are load-bearing.
+# `conjA`/`conjB` are NOT dropped: both are forwarded to `plan_contract`, which
+# folds each with the corresponding view's `.op` through `_qs_isconj`
+# (src/driver.jl) and applies the result in the packing pass. Three facts about
+# that split are load-bearing and are the reason these comments exist.
 #
-# (a) The combining rule is
+# (a) THE COMBINING RULE IS XOR, not `||`:
 #
 #         _qs_isconj(v::StridedView{T}, flag::Bool) where {T} =
 #             (T <: Complex) && (flag ⊻ _op_conjugates(v.op))
 #
-#     `⊻`, not `||`: TO's flag and `StridedView.op` are two *independent*
-#     requests to conjugate the same data. TO's contract is
-#     `C = β*C + α*permutedims(contract(opA(A), opB(B)), pAB)`, i.e. `conjA` is
-#     applied on top of whatever the view already carries, and `conj` is
-#     involutive -- so two conjugations cancel and only the parity of the pair
-#     survives. `α`/`β` are not conjugated at all: `conjA` conjugates A's data
-#     only.
+#     TO's flag and `StridedView.op` are two *independent* requests to
+#     conjugate the same data (`conjA` is applied on top of whatever the view
+#     already carries), and `conj` is involutive -- so two conjugations cancel
+#     and only the parity survives. `α`/`β` are never conjugated.
 #
-# (b) `_op_conjugates` is a *total* table (`identity`/`transpose` -> `false`,
-#     since both are elementwise identities on a `Number`; `conj`/`adjoint` ->
-#     `true`) with an `@noinline` throwing fallback -- deliberately not
-#     TensorOperations' TBLIS extension's `(A.op === conj)` test
-#     (`isconj`, ext/TensorOperationsTBLISExt.jl). That test is right for every
-#     `op` `StridedViews` itself constructs, but it is not total:
-#     `StridedView(p, sz, st, off, adjoint)` is directly constructible, and
-#     `=== conj` classifies it as *unconjugated*, silently returning the
-#     unconjugated contraction. That is exactly the silent-wrong-answer class
-#     this milestone exists to close, so an unrecognised `op` is hard-rejected
-#     instead -- consistent with this backend's "hard-reject, never fall back"
-#     rule. The fallback is unreachable for every `op` `StridedViews` builds,
-#     so being total costs nothing.
+# (b) `_op_conjugates` IS TOTAL -- `identity`/`transpose` -> `false` (both are
+#     elementwise identities on a `Number`), `conj`/`adjoint` -> `true`, plus an
+#     `@noinline` throwing fallback. Deliberately NOT TensorOperations' TBLIS
+#     extension's `(A.op === conj)` test: that is right for every `op`
+#     `StridedViews` itself constructs but is not total, and
+#     `StridedView(p, sz, st, off, adjoint)` is directly constructible and would
+#     be classified as *unconjugated*, silently returning the wrong
+#     contraction. Hard-rejecting an unknown `op` matches this backend's
+#     "hard-reject, never fall back" rule, and the unreachable fallback costs
+#     nothing.
 #
-# (c) A conjugated output `C` is *rejected*, not supported: `plan_contract`
-#     throws on `_qs_isconj(Cv, false)`. In-tree precedent, same rejection:
-#     TensorOperations' TBLIS extension does
-#     `isconj(SV(C), false) && throw_conj_output(f)`
-#     (ext/TensorOperationsTBLISExt.jl). Supporting it would thread a
-#     conjugation flag as a type parameter through `store_tile!` ->
-#     `execute_tile!` -> `_execute_micro_tile!` -> the nest, doubling
-#     specialisations of the *innermost* code for a case TO's public API cannot
-#     even express (there is no `conjC` parameter), and would require
+# (c) A CONJUGATED OUTPUT `C` IS REJECTED, not supported. In-tree precedent:
+#     TO's TBLIS extension does `isconj(SV(C), false) && throw_conj_output(f)`.
+#     Supporting it would thread a conjugation flag as a type parameter through
+#     `store_tile!` -> `execute_tile!` -> `_execute_micro_tile!` -> the nest,
+#     doubling specialisations of the *innermost* code for a case TO's public
+#     API cannot even express (there is no `conjC`), and would require
 #     re-deriving the beta-applied-once argument under
 #     `beta_eff = firstpanel ? betaT : one(T)`.
 #
-# The *fold* lives in `plan_contract`, not here, and the rejection lives in
-# BOTH. `plan_contract`/`contract!` are public entry points reachable without
-# this adapter, and a caller who hands the engine a conjugated complex
-# `StridedView` directly is exposed to the identical silent wrongness, so the
-# engine must check. The adapter checks as well, because it passes
-# `workspace = _qs_task_workspace(...)` as an *argument* to `plan_contract`
-# and Julia evaluates arguments first -- so relying on the engine alone would
-# acquire (and possibly `reserve!`-grow) a pooled workspace on behalf of a call
-# that is about to be rejected, at a point the frozen order does not mention.
-# See `_qs_prepare` below, and docs/decisions.md's "Second addendum to
-# 'Required argument-checking order in the adapter (frozen)'" together with its
-# correction in "Phase C integration findings". Both sites call the identical
-# `_qs_isconj(Cv, false)`, so the two cannot diverge in behaviour, and each has
-# its own pinning test.
-#
-# Keeping the fold single-owned also makes the plan/view mismatch hazard
-# unrepresentable rather than merely detected: `execute!(plan, α, β)` takes no
-# operands, so there is nothing to re-supply with a different `op`.
-#
-# The real path is *structurally* immune -- stronger than the original frozen
-# text claimed. `StridedViews` defines `Base.conj(a::StridedView{<:Real}) = a`
-# (and `adjoint` on a real matrix view is a plain `permutedims` of it), so `op`
-# is always `identity` for a real element type no matter what wrapper the user
-# passes; and `_qs_isconj` short-circuits on `T <: Complex` regardless. Passing
-# `conjA = true` on a real eltype therefore cannot even create a new `execute!`
-# specialisation: `plan.atransform === plan.btransform === identity` always.
+# The rejection lives in BOTH `plan_contract` and `_qs_prepare`, deliberately;
+# see `_qs_prepare`. The real path is *structurally* immune: `StridedViews`
+# defines `Base.conj(a::StridedView{<:Real}) = a`, and `_qs_isconj`
+# short-circuits on `T <: Complex` regardless, so `conjA = true` on a real
+# eltype cannot even create a new `execute!` specialisation.
 
 # Shared prefix of both `tensorcontract!` methods below, in the frozen order
-# (docs/decisions.md, "Required argument-checking order in the adapter", its
-# `StridedView`-based-aliasing addendum, and its second addendum):
+# (docs/decisions.md, "Required argument-checking order in the adapter" and its
+# two addenda):
 #
 #     eligibility -> argcheck -> dimcheck -> wrap -> aliasing
 #         -> conjugated-C rejection
@@ -266,22 +234,17 @@ end
 # The conjugated-`C` rejection is performed HERE as well as in
 # `plan_contract`, and the duplication is deliberate. `plan_contract` owns it
 # for direct `contract!`/`plan_contract` callers, who never run this prefix.
-# But both `tensorcontract!` methods below pass `workspace =
-# _qs_task_workspace(...)` (or open an allocator checkpoint) as an *argument*
-# to `plan_contract`, so that argument is evaluated -- acquiring and possibly
-# `reserve!`-growing a pooled workspace -- before `plan_contract`'s own
-# rejection can fire. Leaving it to the engine alone would therefore mutate
-# process-visible state for a call that is about to be rejected, and would put
-# the rejection after a step the frozen order does not even mention. Rejecting
-# here restores the frozen order for adapter callers; the engine keeps its own
-# check so neither entry point depends on the other.
+# But both methods below pass `workspace = _qs_task_workspace(...)` (or open
+# an allocator checkpoint) as an *argument* to `plan_contract`, and Julia
+# evaluates arguments first -- so deferring to the engine would acquire and
+# possibly `reserve!`-grow a pooled workspace on behalf of a call that is about
+# to be rejected, at a point the frozen order does not mention. Both sites call
+# the identical `_qs_isconj(Cv, false)`, and each has its own pinning test.
 #
-# `conjA`/`conjB` deliberately do not flow through here. No step of this prefix
-# consumes them, and their sole consumer -- `plan_contract` -- is called
-# directly by each method below, so routing them through would widen this
-# signature and its return tuple without moving any decision closer to the code
-# that makes it. One owner of the fold also means adapter callers and direct
-# `plan_contract` callers run literally the same code.
+# `conjA`/`conjB` deliberately do not flow through here: no step of this prefix
+# consumes them, and their sole consumer `plan_contract` is called directly by
+# each method below, so routing them through would widen this signature without
+# moving any decision closer to the code that makes it.
 @inline function _qs_prepare(C, A, pA, B, pB, pAB, α, β)
     _qs_check_eligible(TO.tensorcontract!, C, A, B)
     TO.argcheck_tensorcontract(C, A, pA, B, pB, pAB)
@@ -359,6 +322,13 @@ function TO.tensorcontract!(
     return C
 end
 
+# NOT merged with the method above, although the two differ only in allocator
+# handling. Merging them into one method over a dispatched `_qs_run!` helper
+# reads better and saves a duplicated 10-line signature, but MEASURES WORSE:
+# +32 B/call (`Float64`) and +64 B/call (`ComplexF64`) against this form, on
+# both allocator regimes, reproducibly. The extra frame changes what escapes,
+# so the `ContractPlan` stops being elided. Left as two methods deliberately;
+# see docs/decisions.md, "Comment/structure cleanup pass".
 function TO.tensorcontract!(
         C::AbstractArray,
         A::AbstractArray, pA::Index2Tuple, conjA::Bool,

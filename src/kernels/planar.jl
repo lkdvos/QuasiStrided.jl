@@ -6,23 +6,20 @@
 # no duplicated lanes. Everything below this boundary works exclusively in
 # `real(T)`: packed buffers, `SIMD.Vec` lanes and the accumulator.
 #
-# Two *independent* performance cliffs run through this file and must be kept
-# apart in any analysis (docs/decisions.md, "The planar microkernel:
-# accumulator, body, and two independent cliffs"):
+# Two *independent* performance cliffs run through this file and must not be
+# conflated (docs/decisions.md, "The planar microkernel: accumulator, body, and
+# two independent cliffs"):
 #
-#   Cliff A -- architectural register spill. Live state per K step is
-#   `2*MV*NR` accumulators + `2*MV` A vectors + 2 B broadcasts, and that must
-#   fit the architectural register file (32 zmm under AVX-512, 16 ymm under
-#   AVX2). See `planar_register_pressure`. This is about the hardware.
+#   Cliff A -- architectural register spill. Hardware. See
+#   `planar_register_pressure`.
 #
 #   Cliff B -- Julia's tuple lowering. Dynamic `NTuple` indexing above NV = 16
-#   makes the compiler heap-allocate the accumulator rather than keep it
-#   register-resident: 24576 B per `execute!`, measured in Phase H. Planar at
-#   16x6 is NV_total = 24, so the cliff is live from the first line of code.
-#   Therefore *every* accumulate and store here is `@generated` with literal
-#   tuple indices, including the lane tail -- the real path's runtime-indexed
-#   `_acc_lane` helper (src/kernels/simd.jl) must not be used. Only a single
-#   `Vec` is ever addressed dynamically (by lane), which stays on the stack.
+#   makes the compiler heap-allocate the accumulator: 24576 B per `execute!`,
+#   measured in Phase H. Planar at 16x6 is NV_total = 24, so the cliff is live
+#   from the first line of code. Therefore *every* accumulate and store here is
+#   `@generated` with literal tuple indices, including the lane tail -- the real
+#   path's runtime-indexed `_acc_lane` helper (src/kernels/simd.jl) must not be
+#   used here.
 
 using SIMD: Vec, vload, vstore
 
@@ -51,15 +48,8 @@ struct PlanarKernel{MR, NR, T, W} <: DescriptorKernel{MR, NR, T}
     function PlanarKernel{MR, NR, T, W}(
             descriptor::ComplexKernelDescriptor{MR, NR, T, PlanarFormat, PlanarFormat}
         ) where {MR, NR, T, W}
-        W isa Int && W > 0 ||
-            throw(ArgumentError("PlanarKernel requires an Int vector width W > 0, got W = $W"))
-        mod(MR, W) == 0 ||
-            throw(
-            ArgumentError(
-                "PlanarKernel requires mr(kernel) = $MR to be a multiple of " *
-                    "the vector width W = $W"
-            )
-        )
+        _check_lanewidth("PlanarKernel", W)
+        _check_mr_multiple("PlanarKernel", MR, W)
         return new{MR, NR, T, W}(descriptor)
     end
 end
@@ -111,29 +101,18 @@ Vector registers live at the bottom of the K loop:
 
 with `MV = mr(kernel) ÷ lanewidth(kernel)`. **Cliff A**: this must be `<=` the
 architectural register count (`target_profile().nregisters`; 32 zmm under
-AVX-512, 16 ymm under AVX2) or the microkernel spills, costing 30-50%. At the
-reference shape `(MV, NR) = (2, 6)` it is `24 + 4 + 2 = 30 <= 32` -- tight.
-Independent of Cliff B, which is about Julia's tuple lowering, not hardware.
+AVX-512, 16 ymm under AVX2) or the microkernel spills, costing 30-50%.
 
-**Measured, and the `<= nregisters` bound is optimistic.** `@code_native` on
-`accumulate`'s inner loop (Julia 1.12.6, ccqlin038, cascadelake `:avx512`,
-32 zmm) counts `%rsp` stores/reloads per K step against this quantity:
-
-| shape | pressure | stores | reloads |
-| --- | --- | --- | --- |
-| planar (24,3,8) / (48,3,16) | 26 | 0 | 0 |
-| planar (8,8,8) / (16,8,16) | 20 | 0 | 0 |
-| real `SIMDKernel` (32,6,8) | 29 | 0 | 0 |
-| **planar (16,6,8) / (32,6,16)** | **30** | **26** | **3** |
-| real `SIMDKernel` (48,6,8) | 43 | 12 | 12 |
-| planar (16,6,4) (over budget) | 58 | 96 | 74 |
-
-The transition sits between 29 (clean) and 30 (spilling), not at 32: the
-reference `(MV,NR) = (2,6)` shape already spills, 26 stores against 48 FMAs.
-Most of that traffic is store-only (23 accumulator stores, no matching
-reloads), so it is store-port pressure rather than a load-use dependency
-chain, but it is not free. Recorded rather than worked around; the shape menu
-is not this file's to change.
+**The `<= nregisters` bound is measured to be optimistic, and is not a
+predictor.** At the reference shape `(MV, NR) = (2, 6)` it is `24 + 4 + 2 = 30`
+and that shape *does* spill (26 stack stores per K step against 48 FMAs, mostly
+store-port traffic rather than a load-use chain), while `(24,3,8)` at pressure
+26 is clean and `(8,8,8)` at pressure 20 is not -- so spilling is not monotone
+in this number and aspect ratio matters independently. Full tables, both
+instruments, and the Phase D correction: docs/decisions.md, "Cliff A bites at
+the shipped shape" and "Correcting the Phase C planar spill table". Treat this
+as a necessary condition, never a ranking; shapes are ranked on measured
+throughput (Phase F) or not at all.
 """
 planar_register_pressure(::PlanarKernel{MR, NR, T, W}) where {MR, NR, T, W} =
     2 * (MR ÷ W) * NR + 2 * (MR ÷ W) + 2
@@ -161,35 +140,20 @@ function zero_accumulator(kernel::PlanarKernel{MR, NR, T, W}) where {MR, NR, T, 
 end
 
 # Fully unrolled, closure-free K-step body, mirroring `_accumulate_step` in
-# src/kernels/simd.jl. Per logical K step: MV A vector loads per plane, NR B
-# scalar loads per plane, 4*MV*NR FMAs, generated as straight-line code with
-# literal tuple indices throughout (Cliff B).
+# src/kernels/simd.jl: per logical K step, MV A vector loads per plane, NR B
+# scalar loads per plane, 4*MV*NR FMAs, literal tuple indices throughout
+# (Cliff B).
 #
-# `nai_v = -ai_v` is hoisted out of the `j` loop so the negation would cost MV
-# extra ops per K step rather than MV*NR (1.4% worst case at (MV,NR) = (2,6))
-# if LLVM declined to fold it. It does not decline.
-#
-# VERIFIED by @code_native, Julia 1.12.6 / LLVM, ccqlin038 (cascadelake,
-# :avx512), on the inner loop of `accumulate` -- which is the shipped form,
-# since `execute_tile!` calls out to it rather than inlining it, on the real
-# path too. Per K step, for every menu shape:
-#
-#   (MR,NR,W)          vfnmadd231  vfmadd231  vxorp  vsubp  vmulp
-#   (16,6,8)  CF64         12          36       0      0      0
-#   (24,3,8)  CF64          9          27       0      0      0
-#   ( 8,8,8)  CF64          8          24       0      0      0
-#   (32,6,16) CF32         12          36       0      0      0
-#   (48,3,16) CF32          9          27       0      0      0
-#   (16,8,16) CF32          8          24       0      0      0
-#
-# i.e. exactly `MV*NR` vfnmadd + `3*MV*NR` vfmadd = `4*MV*NR` FMAs and **zero**
-# separate negations: the `fneg` operand of `llvm.fmuladd` folds into
-# `vfnmadd231pd`/`vfnmadd231ps` as predicted, so the hoist is free rather than
-# merely cheap.
-#
-# `cr - ai*bi` is REJECTED and must not be reintroduced: Julia does not set
-# LLVM's `contract` fast-math flag by default, so that would not fuse -- two
+# GUARDRAIL: the real part is `muladd(-ai, bi, muladd(ar, br, c))`. `c - ai*bi`
+# is REJECTED and must not be reintroduced: Julia does not set LLVM's
+# `contract` fast-math flag by default, so that form does NOT fuse -- two
 # instructions, and different rounding from the other three terms.
+#
+# `nai_v = -ai_v` is hoisted out of the `j` loop so a declined fold would cost
+# MV extra ops per K step rather than MV*NR. Verified by `@code_native` at
+# every menu shape: exactly `MV*NR` `vfnmadd231` + `3*MV*NR` `vfmadd231` and
+# ZERO separate negations, so the hoist is free rather than merely cheap
+# (per-shape table in docs/decisions.md, "the per-shape `vfnmadd` count").
 @generated function _accumulate_step_planar(
         kernel::PlanarKernel{MR, NR, T, W}, acc::NTuple{NA, Vec{W, R}},
         packed_a::PA, packed_b::PB, p::Int
@@ -303,16 +267,17 @@ end
 # ----------------------------------------------------------------------------
 
 # Scattered/scalar store, `@generated` so every `acc[...]` is a compile-time
-# index (Cliff B). Unrolled over `(v, j)` exactly as `_store_tile_scattered!`
-# in src/kernels/simd.jl; only the lane index inside a single `Vec` is a
-# runtime value, which stays on the stack.
+# index (Cliff B; see src/kernels/simd.jl's `_store_tile_scattered!` for the
+# measured number). Only the lane index inside a single `Vec` is a runtime
+# value.
 #
-# The fused form is kept deliberately: QuasiStrided's `store_tile!` is already
-# specialised per `(QSTile{S,R,C}, kernel)` by dispatch, so the reference
-# project's kernel-writes-a-stack-tile / separate-writeback split would buy
-# nothing and would re-introduce the memory round-trip Phase H removed at ~4x.
-# The unit-stride plane-to-interleave fast path (shufflevector) is a
-# deliberately deferred, measurement-gated follow-on and is NOT built here.
+# The fused form is kept deliberately: `store_tile!` is already specialised per
+# `(QSTile{S,R,C}, kernel)` by dispatch, so the reference project's
+# kernel-writes-a-stack-tile / separate-writeback split would buy nothing and
+# would re-introduce the memory round-trip Phase H removed at ~4x
+# (docs/decisions.md, "The fused `store_tile!` is kept"). The unit-stride
+# plane-to-interleave fast path is a deliberately deferred, measurement-gated
+# follow-on and is NOT built here.
 @generated function _store_tile_planar!(
         destination::QSTile, acc::NTuple{NA, Vec{W, R}},
         alpha::T, beta::T, kernel::PlanarKernel{MR, NR, T, W},
@@ -381,15 +346,8 @@ function store_tile!(
         destination::QSTile, acc::NTuple{NA, Vec{W, R}},
         alpha::T, beta::T, kernel::PlanarKernel{MR, NR, T, W}
     ) where {MR, NR, T, W, R, NA}
-    m = nrows(destination)
-    n = ncols(destination)
+    m, n = _store_prologue!(destination, alpha, beta)
     (m == 0 || n == 0) && return destination
-
-    if iszero(alpha)
-        scale_tile!(destination, beta)
-        return destination
-    end
-
     return _store_tile_planar!(destination, acc, alpha, beta, kernel, m, n)
 end
 
@@ -397,49 +355,18 @@ end
     execute_tile!(kernel::PlanarKernel, destination::QSTile, packed_a, packed_b, kc::Int, alpha, beta) -> destination
 
 Planar counterpart of `SIMDKernel`'s `execute_tile!`; same validation order and
-short-circuits. `kc` is the **logical** (complex) K depth, and the buffer-length
-checks go through `packed_a_length`/`packed_b_length`, which take a logical `kc`
-and return a count of **reals**.
+short-circuits (both are `_execute_tile_prologue!`'s). `kc` is the **logical**
+(complex) K depth, and the buffer-length checks go through
+`packed_a_length`/`packed_b_length`, which take a logical `kc` and return a
+count of **reals**.
 """
 function execute_tile!(
         kernel::PlanarKernel{MR, NR, T, W}, destination::QSTile,
         packed_a::PA, packed_b::PB, kc::Int, alpha, beta
     ) where {MR, NR, T, W, PA, PB}
-    m = nrows(destination)
-    n = ncols(destination)
-    m <= MR || throw(ArgumentError("destination valid row extent $m exceeds mr(kernel) = $MR"))
-    n <= NR || throw(ArgumentError("destination valid column extent $n exceeds nr(kernel) = $NR"))
-    kc >= 0 || throw(ArgumentError("execute_tile! requires kc >= 0, got kc = $kc"))
-
-    alphaT = convert(T, alpha)
-    betaT = convert(T, beta)
-
-    (m == 0 || n == 0) && return destination
-
-    checked_tile_storage_bounds(destination)  # bounds before any unchecked path
-
-    if kc == 0 || iszero(alphaT)
-        scale_tile!(destination, betaT)
-        return destination
-    end
-
-    length(packed_a) >= packed_a_length(kernel, kc) ||
-        throw(
-        DimensionMismatch(
-            "execute_tile!: packed_a has length $(length(packed_a)), " *
-                "need at least packed_a_length(kernel, kc=$kc) = $(packed_a_length(kernel, kc))"
-        )
-    )
-    length(packed_b) >= packed_b_length(kernel, kc) ||
-        throw(
-        DimensionMismatch(
-            "execute_tile!: packed_b has length $(length(packed_b)), " *
-                "need at least packed_b_length(kernel, kc=$kc) = $(packed_b_length(kernel, kc))"
-        )
-    )
-
-    acc = zero_accumulator(kernel)
-    acc = accumulate(kernel, acc, packed_a, packed_b, kc)
-    store_tile!(destination, acc, alphaT, betaT, kernel)
-    return destination
+    run, alphaT, betaT =
+        _execute_tile_prologue!(kernel, destination, packed_a, packed_b, kc, alpha, beta)
+    run || return destination
+    acc = accumulate(kernel, zero_accumulator(kernel), packed_a, packed_b, kc)
+    return store_tile!(destination, acc, alphaT, betaT, kernel)
 end

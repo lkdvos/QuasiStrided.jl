@@ -1,14 +1,14 @@
 # Real-path regression guard for the complex element-type milestone.
 #
 # The milestone's first acceptance criterion is that adding complex support did
-# not slow the real path down. The test suite proves the real path is
-# *correct*, and `git diff` proves the hot functions are textually unedited,
-# but neither can see a regression caused by (say) a new `ContractPlan` type
-# parameter defeating a specialization. Only a measurement can, and this is it.
+# not slow the real path down. The suite proves the real path is *correct* and
+# `git diff` proves the hot functions are textually unedited, but neither can
+# see a regression caused by (say) a new `ContractPlan` type parameter
+# defeating a specialization. Only a measurement can, and this is it.
 #
 # It is NOT `bench_default_vs_legacy.jl`, which compares two configurations
-# *within* one tree. This measures the same real default configuration so that
-# it can be compared *across two trees* -- the working tree against the
+# *within* one tree. This measures the same real default configuration so it
+# can be compared *across two trees* -- the working tree against the
 # milestone's base commit -- which cannot be done in a single process, because
 # both trees define a module named `QuasiStrided`.
 #
@@ -16,26 +16,22 @@
 #
 #   julia --project=. benchmark/bench_real_path_guard.jl
 #
-# Sequencing matters more than usual. ccqlin038 is not reliably exclusive,
-# canary spreads of 4-15% are normal, and an 11-rep comparison in the
-# panel-addressing milestone invented two regressions that 21 reps erased
-# (STATUS.md, "Measurement hygiene"). So: check for other users' processes
-# first, run the two trees with nothing else on the machine, and read the
-# canary bracket before reading any ratio.
+# HOW TO RUN AND READ IT -- all three points cost this project time to find,
+# and the full account is in docs/decisions.md, "The real-path regression
+# guard: no regression, and the resolution is ~5%":
 #
-# How to read the result. A *systematic one-sided* shift across every shape is
-# a regression even if each individual point sits inside the noise band -- that
-# is what a lost specialization looks like. A single point outside the band
-# with the others clean is noise, not a finding. And a pattern that does not
-# reproduce between two rounds is noise no matter how tidy it looks in one.
-#
-# Known artefact, measured: `canary[start]` reads systematically ~10% FASTER
-# than `canary[middle]`/`canary[end]`, in every run of this script so far, on
-# both trees. That is a warm-up effect in the canary itself, not machine drift
-# -- the middle-to-end spread is 0.2-3.4% in the same runs. So the reported
-# "canary spread" here reads ~11% and trips its own warning while the machine
-# is in fact quiet. Judge quietness from the middle/end pair; the start canary
-# is useful only as a fixed reference across runs.
+#   * Sequence in ABBA order, with nothing else on the machine. Straight
+#     base-then-new twice is confounded by wall-clock drift, and an 11-rep
+#     comparison once invented two regressions that 21 reps erased.
+#   * A *systematic one-sided* shift across every shape is a regression even
+#     inside the noise band -- that is what a lost specialization looks like. A
+#     lone outlier, or a pattern that does not reproduce across rounds, is
+#     noise. This instrument resolves ~5-6% on geomean, no finer.
+#   * Judge machine quietness from the middle/end canary pair only.
+#     `canary[start]` reads ~10% FASTER than the others in every run of this
+#     script, on both trees -- a warm-up effect in the canary itself, not drift
+#     -- so the reported "canary spread" trips its own warning at ~11% while
+#     the machine is in fact quiet.
 
 include(joinpath(@__DIR__, "harness.jl"))
 
@@ -45,27 +41,19 @@ const GUARD_SHAPES = vcat(MAIN_SHAPES, SMALL_SHAPES)
 const OUTDIR = results_dir()
 mkpath(OUTDIR)
 
-# The filename carries the commit and a run counter, which matters more here
-# than for any other script in this directory: this one exists to be run
-# against TWO trees and diffed, and `results_dir()` is keyed only by host and
-# date. Without this, the second run of the day silently overwrites the first
-# -- which happened on the first use of this script and destroyed a round of
-# data before it was noticed. A run counter as well as the commit, because the
-# interesting comparison is sometimes the *same* tree twice (that is how the
-# run-to-run noise floor is established, and a noise floor measured from one
-# run is not a noise floor).
+# The filename carries the commit and a run counter. `results_dir()` is keyed
+# only by host and date, so without the counter the second run of the day
+# silently overwrites the first -- which happened, and destroyed a round of
+# data. The counter matters because the interesting comparison is sometimes the
+# *same* tree twice: that is how the run-to-run noise floor gets established.
 const RUN_TAG = let
-    # `QS_GUARD_LABEL` exists because the whole point of this script is to
-    # compare two trees, and the tree that is NOT the working copy is usually
-    # an extracted one (`git archive`) where `git_commit()` cannot work. Label
-    # it explicitly so the artefacts say which engine they measured -- without
-    # this, a reviewer finds four identically-tagged CSVs and cannot tell a
-    # two-tree comparison from a same-tree noise measurement. That happened.
+    # `QS_GUARD_LABEL`: the tree that is NOT the working copy is usually
+    # extracted with `git archive`, where `git_commit()` cannot work, so both
+    # sides would otherwise carry the same tag and a reviewer could not tell a
+    # two-tree comparison from a same-tree noise run. That happened too.
     c = get(ENV, "QS_GUARD_LABEL", git_commit())
-    # `git_commit()` returns a human sentence on failure ("unknown (git
-    # rev-parse failed)"), which is how a tree extracted with `git archive`
-    # reports -- exactly the situation this script is built for. Keep the
-    # filename filesystem-safe rather than assuming a hash.
+    # `git_commit()` returns a human sentence on failure, so keep the filename
+    # filesystem-safe rather than assuming a hash.
     safe = replace(c, r"[^A-Za-z0-9]" => "")
     short = length(safe) >= 8 ? safe[1:8] : safe
     n = 1
