@@ -411,12 +411,244 @@ Still deferred (see README "Not implemented" and `docs/decisions.md`):
 threading (state is still organized to not preclude it, but note
 `PackedPanel`/`PtrScatterAxis` borrow pointers into workspace buffers, so a
 threaded driver must keep the `GC.@preserve` and the per-worker split of the
-M-side state consistent), autotuning across shapes, GPU, complex-arithmetic
-methods, K padding, orientation swap, `tensoradd!`/`tensortrace!`. T15 (an
-optional upstream docs PR to TensorOperations.jl) remains unstarted.
+M-side state consistent), autotuning across shapes, GPU, K padding,
+orientation swap, `tensoradd!`/`tensortrace!`. T15 (an optional upstream docs
+PR to TensorOperations.jl) remains unstarted. **Complex-arithmetic methods are
+no longer deferred** -- they are the open milestone below; what stays out of
+scope there is 3m, mixed real/complex operands, and writing into a conjugated
+output `C`.
 
 **BLIS microkernels stay closed** (Phase G): all of `blis_jll` 0.9/1.0/2.0
 ship the asm kernels and `bli_cntx_get_*` as local symbols only, so `dlsym`
 cannot reach them. **LoopVectorization.jl was considered and rejected** as a
 dependency (grant-funded maintenance, compiler-fragile, and unnecessary — the
 addressing idea was reproduced with zero new dependencies).
+
+## Complex element-type milestone — open
+
+Opened 2026-09-14 on branch/worktree `complex`, base `114e594`. Goal: support
+`ComplexF32`/`ComplexF64` end to end — engine and `QuasiStridedBackend` — with
+two switchable microkernel methods, and discharge the conjugation invariant that
+has blocked this since the TensorOperations milestone.
+
+Full design, every frozen decision, and the reasoning behind each rejected
+alternative are in `docs/decisions.md`, "Complex element-type milestone: Phase A
+direction freeze" and "Amendment 3" — **that file, not this one, is
+authoritative for *why***. This section is only *what phase, what count*.
+
+Direction in one paragraph: planar (split-complex, BLIS "1r", a genuinely
+complex microkernel issuing four real FMAs with no shuffles) is the
+unconditional default; 1m (Van Zee's induced method — the *existing real kernel*
+over `2*kc` real steps, fed by "1e"-packed A) is selectable by naming the
+kernel; 3m is out. The design is taken from the user's sibling project
+`tensorcontract-rs`, which was built to measure exactly these methods and whose
+refutations are binding here — in particular that **the method ranking does not
+transfer between machines** (four orderings measured on four machines), so no
+auto-dispatch rule is derived from any sweep and every ratio names `ccqlin038`.
+
+Review budget: two gated passes, one Fable scoped to the conjugation/`op`
+semantics and the frozen-record amendment (a wrong `_op_conjugates` entry is a
+silent wrong answer, which is this package's worst failure mode), then one
+Sonnet-High over everything since Phase A. Neither is spent yet;
+`fable_review_complex_used: false`.
+
+- [x] **Phase A** (direction freeze): `docs/decisions.md` milestone section +
+      Amendment 3 + the second addendum to the frozen argcheck order;
+      `STATUS.md` entry; `src/complex_format.jl` (new) with declarations and
+      total real-side defaults only — `PackFormat`/`ComplexMethod` singletons,
+      `reals_per_element`, `a_reals`/`b_reals`/`accumulator_planes`,
+      `ComplexKernelDescriptor` and its accessors, and the
+      `realtype`/`packed_a_per_k`/`packed_b_per_k`/`complex_method` defaults
+      plus `DescriptorKernel` forwarders that keep every generic total. **No
+      behaviour**: `git diff` touches no existing function body, and the only
+      edit to an existing source file is one `include` line in
+      `src/QuasiStrided.jl`.
+- [ ] **Phase B** (five-way parallel, disjoint files, all depending on A only):
+      **B1** plumbing (`src/workspace.jl`, `src/driver.jl`, `src/blocking.jl`) —
+      the `VT` bound relaxation, `realtype`-driven buffer allocation, the four
+      `_sliver_panel` call sites, `_pack_sliver!`'s `TF` parameter,
+      `ContractPlan`'s `TA`/`TB`, the complex shape rule and menus, and the
+      3-argument `default_blocking`. `src/driver.jl` is **exclusive** to B1.
+      **B2** packing (additive only; `_pack_panel!` untouched). **B3** the
+      planar kernel. **B4** the adapter. **B5** adapter tests, authored blind
+      against the Phase A freeze.
+- [x] **Phase C** (integration): B1–B5 merged; `_complex_kernel_from_shape`'s
+      `PlanarMethod` arm wired (generated over that method's own menu, so every
+      branch builds a concrete kernel from literal `Val`s); the method-generic
+      arm still throws, so an unimplemented method can never silently fall back
+      to planar. Three reconciliations, all recorded in `docs/decisions.md`'s
+      "Phase C integration findings": the adapter's frozen argcheck order was
+      violated by keyword evaluation (a pooled workspace was acquired before a
+      rejected call could throw — found by the blind test author, whose own
+      assertion was passing for the wrong reason); complex kernel *construction*
+      is now ISA-gated as well as the shape rule, since the legacy complex
+      fallback was over AVX2's register budget; and B1's seam scaffolding test
+      was replaced by its inverse. **20586/20586 passing** (Julia 1.12.6), Runic
+      clean, 0 failed / 0 errored.
+- [x] **Phase D** (1m): `src/kernels/onem.jl` (new). The freeze's "nearly free"
+      claim holds — the FMA loop, packing, lengths, sliver addressing, blocking
+      and `execute_tilewise!` are all reused unchanged, and the only genuinely
+      new logic is a ~25-line generated `OneM` tile reader. Two freeze defects
+      found: the frozen `inner::SIMDKernel{2MR,NR,real(T),W}` field spelling is
+      **not legal Julia** (computations on `TypeVar`s), and **`W` must be even**
+      — a requirement the freeze never stated, and one whose violation would
+      corrupt the tile reader silently rather than error. Both fixed and tested.
+      Every shipped 1m shape is spill-free; 1m is *better* behaved than planar
+      on Julia 1.10.
+- [x] **Phase E** (end-to-end randomized oracle): `test/test_macro_driver.jl`
+      gained the fourth oracle layer — 501 randomized complex cases against a
+      dense-matmul oracle with its **own** conjugation table, the conj/`op`
+      cross-product drawn rather than enumerated under a fixed seed. Pins the
+      xor (not `||`), pins that `adjoint` conjugates with no flag set (which an
+      `op === conj` implementation fails *only* here), and pins `execute!`
+      against `execute_tilewise!` with conjugation forced on. Cache-crossing
+      extents derived from each method's own blocking, crossing asserted.
+      Purely additive: 448 insertions, 0 deletions.
+- [x] **Phase F** (measurement on `ccqlin038`, 21 reps, canary spread 0.4-3.0%).
+      **The derived register-shape rule was wrong for complex by 38-41%.** The
+      shape `MR = 2W, NR = 6` derives was the *worst* planar configuration
+      measured; the spill-free `24x3`/`48x3` shape that Phase C's spill
+      analysis had flagged wins outright, and beats every 1m shape too — so the
+      spill analysis predicted the ranking before the ranking was measured.
+      Acted on through the `_shape_override` hook that has been deliberately
+      empty since Phase G; these are the **only swept rows in the package**, and
+      they apply on `:avx512` only. Complex-efficiency geomean went
+      **1.256 → 1.829** (`ComplexF64`) and **1.457 → 1.910** (`ComplexF32`),
+      and the sub-1.0 dip at the large compute-bound sizes disappeared
+      (`ComplexF64` 512³ 40.5 → 73.7 GF/s, +82%). Real-path guard: **no regression
+      detectable at the instrument's ~5-6% resolution**, which is all it can
+      support — the earlier "pooled geomean 0.988" is retracted, since the
+      between-tree effect (2.0%) is smaller than the same-tree run-to-run
+      noise (up to 6.3% geomean) and the sign flips between rounds. No
+      systematic one-sided shift, and the resolved kernel shape is identical
+      at every point in both trees. Planar stays the default; 1m stays selectable only by name.
+- [x] **Phase G** (the two gated reviews, both spent —
+      `fable_review_complex_used: true`). The Fable pass found **no blocking
+      numerical finding**: 1352 adapter + 512 direct-engine + 4 macro cases
+      against oracles it wrote itself, zero failures, and it hand-verified the
+      1e conjugated layout via the observation that the 2×2 block is the real
+      matrix representation of "multiply by z", so substituting `conj(z)` gives
+      exactly `M(z)ᵀ`. It also established something stronger than the freeze
+      claimed: **xor is TensorOperations' own semantics**, forced by TO
+      realising `conjA` as `conj(SV(A))` and StridedViews flipping `op` through
+      its `_conj` table — not merely TBLIS's convention. Four record/doc
+      defects found and fixed (two false claims in Amendment 3, a
+      self-contradicting source comment, a stale docstring default).
+      The Sonnet pass found **one blocking finding and it was right**: the
+      real-path guard's quoted geomean was not substantiated by the artefacts
+      on disk. The number is retracted and the conclusion narrowed — see below.
+      It independently re-measured zero allocation in all 24 (method × shape ×
+      precision × function) cells on a *scattered* fixture.
+- [x] **Phase H** (close): `docs/decisions.md` carries the freeze, Amendments
+      3 and 4, the Phase C/D/F findings and corrections, and the Phase G
+      disposition; `README.md` describes complex support as a capability
+      (including the measured efficiency ratio and the one machine-specific
+      constant in the package) and narrows its "Not implemented" list to what
+      is genuinely still out of scope; this section is the closing record.
+
+**Milestone closed.** `ComplexF32`/`ComplexF64` work through both `contract!`
+and `@tensor backend = QuasiStridedBackend()`, with `conjA`/`conjB` and
+`StridedView.op` composed by xor and absorbed at pack time.
+
+### What shipped
+
+- `src/complex_format.jl` (new): the packed formats (`RealFormat`,
+  `PlanarFormat` = BLIS "1r", `OneEFormat` = BLIS "1e"), the method singletons,
+  `ComplexKernelDescriptor`, and the accessors that keep every generic total on
+  the real path (`realtype`, `packed_a_per_k`, `packed_b_per_k`,
+  `complex_method`). `src/kernel_descriptor.jl` is **untouched**: the frozen
+  packed format is preserved as the `RealFormat` instance of a more general
+  offset formula, not redefined.
+- `src/kernels/planar.jl` (new): the default. A genuinely complex microkernel,
+  four real FMAs per (A-vector, B-scalar) pair with no shuffles, flat
+  `NTuple{2NV,Vec{W,real(T)}}` accumulator, every body `@generated` with
+  literal tuple indices.
+- `src/kernels/onem.jl` (new): Van Zee's induced method, reusing the **real**
+  `SIMDKernel` verbatim over `2*kc` real steps. Selectable only by naming it.
+- Conjugation through the `transform` seam that already existed, folded with
+  `.op` at plan time and stored as `ContractPlan`'s `TA`/`TB`; a conjugated
+  *output* is rejected.
+- `ContractWorkspace{T,VT}`'s bound relaxed (not extended) so every existing
+  `ContractWorkspace{Float64,Vector{Float64}}` spelling still type-checks.
+- The one machine-specific constant in the package: `_shape_override` for
+  complex on `:avx512` only.
+
+### Measured (ccqlin038, Cascade Lake, Julia 1.12.6, 21 reps)
+
+- **Complex efficiency geomean 1.83 (`ComplexF64`) / 1.91 (`ComplexF32`)** —
+  complex GFLOP/s over the same engine's real GFLOP/s at the same shape, with
+  complex charged the textbook 8 flops/MAC. Above 1.0 means complex is treated
+  *better* than real, as twice the arithmetic intensity predicts.
+- **No real-path regression detectable** at the guard's ~5-6% resolution.
+- **Zero allocation** in all 24 (method × shipped shape × precision ×
+  `accumulate`/`execute_tile!`) cells on a scattered fixture, independently
+  re-measured at review.
+
+### The two things most worth remembering
+
+1. **The hardware-derived register-shape rule did not survive the complex
+   extension.** It is arithmetically sound and reproduces the reference
+   project's measured shape, yet on this machine through Julia's register
+   allocator it selects the *worst* planar configuration by 38-41%. Phase C's
+   spill analysis predicted that before Phase F measured it. The lesson is the
+   project's own "ranking does not transfer between machines", applying one
+   level lower than it was written for: a shape validated through one
+   compiler's register allocator need not hold under another's.
+2. **A claim about evidence failed review where no claim about code did.**
+   Both passes probed the conjugation logic hard and found nothing wrong with
+   it; the one blocking finding was that the real-path guard's quoted number
+   was not substantiated by the files on disk. It was retracted. Benchmark
+   artefacts that do not say which tree they measured are not evidence.
+
+### Still out of scope on the complex side
+
+3m; mixed real/complex operands; writing into a conjugated output `C`; complex
+register shapes for AVX2 or NEON (the engine refuses to pick a complex kernel
+on an unmeasured ISA rather than ship a guaranteed-spilling default); the
+unit-stride plane-to-interleave store (measurement-gated, not yet justified);
+complex `tensoradd!`/`tensortrace!` (contraction-only is unchanged).
+
+### Open, deliberately
+
+"Which spill detector is right" — Phase C's versus Phase D's — is not settled
+and no longer needs to be: Phase F ranked on measured throughput, which
+supersedes the spill-count question, and both detectors agreed on the shape
+that mattered. It is a disagreement about an instrument nothing shipped now
+depends on.
+
+**Phase D also corrected Phase C.** Phase C's planar spill table presented
+spilling as monotone in a single pressure number; Phase D's detector — which
+counts folded FMA reload operands and `rbp`-relative traffic, and which
+reproduces both of Phase C's *real* controls exactly — shows it is not:
+planar `(24,3,8)` at pressure 26 is clean while `(8,8,8)` at pressure 20
+spills. So the frozen budget inequality is a necessary condition, not a
+predictor. The menu order still stays untouched and unranked, which the
+correction vindicates rather than undermines: the quantity it would have been
+reordered on was being misread. Full account in `docs/decisions.md`.
+
+**Test count: 13299 at Phase A open → 20586 after Phase C → 34480 after
+Phase F** (Julia 1.12.6, 0 failed, 0 errored, Runic clean).
+B1's acceptance criterion — the real path unchanged with no complex kernel
+wired in — was proved on an isolated tree: pristine `7503fdd` 13299/13299,
+base + B1 alone 13612/13612, 0 failed, 0 errored. The measured half of that
+guard (`benchmark/bench_default_vs_legacy.jl` inside the canary spread) is
+Phase F's first sweep and gates the rest.
+
+Verified end to end at Phase C close, independently of the in-tree suite: all
+four element types against `mul!`; the full 16-combination `conj`×`op`
+cross-product against **both** `StridedNative()` and a hand-written oracle, 0
+mismatches; the xor in isolation (`conj(A)` with `conjA = true` must give the
+*unconjugated* product); a genuine 3-index contraction on permuted/scattered
+operands; conjugated complex output rejected while a real `adjoint` output is
+still accepted; β = 0 not propagating NaN from a poisoned `C`. Backend
+allocation is **4432 B/call for complex, identical to real's 4432** — the
+`plan_contract` bookkeeping the README already documents, so complex adds none
+of its own.
+
+Two notes for anyone picking this up on a fresh checkout of this worktree.
+`Manifest.toml` is gitignored, so the environment must be resolved before
+anything runs. And on the *first* full run after that, Aqua's
+`test_persistent_tasks` can fail on a timeout: it loads the package in a
+subprocess, which on a cold depot has to precompile first (observed here at
+2m24s, against 5.5s once warm). It is not a real failure — re-run the suite,
+and check it in isolation before believing it.

@@ -1,6 +1,17 @@
 # Frozen coupling contract between packing (tiles.jl/packing.jl) and the
 # kernels (kernel.jl/kernels/simd.jl); do not redefine elsewhere.
 
+# Register-tile validation shared by `KernelDescriptor` and
+# `ComplexKernelDescriptor`. `name` only names the type in the message;
+# construction-time only, never hot.
+@inline function _check_reg_tile(name, MR, NR)
+    MR isa Int && NR isa Int ||
+        throw(ArgumentError("$name requires Int type parameters MR, NR"))
+    MR > 0 || throw(ArgumentError("$name requires MR > 0, got MR = $MR"))
+    NR > 0 || throw(ArgumentError("$name requires NR > 0, got NR = $NR"))
+    return nothing
+end
+
 """
     KernelDescriptor{MR,NR,T}
 
@@ -10,10 +21,7 @@ packed-offset formulas and name `T`; concrete kernels wrap or reference one.
 """
 struct KernelDescriptor{MR, NR, T}
     function KernelDescriptor{MR, NR, T}() where {MR, NR, T}
-        MR isa Int && NR isa Int ||
-            throw(ArgumentError("KernelDescriptor requires Int type parameters MR, NR"))
-        MR > 0 || throw(ArgumentError("KernelDescriptor requires MR > 0, got MR = $MR"))
-        NR > 0 || throw(ArgumentError("KernelDescriptor requires NR > 0, got NR = $NR"))
+        _check_reg_tile("KernelDescriptor", MR, NR)
         T === Float32 || T === Float64 ||
             throw(ArgumentError("KernelDescriptor requires T ∈ (Float32, Float64) for this milestone, got $T"))
         return new{MR, NR, T}()

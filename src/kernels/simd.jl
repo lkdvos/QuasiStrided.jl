@@ -21,15 +21,8 @@ struct SIMDKernel{MR, NR, T, W} <: DescriptorKernel{MR, NR, T}
     descriptor::KernelDescriptor{MR, NR, T}
 
     function SIMDKernel{MR, NR, T, W}(descriptor::KernelDescriptor{MR, NR, T}) where {MR, NR, T, W}
-        W isa Int && W > 0 ||
-            throw(ArgumentError("SIMDKernel requires an Int vector width W > 0, got W = $W"))
-        mod(MR, W) == 0 ||
-            throw(
-            ArgumentError(
-                "SIMDKernel requires mr(kernel) = $MR to be a multiple of " *
-                    "the vector width W = $W"
-            )
-        )
+        _check_lanewidth("SIMDKernel", W)
+        _check_mr_multiple("SIMDKernel", MR, W)
         return new{MR, NR, T, W}(descriptor)
     end
 end
@@ -43,12 +36,10 @@ Default `SIMD.Vec` lane count for `T` (one 256-bit register's worth): 4 for
 _default_lanewidth(::Type{Float64}) = 4
 _default_lanewidth(::Type{Float32}) = 8
 
-function SIMDKernel(::Val{MR}, ::Val{NR}, ::Type{T}, ::Val{W}) where {MR, NR, T, W}
-    return SIMDKernel{MR, NR, T, W}(KernelDescriptor(Val(MR), Val(NR), T))
-end
-function SIMDKernel(::Val{MR}, ::Val{NR}, ::Type{T}) where {MR, NR, T}
-    return SIMDKernel(Val(MR), Val(NR), T, Val(_default_lanewidth(T)))
-end
+SIMDKernel(::Val{MR}, ::Val{NR}, ::Type{T}, ::Val{W}) where {MR, NR, T, W} =
+    SIMDKernel{MR, NR, T, W}(KernelDescriptor(Val(MR), Val(NR), T))
+SIMDKernel(::Val{MR}, ::Val{NR}, ::Type{T}) where {MR, NR, T} =
+    SIMDKernel(Val(MR), Val(NR), T, Val(_default_lanewidth(T)))
 
 """
     lanewidth(kernel::SIMDKernel) -> Int
@@ -80,9 +71,8 @@ ordinary heap array of accumulators is not the intended fast path"). Entry
 `i` of that vector is lane `i - v*W + 1` (1-based `SIMD.Vec` indexing).
 """
 function zero_accumulator(kernel::SIMDKernel{MR, NR, T, W}) where {MR, NR, T, W}
-    NVECA = MR ÷ W
     z = zero(Vec{W, T})
-    return ntuple(_ -> z, Val(NVECA * NR))
+    return ntuple(_ -> z, Val((MR ÷ W) * NR))
 end
 
 # Fully unrolled, closure-free K-step body: one vector load per A row-vector,
@@ -163,21 +153,17 @@ _unit_stride_rows(::PtrScatterAxis) = false
     return acc[v + NVECA * j + 1][lane1]
 end
 
-# Scalar/scattered store path, with the accumulator tuple indexed only by
-# *compile-time* constants.
+# Scalar/scattered store path.
 #
-# The straightforward `for j, i` loop reaches the tuple as
-# `acc[v + NVECA*j + 1]` with both `v` and `j` runtime values. Indexing an
-# `NTuple` dynamically forces the whole tuple to memory, and above NV = 16 the
-# compiler heap-allocates it rather than using the stack: measured 24576 B per
-# `execute!` on the 3-index scattered fixture at (MR,NR,W) = (32,6,8), against
-# 0 B at (16,6,8) (docs/decisions.md, Phase H). Since scattered destinations
-# are this engine's reason to exist, that silently capped the usable register
-# tile on exactly the workload that matters.
-#
-# Unrolling over `(v, j)` hoists each `acc[...]` to a static index, so only a
-# single `Vec` is ever addressed dynamically (by lane), which stays on the
-# stack. That is NV blocks of code, not MR*NR statements.
+# GUARDRAIL (Cliff B): every `acc[...]` here must be a *literal* tuple index,
+# which is why this is `@generated` and unrolled over `(v, j)` rather than a
+# plain `for j, i` loop. Indexing an `NTuple` dynamically forces the whole
+# tuple to memory, and above NV = 16 the compiler heap-allocates it: measured
+# 24576 B per `execute!` on the 3-index scattered fixture at
+# (MR,NR,W) = (32,6,8), against 0 B at (16,6,8) (docs/decisions.md, Phase H).
+# Scattered destinations are this engine's reason to exist, so that silently
+# capped the usable register tile on exactly the workload that matters. Only
+# the lane index inside a single `Vec` may be a runtime value.
 @generated function _store_tile_scattered!(
         destination::QSTile, acc::NTuple{NV, Vec{W, T}},
         alpha::T, beta::T, kernel::SIMDKernel{MR, NR, T, W},
@@ -222,14 +208,8 @@ function store_tile!(
         destination::QSTile, acc::NTuple{NV, Vec{W, T}},
         alpha::T, beta::T, kernel::SIMDKernel{MR, NR, T, W}
     ) where {MR, NR, T, W, NV}
-    m = nrows(destination)
-    n = ncols(destination)
+    m, n = _store_prologue!(destination, alpha, beta)
     (m == 0 || n == 0) && return destination
-
-    if iszero(alpha)
-        scale_tile!(destination, beta)
-        return destination
-    end
 
     NVECA = MR ÷ W
     nfull = m ÷ W  # whole W-row blocks entirely inside [0, m)
@@ -268,48 +248,17 @@ end
     execute_tile!(kernel::SIMDKernel, destination::QSTile, packed_a, packed_b, kc::Int, alpha, beta) -> destination
 
 SIMD counterpart of `ScalarKernel`'s `execute_tile!`; same validation order
-and short-circuits. Numerically matches `ScalarKernel` only to within a
-tolerance (FMA grouping differs), never bitwise.
+and short-circuits (both are `_execute_tile_prologue!`'s). Numerically matches
+`ScalarKernel` only to within a tolerance (FMA grouping differs), never
+bitwise.
 """
 function execute_tile!(
         kernel::SIMDKernel{MR, NR, T, W}, destination::QSTile,
         packed_a::PA, packed_b::PB, kc::Int, alpha, beta
     ) where {MR, NR, T, W, PA, PB}
-    m = nrows(destination)
-    n = ncols(destination)
-    m <= MR || throw(ArgumentError("destination valid row extent $m exceeds mr(kernel) = $MR"))
-    n <= NR || throw(ArgumentError("destination valid column extent $n exceeds nr(kernel) = $NR"))
-    kc >= 0 || throw(ArgumentError("execute_tile! requires kc >= 0, got kc = $kc"))
-
-    alphaT = convert(T, alpha)
-    betaT = convert(T, beta)
-
-    (m == 0 || n == 0) && return destination
-
-    checked_tile_storage_bounds(destination)  # bounds before any unchecked path
-
-    if kc == 0 || iszero(alphaT)
-        scale_tile!(destination, betaT)
-        return destination
-    end
-
-    length(packed_a) >= packed_a_length(kernel, kc) ||
-        throw(
-        DimensionMismatch(
-            "execute_tile!: packed_a has length $(length(packed_a)), " *
-                "need at least packed_a_length(kernel, kc=$kc) = $(packed_a_length(kernel, kc))"
-        )
-    )
-    length(packed_b) >= packed_b_length(kernel, kc) ||
-        throw(
-        DimensionMismatch(
-            "execute_tile!: packed_b has length $(length(packed_b)), " *
-                "need at least packed_b_length(kernel, kc=$kc) = $(packed_b_length(kernel, kc))"
-        )
-    )
-
-    acc = zero_accumulator(kernel)
-    acc = accumulate(kernel, acc, packed_a, packed_b, kc)
-    store_tile!(destination, acc, alphaT, betaT, kernel)
-    return destination
+    run, alphaT, betaT =
+        _execute_tile_prologue!(kernel, destination, packed_a, packed_b, kc, alpha, beta)
+    run || return destination
+    acc = accumulate(kernel, zero_accumulator(kernel), packed_a, packed_b, kc)
+    return store_tile!(destination, acc, alphaT, betaT, kernel)
 end

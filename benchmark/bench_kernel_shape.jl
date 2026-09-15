@@ -77,7 +77,13 @@ end
 # The match must be pinned to the accumulator's own width: matching any width
 # counts the 16-byte GC-frame store every one of these functions emits, and
 # reports a phantom spill even at 6 accumulators.
-const FMA_RE = r"vfmadd"
+# Matches BOTH `vfmadd*` and `vfnmadd*`. The negated form is not an
+# alternative spelling: a planar complex kernel issues exactly `MV*NR` of them
+# per K step (the `-Ai*Bi` term of the real output plane) against `3*MV*NR`
+# plain ones, so a bare `r"vfmadd"` -- which does NOT match the substring
+# `vfnmadd` -- would undercount planar's FMAs by a quarter and make the
+# "fmas should equal nv" check below read as a spurious shortfall.
+const FMA_RE = r"vfn?madd"
 
 function stack_store_re(vector_bytes::Int)
     word = vector_bytes == 64 ? "zmmword" :

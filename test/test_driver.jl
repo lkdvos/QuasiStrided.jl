@@ -780,3 +780,183 @@ end
     @test Cmat2 ≈ Amat * Bmat
     @test allocs2 == 0 skip = (VERSION < v"1.11")
 end
+
+# =====================================================================
+# Conjugation plumbing (docs/decisions.md, "Conjugation: semantics, and where
+# each piece is absorbed"). No complex kernel exists yet, so what is testable
+# here -- and what matters most for this worker -- is the *real-path-unchanged*
+# half of that section, plus the predicates themselves.
+# =====================================================================
+
+@testset "_op_conjugates is a total table with a throwing fallback" begin
+    # NOT TensorOperations' TBLIS extension's `A.op === conj` test:
+    # `StridedView(p, sz, st, off, adjoint)` is directly constructible, and
+    # `=== conj` would silently treat it as unconjugated.
+    @test QuasiStrided._op_conjugates(identity) === false
+    @test QuasiStrided._op_conjugates(conj) === true
+    @test QuasiStrided._op_conjugates(transpose) === false   # elementwise identity
+    @test QuasiStrided._op_conjugates(adjoint) === true
+    @test_throws ArgumentError QuasiStrided._op_conjugates(sin)
+
+    # A real element type is conjugated by nothing, whatever the flag or the
+    # op: `StridedViews` collapses `conj` on a real view, so this is a
+    # structural guarantee, not a convention.
+    for op in (identity, conj, transpose, adjoint), flag in (false, true)
+        v = StridedView(randn(16), (4, 4), (1, 4), 0, op)
+        @test QuasiStrided._qs_isconj(v, flag) === false
+    end
+    # A complex element type: the flag and the op compose with XOR, so a
+    # conj-wrapped view with conjA = true is unconjugated.
+    for (op, oc) in ((identity, false), (conj, true), (transpose, false), (adjoint, true)),
+            flag in (false, true)
+        v = StridedView(randn(ComplexF64, 16), (4, 4), (1, 4), 0, op)
+        @test QuasiStrided._qs_isconj(v, flag) === (flag ⊻ oc)
+    end
+end
+
+@testset "conjA/conjB add no specialization on the real path" begin
+    Random.seed!(97531)
+    Ma, Ka, Na = 12, 9, 7
+    Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
+    Cmat = zeros(Ma, Na)
+    base = _mm_plan(Cmat, Amat, Bmat)
+
+    for ca in (false, true), cb in (false, true)
+        plan = _mm_plan(Cmat, Amat, Bmat; conjA = ca, conjB = cb)
+        # The directly testable real-path guarantee: `_qs_isconj` is false
+        # unconditionally for a real T, so TA === TB === typeof(identity) and
+        # execute! gains no new specialization even with conjA = true.
+        @test typeof(plan.atransform) === typeof(identity)
+        @test typeof(plan.btransform) === typeof(identity)
+        @test typeof(plan) === typeof(base)
+        fill!(Cmat, 0.0)
+        execute!(plan, 1.0, 0.0)
+        @test Cmat ≈ Amat * Bmat
+        fill!(Cmat, 0.0)
+        execute_tilewise!(plan, 1.0, 0.0)
+        @test Cmat ≈ Amat * Bmat
+    end
+
+    # ... and the same through views that carry a non-trivial `op`, which a
+    # real eltype collapses to identity before the engine ever sees it.
+    Av = conj(StridedView(Amat))
+    @test Av.op === identity
+    plan = plan_contract(
+        StridedView(Cmat), Av, (1, 2), StridedView(Bmat), (2, 3), (1, 3); conjA = true
+    )
+    @test typeof(plan) === typeof(base)
+    fill!(Cmat, 0.0)
+    execute!(plan, 1.0, 0.0)
+    @test Cmat ≈ Amat * Bmat
+end
+
+@testset "plan_contract rejects a conjugated output, but not a real adjoint" begin
+    Random.seed!(2469)
+    Amat, Bmat = randn(6, 5), randn(5, 4)
+
+    # This is the test that pins "the real path is unchanged" exactly where it
+    # could break: `adjoint(::Matrix{Float64})` has op === identity, because
+    # StridedViews collapses adjoint on a real eltype, so it is still ACCEPTED.
+    Cadj = adjoint(zeros(4, 6))
+    Cv = StridedView(Cadj)
+    @test Cv.op === identity
+    plan = plan_contract(Cv, StridedView(Amat), (1, 2), StridedView(Bmat), (2, 3), (1, 3))
+    execute!(plan, 1.0, 0.0)
+    @test Cadj ≈ Amat * Bmat
+
+    # A conjugated COMPLEX output is rejected at the engine boundary, not in
+    # the adapter, so `plan_contract`/`contract!` are protected too. Checked by
+    # message: a complex plan would otherwise also throw ArgumentError from the
+    # not-yet-wired kernel seam, which is a different failure.
+    Ac, Bc = randn(ComplexF64, 6, 5), randn(ComplexF64, 5, 4)
+    Cc = zeros(ComplexF64, 24)
+    for op in (conj, adjoint)
+        Ccv = StridedView(Cc, (6, 4), (1, 6), 0, op)
+        err = try
+            plan_contract(Ccv, StridedView(Ac), (1, 2), StridedView(Bc), (2, 3), (1, 3))
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("conjugated", err.msg)
+    end
+    # An unrecognized op is hard-rejected rather than silently mishandled --
+    # and, stronger than the freeze assumed, StridedViews makes one
+    # unconstructible in the first place: its own `F` parameter is bounded by
+    # exactly the four functions `_op_conjugates` tabulates. That bound is what
+    # this asserts, so the throwing fallback stays correct-by-construction
+    # rather than merely untested; if StridedViews ever widens it, this fails
+    # here rather than silently somewhere in packing.
+    @test_throws TypeError StridedView(Cc, (6, 4), (1, 6), 0, sin)
+    Fbound = fieldtype(typeof(StridedView(Cc, (6, 4), (1, 6), 0, conj)), :op)
+    @test Fbound === typeof(conj)
+    optypes = Base.unwrap_unionall(StridedView).parameters[4].ub
+    @test Set(Base.uniontypes(optypes)) ==
+        Set((typeof(identity), typeof(conj), typeof(transpose), typeof(adjoint)))
+end
+
+@testset "ContractWorkspace: the relaxed VT bound keeps every old spelling" begin
+    k64 = SIMDKernel(Val(8), Val(6), Float64)
+    k32 = SIMDKernel(Val(8), Val(6), Float32)
+    b = Blocking(16, 8, 12)
+
+    # Every existing spelling stays valid, unedited -- the whole point of
+    # relaxing the bound rather than adding a parameter.
+    ws = QuasiStrided.ContractWorkspace(Float64, k64, b; oracle = true)
+    @test ws isa QuasiStrided.ContractWorkspace{Float64, Vector{Float64}}
+    @test eltype(ws.packed_a) === Float64
+
+    # `T` is the STORAGE element type and the packed panels hold `real(T)`: a
+    # complex storage type over Float64-packing is the new instance the relaxed
+    # bound admits, at the SAME arity.
+    wsc = QuasiStrided.ContractWorkspace(ComplexF64, k64, b; oracle = true)
+    @test wsc isa QuasiStrided.ContractWorkspace{ComplexF64, Vector{Float64}}
+    @test eltype(wsc.packed_a) === Float64 === eltype(wsc.tw_packed_b)
+    @test all(isconcretetype, fieldtypes(typeof(wsc)))
+    @test !any(t -> t isa Union, fieldtypes(typeof(wsc)))
+
+    # ... and a mismatched (T, VT) pair cannot be constructed at all: the inner
+    # constructor enforces eltype(VT) === real(T).
+    @test_throws ArgumentError QuasiStrided.ContractWorkspace(ComplexF64, k32, b)
+    @test_throws ArgumentError QuasiStrided.ContractWorkspace(Float64, k32, b)
+    @test_throws ArgumentError QuasiStrided.ContractWorkspace(ComplexF32, k64, b)
+
+    # Reuse still refuses a workspace of the wrong storage type, by dispatch.
+    Amat, Bmat, Cmat = randn(6, 5), randn(5, 4), zeros(6, 4)
+    @test_throws ArgumentError plan_contract(
+        StridedView(Cmat), StridedView(Amat), (1, 2), StridedView(Bmat), (2, 3), (1, 3);
+        workspace = wsc
+    )
+end
+
+@testset "a non-identity pack transform crosses _pack_sliver! without allocating" begin
+    # The real path never builds this plan -- `_qs_isconj` is false for a real
+    # eltype, which is the point -- but the Phase 2b finding-5 failure mode (a
+    # transform reaching `_pack_sliver!` as a Union, ~80 B/call of dynamic
+    # dispatch) is a property of the `TF`/`TA`/`TB` type parameters, not of
+    # complex arithmetic. Building the plan directly exercises a genuine second
+    # specialization now, rather than discovering it in Phase C. `conj` is the
+    # elementwise identity on a real, so the result must be unchanged.
+    Random.seed!(8642)
+    Ma, Ka, Na = 19, 23, 17
+    Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
+    Cmat = zeros(Ma, Na)
+    p = _mm_plan(Cmat, Amat, Bmat)
+    pc = ContractPlan(
+        p.kernel, p.mgroup, p.ngroup, p.kgroup, p.blocking,
+        p.Astorage, p.Abase, p.Bstorage, p.Bbase, p.Cstorage, p.Cbase,
+        conj, conj, p.workspace,
+    )
+    @test isconcretetype(typeof(pc))
+    @test typeof(pc.atransform) === typeof(conj) === typeof(pc.btransform)
+    @test isempty(_ws_nonconcrete_types(execute!, (typeof(pc), Float64, Float64)))
+
+    allocs = _steady_allocs!(execute!, pc, Cmat)
+    @test Cmat ≈ Amat * Bmat
+    @test allocs == 0 skip = (VERSION < v"1.11")
+
+    fill!(Cmat, 0.0)
+    allocs_tw = _steady_allocs!(execute_tilewise!, pc, Cmat)
+    @test Cmat ≈ Amat * Bmat
+    @test allocs_tw == 0 skip = (VERSION < v"1.11")
+end

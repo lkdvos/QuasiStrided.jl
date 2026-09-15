@@ -1316,13 +1316,23 @@ nothing in it; it exists so the list can be read in one place at close.
   add/permute or trace step therefore cannot run wholesale under
   `backend=QuasiStridedBackend()`. Known and accepted; `README.md` says so
   plainly.
-- **Complex element types.** Blocked by the load-bearing conj/`op`
-  invariant under "Eligibility predicate, and the conjugation invariant":
-  QuasiStrided ignores `StridedView.op` and `conjA`/`conjB` entirely, which
-  is correct *only* for real `Float32`/`Float64`. Widening
-  `_qs_eltype_ok` without first handling `op`/`conj` explicitly would
-  produce silently wrong results, not an error. Do not treat this as a
-  one-line change.
+- **Complex element types.** ~~Blocked by the load-bearing conj/`op`
+  invariant~~ — **no longer true as of the complex element-type milestone;
+  see "Amendment 3" and the milestone sections at the end of this file.**
+  `ComplexF32`/`ComplexF64` are supported, `conjA`/`conjB` are folded with
+  each operand's `StridedView.op` by xor, and a conjugated *output* is
+  rejected. What remains out of scope on the complex side is narrower: the
+  3m method, mixed real/complex operands, and writing into a conjugated
+  output view.
+
+  The original text is struck rather than deleted because the reasoning it
+  recorded — that widening `_qs_eltype_ok` without first handling `op`/`conj`
+  would produce silently wrong results rather than an error — was correct
+  about the code as it then stood, and is exactly why the milestone had to do
+  that work first. Amendment 3 claimed this bullet had already been struck
+  while it was in fact still standing and asserting the opposite of the
+  shipped behaviour; that was caught by the milestone's gated review and is
+  fixed here.
 - **Threading.** Deferred. The state layout does not preclude it — see the
   macro-blocking "Phase D" finding 4 above (`ContractPlan`'s `(jc,pc)` and
   per-`ic` state are already disjoint fields; parallelizing over `ic` would
@@ -1828,3 +1838,1563 @@ better-tested replacement for `src/target.jl`'s cache detection (it already
 reports cache inclusivity, and divides L3 by the number of sharing cores),
 and `LayoutPointers`/`StrideArraysCore` provide `gesp`/`PtrArray`, if a
 dependency ever becomes acceptable.
+
+## Complex element-type milestone: Phase A direction freeze
+
+Opened 2026-09-14 on branch/worktree `complex`, base `114e594`. Goal: support
+`ComplexF32`/`ComplexF64` end to end -- engine and `QuasiStridedBackend` -- with
+two switchable microkernel methods, and discharge the conjugation invariant
+frozen in "Eligibility predicate, and the conjugation invariant" above.
+
+Everything in this section is frozen before any implementation worker launches.
+Amendments follow the house style: a numbered `### Amendment N` naming what it
+amends, with the original text left standing.
+
+### Direction, and where it comes from
+
+The design is not invented here. `tensorcontract-rs`
+(`/mnt/home/ldevos/Projects/tensorcontract-rs/main`) was built to measure exactly
+these methods on this class of workload and keeps a candid refutation record.
+What it establishes, and what is therefore binding on this milestone:
+
+- **Planar (split-complex, BLIS "1r") is the default.** Both panels hold
+  `[re_0..re_{n-1} | im_0..im_{n-1}]` per K step, driven by a genuinely complex
+  microkernel: four real FMAs per (A-vector, B-scalar) pair on data already in
+  the right lanes. No shuffles, no `fmaddsub`, no duplicated lanes.
+- **1m is nearly free in Julia.** Van Zee's induced method is literally the
+  *existing real kernel* over `2*kc` real steps, fed by "1e"-packed A and
+  "1r"-packed B (`crates/tensorcontract/src/kernel/simd.rs:170-177` is one line:
+  `real::<MV,NR>(2*kc, a, b, ab)`). B's "1r" is bit-identical to planar's and
+  shares the code path (their D14), so 1m's entire marginal cost is on the A
+  side.
+- **3m is out of scope.** `docs/refuted.md`'s "The complex-method ranking, and
+  the memory-bound inversion, as facts about the engine (A44)": last in every
+  column on Ice Lake, 0 of 49 cases won, per-case ratios 0.63-0.84 -- uniform,
+  not a few bad shapes. The mechanism that was supposed to justify it (the 25%
+  flop saving paying with L1-resident panels) did not survive either.
+- **The ranking does not transfer between machines.** Four orderings measured:
+  Cascade Lake, Ice Lake, portable scalar, and Apple M3 Max -- where 3m wins
+  outright at 1.135x planar. Their `docs/results.md:226`: "Ranking anything below
+  planar without naming the machine is a mistake this project has made twice."
+- **The methods differ in bytes moved per useful flop, not in flop count.**
+  Their A7 is refuted: "The three complex methods differ mainly in flop count.
+  **Refuted in Phase 3.** They differ mainly in **bytes moved per useful flop**."
+  3m does 25% *fewer* FMAs and still loses, because it loads three planes of both
+  operands to do it.
+- **Complex is not intrinsically disadvantaged.** 4x the flops on 2x the bytes is
+  twice the arithmetic intensity, so packing and indexing overheads amortise
+  *better*. They measure complex throughput *higher* than real on the same
+  shapes, 1.42-1.47x, replicated on two microarchitectures.
+
+Also adopted from that project, as method rather than as result: one kernel body
+written once and parameterised (their D17/D24 -- "a comparison between three
+methods must not also be a comparison between three hand-tunings"). 1m therefore
+reuses the real `_accumulate_step` **verbatim** rather than getting a copy.
+
+### Method ranking does not transfer between machines
+
+**No auto-dispatch rule is derived from any sweep this milestone runs.**
+`PlanarMethod` is the unconditional default; `OneMMethod` is selected only by
+naming the kernel, exactly as `benchmark/bench_default_vs_legacy.jl` already
+names the legacy kernel. Naming the kernel already picks up the matching
+blocking through `default_blocking(kernel)`, so no second mechanism is needed.
+
+This is the same decision, for the same reason, as `_shape_override(::Val,
+::Type) = nothing` in `src/driver.jl` -- "deliberately empty: ... a row here
+would only pin this package to one machine's noise" (Phase H). Every
+planar-vs-1m ratio this milestone reports names `ccqlin038`.
+
+### The frozen packed format is preserved, not extended
+
+`src/kernel_descriptor.jl` stays **completely unmodified**: its `T` remains the
+real type, its `T === Float32 || T === Float64` guard remains, and
+`packed_a_offset`/`packed_b_offset`/`packed_a_length`/`packed_b_length` on
+`KernelDescriptor` remain as written. It is the *real-panel* descriptor.
+
+`src/complex_format.jl` (new) introduces a strictly more general offset formula
+under new names on a new type, `ComplexKernelDescriptor{MR,NR,T,FA,FB}`:
+
+    p * reg_tile * reals_per_element  +  plane * reg_tile  +  index
+
+**At `reals_per_element == 1, plane == 0` this reduces exactly to the frozen
+`i + MR*p`.** The frozen layout is therefore the `RealFormat` instance of a more
+general formula, not something that was redefined; every existing caller, test
+and docstring is untouched. That sentence is the whole argument for why this is
+additive rather than a breaking change to a frozen interface.
+
+Formats and their `reals_per_element`: `RealFormat` 1, `PlanarFormat` 2
+(BLIS "1r"), `OneEFormat` 4 (BLIS "1e", the real `2x2` block `[[re,-im],[im,re]]`
+stored as two real K steps of `2n`). 3m's `ThreeM` format is deliberately absent.
+
+### Three meanings of `T`, pinned
+
+On the real path the storage element type, the packed-buffer element type and
+the `SIMD.Vec` lane type are all the same type, which is why the ambiguity is
+currently invisible. Complex splits them three ways, and conflating them is the
+main hazard in this milestone:
+
+| notion | accessor | `Float64` | `ComplexF64` planar | `ComplexF64` 1m |
+| --- | --- | --- | --- | --- |
+| storage element of A/B/C | `scalartype(k)` | `Float64` | `ComplexF64` | `ComplexF64` |
+| packed buffer / `Vec` lane | `realtype(k)` | `Float64` | `Float64` | `Float64` |
+| logical register tile | `mr(k)`, `nr(k)` | `MR`,`NR` | complex rows/cols | complex rows/cols |
+| reals per A sliver per **logical** K step | `packed_a_per_k(k)` | `MR` | `2MR` | `4MR` |
+| reals per B sliver per logical K step | `packed_b_per_k(k)` | `NR` | `2NR` | `2NR` |
+
+`packed_a_per_k`/`packed_b_per_k` are the Julia counterparts of that project's
+`Ukr::a_per_k`/`b_per_k`, and they are **the only new quantity the driver
+reads**. For every real kernel they are identically `mr`/`nr`, so substituting
+them at the four `_sliver_panel` call sites is provably the identity -- pinned by
+a test rather than argued.
+
+`packed_a_length(kernel, kc)` takes the **logical** (complex) `kc` and returns a
+count of **reals**. 1m's internal doubling to `2*kc` real steps is confined to
+its own `accumulate` and never appears in a length, an offset, or a driver loop
+bound (their D16: "Exposing that to the driver would leak the method into the
+loop nest").
+
+### Kernel types
+
+    PlanarKernel{MR,NR,T,W} <: DescriptorKernel{MR,NR,T}
+        descriptor::ComplexKernelDescriptor{MR,NR,T,PlanarFormat,PlanarFormat}
+
+    OneMKernel{MR,NR,T,W} <: DescriptorKernel{MR,NR,T}
+        descriptor::ComplexKernelDescriptor{MR,NR,T,OneEFormat,PlanarFormat}
+        inner::SIMDKernel{2MR,NR,real(T),W}
+
+Both carry a field named `descriptor`, so **`src/kernel.jl` needs no changes at
+all**: `mr`/`nr`/`scalartype`/`packed_a_length`/`packed_b_length` forward through
+the existing `DescriptorKernel` methods, and `pack_a!`/`pack_b!` forward through
+the existing generic whose per-argument `where` bounds are the Phase 2b finding-5
+allocation fix. That forwarding generic is the seam, and it already exists.
+
+`packed_a_offset(k::DescriptorKernel, i, p)` on a complex kernel resolves to a
+`ComplexKernelDescriptor` method that does not exist, and the resulting
+`MethodError` is correct and deliberate: no complex kernel should ever be asked
+for a single-plane offset.
+
+### Buffer element type: the `VT` bound relaxes, the arity does not
+
+`ContractWorkspace{T,VT}`'s bound goes from `VT <: AbstractVector{T}` to
+`VT <: AbstractVector`, with `eltype(VT) === real(T)` enforced in the inner
+constructor. `ContractPlan`'s `VT` follows.
+
+**Amends** the typing discipline recorded under Amendment 1 ("`VT` is a
+`where`-bound parameter resolved at construction, never a `Union`- or
+`AbstractVector`-typed field"). That requirement still holds: `VT` is still
+resolved to a concrete `Vector{Float64}` at construction and the *field* is still
+`::VT`. Only the upper bound in the parameter list loosens, and the new inner
+invariant is what keeps the loosening from admitting a wrong workspace.
+
+Why not add an `R` parameter: `ContractWorkspace{Float64,Vector{Float64}}` is
+spelled literally in six places across `src/` and `test/`, plus a user-facing
+error message and three docstrings. With the relaxed bound **every one of those
+spellings stays valid and every one of those tests keeps passing unedited** --
+`ContractWorkspace{ComplexF64,Vector{Float64}}` is simply the new instance.
+
+Why `T` stays the *storage* type: the backend's workspace pool is a
+`Dict{DataType,ContractWorkspace}` keyed by `eltype(C)`. If `T` meant the packed
+eltype, a `Float64` and a `ComplexF64` contraction would collide on one pooled
+workspace, silently coupling two dtypes' `reserve!` footprints. Planar and 1m
+share `VT` and `reserve!` is grow-only, so the key needs no method component --
+but `_reuse_workspace`'s fast path gains a guard on
+`eltype(ws.packed_a) === realtype(kernel)`, so a pooled `ComplexF32` workspace
+cannot serve a `ComplexF64` plan.
+
+Consequences traced and frozen: `_workspace_sizes` needs **no change** (`pa =
+packed_a_length(kernel, kc)` already returns reals, and `m_slivers =
+cld(blocking.mc, mr)` correctly uses the logical extent); `PackedPanel{T}` needs
+**no change** (it is parameterised on the buffer element, so a complex kernel
+receives a `PackedPanel{Float64}` and `panel_vload(Vec{W,Float64}, ...)` works
+verbatim); and `execute_tilewise!`, the in-tree oracle, works for complex with
+**no changes**, which is a large correctness win.
+
+### The planar microkernel: accumulator, body, and two independent cliffs
+
+Accumulator: one flat `NTuple{2NV, Vec{W,R}}` with `NV = (MR÷W)*NR`, real plane
+at tuple indices `1:NV` and imaginary at `NV+1:2NV`, preserving the existing
+`(v,j) -> v + (MR÷W)*j + 1` convention within each plane. Flat, not nested: it
+keeps every signature the same *shape* as the real path, which is the pattern
+Phase H proved keeps the accumulator register-resident.
+
+Body, `@generated` and closure-free, with `nai_v = -ai_v` hoisted out of the `j`
+loop:
+
+    cr = muladd(nai_v, bi_j, muladd(ar_v, br_j, acc[idx]))
+    ci = muladd(ai_v,  br_j, muladd(ar_v, bi_j, acc[NV+idx]))
+
+Julia exposes no `vfnmadd` intrinsic. `cr - ai*bi` is **rejected**: Julia does
+not set LLVM's `contract` fast-math flag by default, so it would not fuse -- two
+instructions, and different rounding from the other three terms.
+`muladd(-ai, bi, cr)` lowers to `llvm.fmuladd` with an `fneg` operand, which
+LLVM's x86 backend folds into `vfnmadd213pd`. Hoisting the negation to `nai_v`
+(once per `(v,p)`, not per `(v,j,p)`) bounds the worst case if it declines to
+fold at `MV` extra `vxorpd` against `4*MV*NR` FMAs -- 1.4% at `(MV,NR) = (2,6)`.
+**This is to be verified by `@code_native` and the result recorded**, following
+this project's `@code_llvm`-verification convention; it does not ship as an
+assumption.
+
+**Cliff A -- architectural register spill** (their `kernel/x86.rs:35-42`; 30-50%
+loss, and "the sweep is full of these cliffs"). Live state per K step:
+
+    2*MV*NR accumulators + 2*MV A vectors + 2 B broadcasts <= nregisters
+
+At the reference planar shape `(MV,NR) = (2,6)` on AVX-512 that is
+`24 + 4 + 2 = 30 <= 32` -- tight, consistent with their menu putting it first.
+On AVX2's 16 ymm even `(1,6)` leaves exactly zero spare, which is why the complex
+derived rule applies on `:avx512` only (below).
+
+**Cliff B -- the Phase H heap-allocation cliff**, from dynamic `NTuple` indexing
+above NV = 16 (24576 B per `execute!`, measured). Planar at 16x6 is
+**NV_total = 24**, so this cliff is live from the first line of code, not
+eventually. Therefore every complex accumulate *and* store is `@generated` with
+literal tuple indices from the first commit -- **including the lane tail**, which
+the real path handles with a runtime-indexed helper (`_acc_lane`) that the
+complex path must not use. Precedent that static indexing scales: after Phase H
+the real path measured 0 B up to `MR = 48`, i.e. NV up to 36.
+
+These two cliffs are independent and must be kept apart in any analysis: Cliff A
+is about the architectural register file, Cliff B about Julia's tuple lowering.
+
+### The fused `store_tile!` is kept; the reference's writeback split is not adopted
+
+That project's kernels overwrite a stack tile and do nothing else --
+`alpha`/`beta`/conjugation/scattered write-back/plane recombination all happen
+afterwards in `writeback.rs` (their D7). **Not adopted, deliberately.**
+
+Their split exists because `Ukr::func` is a bare `unsafe fn` pointer and
+therefore *cannot* be generic over the destination; a stack tile is the only way
+one kernel body serves the regular path, the gather path and every edge block.
+Julia has no such constraint: `store_tile!` is already specialised per
+`(QSTile{S,R,C}, kernel)` by ordinary dispatch and the `@generated` fallback
+already handles every edge block, so the motivating benefit is already had.
+
+The cost here is not free. Phase H measured that routing the accumulator through
+memory cost ~4x and heap-allocated 24 KB per `execute!`; inserting a tile
+store/load round-trip re-introduces exactly the memory hop Phase H removed, on a
+`2*MR*NR`-real tile. And `store_tile!`'s existing contract -- `alpha == 0` never
+reads `acc`, `beta == 0` never reads old `C`, padding lanes are never read
+(pinned by the nonfinite-poisoning tests) -- would have to be re-derived across
+the split for no gain.
+
+The unit-stride plane-to-interleave store (their `writeback.rs:174-183` exists
+solely so LLVM vectorises that conversion) is a **measurement-gated follow-on**,
+not part of the first implementation: they price recombination at
+`~c/(4*min(K,KC))` of a tile's compute, negligible for `K >= KC` and material
+only at single-digit `K`. The scattered `@generated` path ships first, reusing
+the existing generic `_axpby_tile!` unchanged.
+
+### Conjugation: semantics, and where each piece is absorbed
+
+`TO.tensorcontract!`'s contract is
+`C = beta*C + alpha*permutedims(contract(opA(A), opB(B)), pAB)`. There are two
+*independent* sources of conjugation per input:
+
+| source | applies to | effect on a `Number` element |
+| --- | --- | --- |
+| `conjA`/`conjB` (TO's flags) | A, B | `conj` if true |
+| `StridedView.op` | A, B, **and C** | `conj`/`adjoint` conjugate; `identity`/`transpose` do not |
+| `alpha`, `beta` | -- | **not** conjugated |
+
+`alpha`/`beta` need no conjugation: TO applies `conjA` to A's *data* only.
+
+The mechanism behind the frozen warning, stated precisely: **the engine never
+goes through `StridedView` indexing at all.** `_plan_contract` takes
+`parent(A)`/`offset(A)` and the packing and store paths address the parent
+directly through `tile_load`/`tile_store!`, while `StridedViews`' own
+`getindex(a, ::ParentIndex)` and `setindex!` are what apply `a.op`. So `op` is
+silently dropped on **all three** operands, C included.
+
+The real path is *structurally* immune, which is stronger than the frozen text
+claims: `StridedViews` defines `Base.conj(a::StridedView{<:Real}) = a` and
+`adjoint(a::StridedView{<:Number,2}) = permutedims(conj(a), (2,1))`, so for a
+real element type `op` is always `identity` no matter what wrapper the user
+passes. Nothing about the real path can change.
+
+**The combining rule.** TensorOperations' own TBLIS extension encodes
+`isconj(A::StridedView{T}, conjA) = T <: Complex && (conjA ⊻ (A.op === conj))`.
+Correct, but **not total**: `StridedView(p, sz, st, off, adjoint)` is directly
+constructible, and `=== conj` would silently treat it as unconjugated -- exactly
+the silent-wrong-answer class this milestone exists to close. Frozen form:
+
+    _op_conjugates(::typeof(identity))  = false
+    _op_conjugates(::typeof(conj))      = true
+    _op_conjugates(::typeof(transpose)) = false   # elementwise identity on Number
+    _op_conjugates(::typeof(adjoint))   = true
+    @noinline _op_conjugates(f) = _qs_throw("unsupported StridedView.op $f ...")
+
+    _qs_isconj(v::StridedView{T}, flag::Bool) where {T} =
+        (T <: Complex) && (flag ⊻ _op_conjugates(v.op))
+
+The throwing fallback is `@noinline` and unreachable for every `op` that
+`StridedViews` itself constructs, so it costs nothing; hard-rejecting an unknown
+`op` matches "Hard-reject, never fall back".
+
+**A conjugated output `C` is rejected this milestone.** In-tree precedent, same
+rejection for a related reason: TensorOperations' TBLIS extension does
+`isconj(SV(C), false) && throw_conj_output(f)`. Supporting it would thread a
+conjugation flag as a type parameter through `store_tile!` -> `execute_tile!` ->
+`_execute_micro_tile!` -> the nest, doubling specialisations of the *innermost*
+code for a case TO's public API cannot even express (there is no `conjC`
+parameter), and would require re-deriving the beta-applied-once argument under
+`beta_eff = firstpanel ? betaT : one(T)`. The door, explicitly: supporting it
+later means conjugating on the `C` read *and* on the final store (their
+`writeback.rs:244-257`), plus that re-derivation -- their multi-block argument
+re-reads `D` as `C` with `conj_c = conj_d` and is exact "because conjugation is
+additive and involutive", which is a different scheme from `beta_eff` and does
+not transfer without work.
+
+**Where the flags live.** `plan_contract` gains `conjA::Bool = false`,
+`conjB::Bool = false` keywords. They are folded with each view's `.op` *inside*
+`plan_contract`, converted to singleton function values, and passed through the
+existing `_plan_contract` function barrier, where the small
+`Union{typeof(identity),typeof(conj)}` dies exactly as `_default_kernel`'s Union
+already does. `ContractPlan` gains `atransform::TA`, `btransform::TB` fields with
+their own type parameters.
+
+    ta = _qs_isconj(A, conjA) ? conj : identity
+    tb = _qs_isconj(B, conjB) ? conj : identity
+    _qs_isconj(C, false) && throw(ArgumentError("... conjugated output view ..."))
+
+Rejected alternatives, recorded so they are not re-proposed: a runtime `Bool`
+field (the transform then crosses `_pack_sliver!` as a `Union`, which is
+*precisely* Phase 2b finding 5 and its ~80 B/call of dynamic dispatch);
+`Val{Bool}` (identical specialisation cost, worse ergonomics, still needs mapping
+to a function at the pack site); conjugation as part of the kernel type
+(conjugation is per-operand and per-call, not a kernel property -- it would break
+`_default_kernel`, `KernelDescriptor`'s role, and the `DataType`-keyed pool).
+
+**Real-path guarantee, and it is directly testable:** `_qs_isconj` returns
+`false` unconditionally for real `T`, so `TA === TB === typeof(identity)` always
+and **no new `execute!` specialisation exists on the real path**, even when a
+caller passes `conjA = true`.
+
+**The plan/view mismatch hazard is made unrepresentable, not detected.** That
+project had to add a runtime guard (`Error::ElementOpMismatch`, their D57) after
+`plan.run(.., view.conj(), ..)` silently computed the *unconjugated* contraction
+and returned `Ok` -- found by writing documentation, not by a test, because their
+property suite drove a lower-level entry point that has no views. QuasiStrided
+has a strictly stronger position available: `execute!(plan, alpha, beta)` takes
+no operands at all (the plan stores `parent`/`offset`), so there is nothing to
+re-supply and mismatch. `plan_contract` folding `.op` itself, plus
+`_op_conjugates`' throwing fallback, closes the hole structurally. Recorded as a
+deliberate divergence, with their failure mode cited, so the reasoning is
+auditable rather than accidental.
+
+**Where conjugation is applied: the existing `transform` seam.** `pack_a!` and
+`pack_b!` already take a `transform` argument, applied in `_pack_panel!`, already
+forwarded with per-argument bound type parameters, and already tested
+("transform is never called on padding lanes", via call counting). The driver's
+`_pack_sliver!` stops hardcoding `identity` and takes `transform::TF` with **its
+own bound type parameter** -- leaving it unbound reintroduces finding 5, as the
+comment at `src/kernel.jl:30-33` says in as many words.
+
+Three call sites, and the third is the trap: `_execute_nest!`'s `pack_b!` and
+`pack_a!` calls, and **`execute_tilewise!`'s**. If the third is missed, the
+*oracle* is silently wrong for conjugated inputs and the disagreement will
+present as an engine bug. A test pinning `execute!` against `execute_tilewise!`
+**with conjugation set** is therefore mandatory, not optional.
+
+**The `transform` contract is restated format-independently**, because the
+literal `convert(T, transform(v))` in `_pack_panel!` cannot survive planar
+packing into a `real(T)` buffer:
+
+> `transform` is an elementwise scalar function applied to each loaded **source
+> element** before it is committed to the packed buffer, in whatever physical
+> format that buffer uses. A packer that splits an element into planes must
+> produce a result identical to applying `transform` to the complex value and
+> then splitting. Padding lanes are never read and never call `transform`.
+
+That is exactly what "negate the imaginary plane as it is written" implements,
+and it keeps one definition of correctness across all formats. The hazard it
+forbids, stated so a reviewer can look for it: a packer that reinterprets the
+source into real halves and applies `transform` per *half*, where `conj` is a
+no-op. Pinned bitwise by `pack_*!(..., conj)` equalling `pack_*!(..., identity)`
+on a pre-conjugated source, in every format.
+
+Note that conjugation is genuinely free here: it is a sign flip on a value the
+scatter/gather pass has already loaded, in a pass the engine has to make anyway.
+
+### Eligibility
+
+    const _QS_ELTYPES = (Float32, Float64, ComplexF32, ComplexF64)
+    _qs_eltype_ok(C, A, B) =
+        eltype(A) === eltype(B) === eltype(C) && eltype(C) ∈ _QS_ELTYPES
+
+`_qs_strided_ok` and `_qs_eligible` are unchanged in structure.
+
+Still rejected, unchanged: mixed element types, `Float16`, non-strided operands,
+an aliased output. Also rejected, and newly so: `Complex{Float16}`,
+`Complex{Int}`, `Complex{BigFloat}` (not in the tuple); a conjugated output view;
+an unrecognised `StridedView.op`.
+
+**Mixed real-A / complex-B is out of scope.** `KernelDescriptor` and
+`ComplexKernelDescriptor` each carry one element type; the workspace pool is
+keyed by a single `DataType`; `plan_contract` already throws on
+`eltype(A) !== eltype(C)`; and TO's `promote_contract` machinery is the right
+layer for promotion. TBLIS requires a shared eltype too. Supporting it would mean
+either a second scalar type through the kernel or a materialising promotion --
+both contrary to "a timing taken with `backend=QuasiStridedBackend()` always
+measures this engine".
+
+### Register shape and blocking
+
+`_derived_shape` gets a **new `T <: Complex` method rather than an edit**, so
+that "the real path is bit-identical" is a `git diff` fact rather than an
+argument about whether `real(Float64) === Float64`. The complex method takes
+`W = vector_bytes ÷ sizeof(real(T))` -- 8 for `ComplexF64` on AVX-512, 16 for
+`ComplexF32` -- and then **the same rule**, `MR = 2W`, `NR = NR_DEFAULT`.
+
+That is worth stating rather than hiding: their measured planar menu head is
+`(MV,NR) = (2,6)`, i.e. a 16x6 complex tile, which is exactly `MR = 2W, NR = 6`
+with `W` taken from the real type. The one-line Phase G rule survives the complex
+extension; only the `sizeof` argument changes.
+
+`_rule_applies` gains a complex counterpart true on `:avx512` **only**. Their
+AVX2 complex shapes are marked explicitly provisional and unmeasured, and
+Cliff A leaves AVX2 planar with zero spare registers. Same treatment and same
+wording as the `:neon` precedent: derive where measured, fall back everywhere
+else.
+
+Shape menus are **seeded from their measured AVX-512 shapes**
+(`crates/tensorcontract/src/kernel/x86.rs:182-190`), converted to this project's
+`(MR, NR, W)` with `MR` in logical complex rows, at most three per menu so the
+compiled specialisation set stays bounded:
+
+    KERNEL_SHAPES_C64_PLANAR = ((16,6,8), (24,3,8), (8,8,8))
+    KERNEL_SHAPES_C64_ONEM   = ((12,8,8), (16,6,8), (8,8,8))   # their MV counts REAL rows
+    KERNEL_SHAPES_C32_PLANAR = ((32,6,16), (48,3,16), (16,8,16))
+    KERNEL_SHAPES_C32_ONEM   = ((24,8,16), (32,6,16), (16,8,16))
+
+Cliff-A check on the planar menu (`2*MV*NR + 2*MV + 2`): 30, 26, 20 -- all within
+32, and in their measured order.
+
+**Blocking derives from packed reals, not from `sizeof(T)`.** Their D13: doing it
+from element size "would hand 1m double the L2 footprint and quietly rig the
+comparison", because 1m's packed A carries four reals per complex element instead
+of two. But this project's `default_blocking` is deliberately *measured
+constants, not a cache model* -- "Block-size policy (settled)" records that such
+models lost 14-34% even on their own reference machine. The two are reconciled by
+anchoring to the measured real row and holding the packed **byte** budget fixed:
+
+    a_reals(::PlanarMethod) = 2;  b_reals(::PlanarMethod) = 2
+    a_reals(::OneMMethod)   = 4;  b_reals(::OneMMethod)   = 2
+
+    function default_blocking(v::Val, ::Type{T}, m::ComplexMethod) where {T<:Complex}
+        base = default_blocking(v, real(T))          # the MEASURED real row
+        Blocking(max(1, base.mc ÷ a_reals(m)), base.kc, max(1, base.nc ÷ b_reals(m)))
+    end
+
+So AVX-512 `Float64`'s measured `(128, 256, 768)` yields `ComplexF64` planar
+`(64, 256, 384)` and 1m `(32, 256, 384)`: **1m's `mc` is exactly half planar's,
+derived, never tabulated**, and both methods get the same L2/L3 byte budget, so
+the head-to-head is fair by construction rather than by a reviewer noticing. It
+also makes the `_legacy_blocking(::Type{ComplexF64})` `MethodError` disappear
+without a new hand table. Any swept override is a row in this same 3-argument
+table, not a new mechanism.
+
+### Verification contract
+
+Four oracle layers, following this project's existing practice:
+
+1. **Packing.** Per-format conjugation; packed-length ratios (1m's A is exactly
+   twice planar's, 1m's B exactly equal -- their D14); and the bitwise pin that
+   `pack_*!(..., conj)` equals `pack_*!(..., identity)` on a pre-conjugated
+   source. Bitwise is correct here because these are exact; it remains wrong for
+   SIMD-vs-scalar.
+2. **Layout pin.** The Julia analogue of their `offset_of!` test:
+   `reinterpret(Float64, [ComplexF64(1,2)]) == [1.0, 2.0]` -- re then im,
+   adjacent, unit stride. Any planar or 1m packer depends on it.
+3. **Kernel contract.** A **test-local, independent re-implementation** of each
+   packed format plus a test-local tile reader, compared against a scalar complex
+   dot product, run for every method x every shape in the menu and at every lane
+   width the machine supports (not only the default).
+4. **End-to-end randomised**, against the independent macro-nest oracle.
+   **Randomise the conjugation/`op` cross-product; do not enumerate it** -- per
+   iteration draw `conjA`/`conjB` and draw `opA`/`opB` from
+   `(identity, conj, adjoint, transpose)`, under `Random.seed!` so failures
+   reproduce. Exhaustive enumeration is reserved for the microsecond-scale matmul
+   fixture in `test/test_tensoroperations.jl`, whose `conjA, conjB ∈ (false,true)`
+   loop already exists and simply becomes non-trivial.
+
+Plus: a cache-crossing case **per method**, since each method has its own `mc`;
+and `execute!` against `execute_tilewise!` **with conjugation set**.
+
+**Tolerance is an acceptance criterion, not a guideline.** Complex gets the
+**same tolerance as real at the same precision**. Planar and 1m require no
+widening -- only 3m does, and it is out of scope (their D15 gives 3m 100x, and
+explains why: its error bound is relative to `|Ar||Br| + |Ai||Bi|` rather than to
+the complex magnitudes). **If a complex test needs a looser tolerance than its
+real counterpart, that is a bug signal, not a property of complex arithmetic.**
+
+**The real path is proven unchanged five independent ways**: (1) `git diff` shows
+additions, not edits, to `_pack_panel!`, `_accumulate_step`,
+`store_tile!(::SIMDKernel)`, `_derived_shape` and `_legacy_blocking` -- a
+checklist item, not a judgement call; (2) `typeof(plan.atransform) ===
+typeof(identity)` for real `T` even with `conjA = true`; (3) the existing
+zero-allocation assertions hold unchanged and are duplicated for complex; (4) the
+"no union-typed or partially-applied types reach the nest" assertion extends to
+the complex path and the new `TF` parameter; (5) a measured regression guard.
+
+`test/test_target.jl`'s register-budget assertion `(MR÷W)*NR + MR÷W <= 32` is
+**generalised, not widened**: keep it verbatim and add a method-aware complex
+assertion driven by the detected `nregisters` rather than a literal 32, since
+planar carries separate real and imaginary accumulator planes.
+
+### Measurement contract
+
+`benchmark/harness.jl`'s `build_plain`/`build_scattered` are already generic in
+`T` and need no change. `DTYPES` stays as it is so the real baseline is
+byte-identical; complex dtypes are added alongside.
+
+`flops_per_mac(T) = T <: Complex ? 8 : 2`. **8 is the textbook count and is
+deliberately not reduced for induced methods** (their `element.rs:100-106`:
+charging 3m fewer flops "would flatter it"; the same argument applies to 1m,
+which issues fewer real multiplies than the naive four). A **bytes-moved column**
+is reported alongside, because their A7 refutation says that is the quantity the
+methods actually differ in.
+
+Two harness defects to fix while there, both found while planning:
+`benchmark/bench_tensoroperations.jl` duplicates `median_time_s(...; reps = 9)`
+instead of including the harness, and 9 is below the standing >= 15 rule; and
+`benchmark/bench_kernel_shape.jl`'s `FMA_RE = r"vfmadd"` does **not** match
+`vfnmadd`, so the validated spill detector would undercount planar's FMAs.
+
+Sweeps, in dependency order, each at >= 21 reps with compared configurations
+timed **adjacently** and the start/middle/end canary bracket -- `ccqlin038` is not
+reliably exclusive, canary spreads of 4-15% are normal, and an 11-rep comparison
+once invented two regressions that 21 reps erased:
+
+1. **Real-path regression guard**, gating everything else: the shipped tree
+   against `114e594`, same machine, same day. Every point inside the 10% band;
+   a *systematic one-sided* shift across all points counts as a regression even
+   under 10%.
+2. Complex register shapes per method, with the (fixed) spill detector -- Cliff A
+   is the binding constraint, so the detector matters more than the timing.
+3. `kc`, swept **jointly with the shape**, since `packed_a_per_k * kc *
+   sizeof(real(T))` is the L1 A-micropanel footprint and complex doubles or
+   quadruples it (the same reasoning as Phase G).
+4. `mc`/`nc` re-validation against the derived scaling.
+5. Planar vs 1m at matched packed footprint, over the main shapes including the
+   memory-bound `shallowK_256x24x256`, reporting bytes per flop.
+6. `@tensor` head-to-head against `StridedNative()`/`StridedBLAS()`.
+
+**Headline metric: the complex-efficiency ratio**, within the same engine, with
+complex charged 8 flops/MAC: `GFLOPs(ComplexF64) / GFLOPs(Float64)` per shape and
+as a geomean. `1.0` means complex is treated exactly as well as real. Complex has
+twice the arithmetic intensity, so it should amortise overheads *better* -- they
+measure 1.42-1.47x. **Acceptance: geomean >= 1.0 for planar.** Below ~0.9 means a
+structural overhead -- most likely a packing cost or an accumulator spill -- and
+is a **blocking finding for the review phase**, not a result to publish.
+
+### Forward-binding notes (cheap now, expensive to rediscover)
+
+- **Orientation swap**, still deferred: if it lands it must swap
+  `atransform`/`btransform` **and** the packed formats along with the operands.
+  That is correct precisely because the kernel contract is about row and column
+  panels, not about which user tensor they came from (their `driver.rs:332-347`).
+- **Octavian-style no-pack tiers**, this project's standing "Next task": a
+  no-pack tier has **no pack-time seam**, so it would have to absorb conjugation
+  some other way -- at load, inside the kernel, or by excluding conjugated
+  operands from the tier. Decide that before building the tier, not after.
+
+### Explicitly not done this milestone
+
+3m; mixed real/complex operands; writing into a conjugated output `C`; complex
+`tensoradd!`/`tensortrace!` (still throw, contraction-only is unchanged); the
+unit-stride plane-to-interleave store (measurement-gated); AVX2 and NEON complex
+register shapes (fall back, never guessed at); `select_backend` (still unhooked);
+threading; GPU; autotuning; K padding.
+
+### File ownership additions (append to the existing table)
+
+| File | Owner | Phase |
+| --- | --- | --- |
+| `src/complex_format.jl` (new) | main process (freeze), then packing implementer | A, B2 |
+| `src/kernels/planar.jl` (new), `test/test_planar_kernel.jl` (new) | planar-kernel implementer | B3 |
+| `src/kernels/onem.jl` (new) | 1m implementer | D |
+| `src/workspace.jl`, `src/driver.jl`, `src/blocking.jl` | plumbing implementer (**exclusive** -- no other worker edits `src/driver.jl`) | B1 |
+| `src/packing.jl` (additive only; `_pack_panel!` untouched) | packing implementer | B2 |
+| `src/tensoroperations.jl` | adapter implementer | B4 |
+| `test/test_tensoroperations.jl` | adapter-test implementer (authored blind against this section) | B5 |
+| `benchmark/bench_complex_shape.jl`, `benchmark/bench_complex_method.jl` (new) | measurement implementer | F |
+
+### Amendment 3: the conjugation invariant is discharged, and the eltype gate widens
+
+Amends "Eligibility predicate, and the conjugation invariant" above. That section
+was written as a *precondition*, not a prohibition -- "Adding complex eltype
+support in a future milestone is not a matter of widening the eltype check. It
+requires handling `op`/`conj` explicitly first." This amendment records that the
+precondition has now been met, and by what.
+
+What is **left standing, unedited**:
+
+- The diagnosis paragraph ("correct *only* because the eltype is restricted to
+  real `Float32`/`Float64` ...", and the `isconj` quotation). It is a true
+  statement about the code as it stood, and it is still exactly why this work was
+  necessary.
+- The instruction that adding complex support "requires handling `op`/`conj`
+  explicitly first" and is "not a one-line change". Now **discharged** rather than
+  repealed: it reads as a satisfied obligation. The work it demanded is the
+  "Conjugation: semantics, and where each piece is absorbed" subsection above.
+
+What is **amended**:
+
+- **The predicate block.** Superseded by
+
+      const _QS_ELTYPES = (Float32, Float64, ComplexF32, ComplexF64)
+      _qs_eltype_ok(C, A, B) =
+          eltype(A) === eltype(B) === eltype(C) && eltype(C) ∈ _QS_ELTYPES
+
+  with `_qs_strided_ok` and `_qs_eligible` unchanged in structure.
+- **"`src/tensoroperations.jl` must carry this reasoning as a source comment at
+  the point where `conjA`/`conjB` are dropped."** They are no longer dropped, so
+  there is no such point. Superseded by: the adapter must carry, as source
+  comments, (a) the `_qs_isconj` combining rule and why `⊻` is the right
+  composition of the flag with `.op`, (b) why `_op_conjugates` is a *total* table
+  with a throwing fallback rather than TBLIS's `=== conj` test, and (c) why a
+  conjugated output `C` is rejected rather than supported.
+- **"The eltype check is the only thing standing between the current code and
+  silently wrong results for complex inputs."** No longer true, and that is the
+  point of the milestone. The guard is now three things, none of which is the
+  eltype check: `_qs_isconj` folding `conjA`/`conjB` with `.op`;
+  `_op_conjugates`' throwing fallback, so no `op` can be silently mishandled;
+  and the conjugated-`C` rejection.
+- **The supporting facts about the engine-level gate** ("`src/kernel_descriptor.jl`
+  throws unless `T === Float32 || T === Float64`, and `default_blocking` only has
+  measured constants for those two"). `src/kernel_descriptor.jl` is unchanged --
+  complex goes through the separate `ComplexKernelDescriptor`, per "The frozen
+  packed format is preserved, not extended" above -- and `default_blocking` gains
+  a derived complex row rather than a hand-tabulated one.
+- **The bullet requiring "a test that pins it (real operands with
+  `conjA`/`conjB` set true still give results identical to `StridedNative()`)".**
+  **Kept and strengthened** — but *not* textually unchanged, which an earlier
+  revision of this amendment wrongly claimed. The testset was renamed ("conj is
+  a no-op for real eltype" -> "conj is real conjugation for complex eltype, and
+  still a no-op for real"), its loop widened from `eltypes` to `all_eltypes`,
+  and a `T <: Complex` branch added. The real-path *assertion* (`Rq ≈ Rn`)
+  survives and gained `Rq ≈ A * B`, so the guard is intact and stronger; only
+  the claim about its text was wrong. It is now joined by its complex
+  counterpart and by the type-level assertion that
+  `typeof(plan.atransform) === typeof(identity)` for real `T` even when
+  `conjA = true`.
+
+In the closing summary's "Explicitly NOT done" list, the **Complex element types**
+bullet is struck and replaced by a pointer to this milestone plus the residual
+list in "Explicitly not done this milestone" above: 3m, mixed real/complex,
+writing into a conjugated output `C`, and complex `tensoradd!`/`tensortrace!`.
+
+### Second addendum to "Required argument-checking order in the adapter (frozen)"
+
+Recorded here rather than as a numbered Amendment because, like the T11 addendum,
+it changes only *where in the sequence* a check runs and adds one step; no
+previously-correct outcome changes.
+
+The order gains a **conjugated-output rejection**, and it necessarily runs
+**after** the `StridedView` wrap, because it needs `Cv` -- the same reason T11's
+aliasing check had to move there:
+
+    eligibility -> argcheck -> dimcheck -> wrap -> aliasing -> conjugated-C rejection
+
+> **Superseded in part — see "Phase C integration findings" below.** The
+> placement argued for here (the check in `plan_contract` only, the adapter not
+> duplicating it) turned out to be violated by Julia's keyword-argument
+> evaluation: the adapter passes `workspace = _qs_task_workspace(...)` as an
+> *argument* to `plan_contract`, so a pooled workspace was acquired before
+> `plan_contract`'s own rejection could fire. The adapter now performs the
+> rejection too. The reasoning below still stands for *why* the engine keeps a
+> check; it is no longer the only one.
+
+The check itself lives in **`plan_contract`, not in `_qs_prepare`**.
+`plan_contract` and `contract!` are public entry points reachable without the
+adapter, and the same silent-wrongness applies to a caller who wraps a complex
+array in a conjugated `StridedView` and calls the engine directly. Putting it at
+the engine boundary protects both paths and means the adapter does not duplicate
+it. `plan_contract` is also where `conjA`/`conjB` are folded with `.op`, so the
+rejection sits next to the code whose invariant it protects.
+
+## Complex element-type milestone: Phase C integration findings
+
+Five Phase B workers ran in parallel on disjoint files against the Phase A
+freeze. Four of them reported something the freeze got wrong or left
+under-determined. Recorded here at integration rather than at close, because
+three of the four changed shipped code.
+
+### Cliff A bites at the shipped shape: the freeze's register arithmetic was optimistic
+
+**The freeze says** `2*MV*NR + 2*MV + 2 <= nregisters`, and that planar's
+`(MV,NR) = (2,6)` at `24 + 4 + 2 = 30 <= 32` is "tight, consistent with their
+menu putting it first". **Measured on ccqlin038 (Julia 1.12.6, `:avx512`, 32
+zmm), it does not fit.** Counting `%rsp` stores and reloads in `accumulate`'s
+inner loop:
+
+| shape | pressure | stores/K step | reloads |
+| --- | --- | --- | --- |
+| planar `(24,3,8)` / `(48,3,16)` | 26 | 0 | 0 |
+| planar `(8,8,8)` / `(16,8,16)` | 20 | 0 | 0 |
+| real `SIMDKernel` `(32,6,8)`, same NV = 24 (control) | 29 | 0 | 0 |
+| **planar `(16,6,8)` / `(32,6,16)`** | **30** | **26** | **3** |
+| real `SIMDKernel` `(48,6,8)` (control) | 43 | 12 | 12 |
+| planar `(16,6,4)`, deliberately over budget | 58 | 96 | 74 |
+
+The transition sits between **29 and 30**, not at 32, and the shape seeded from
+the reference project's measured menu is on the wrong side of it. The real
+kernel at an *identical* NV = 24 accumulator count is clean, so this is register
+pressure and not a coding defect in the planar body.
+
+Mitigating detail, and the reason this is not being treated as a blocking
+finding: 23 of the 26 are **store-only** -- accumulator vectors written with no
+matching reload, LLVM rematerialising the loop-carried tuple -- so the cost is
+store-port bandwidth rather than a load-use dependency chain. Only 3 are genuine
+B-broadcast spill/reloads.
+
+**What this is really an instance of.** The freeze's own rule -- "the method
+ranking does not transfer between machines" -- turns out to apply to the *shape
+menu* as well, and for a reason the freeze did not anticipate: the reference
+measured `(2,6)` best on this same microarchitecture, but in Rust, with a
+different register allocator. A shape that fits LLVM-via-Rust's allocation need
+not fit LLVM-via-Julia's. The menus stay seeded from that project's
+measurements, because a measured starting point beats a guessed one, but **their
+*order* is now explicitly unvalidated here** and is Phase F's to settle.
+
+**No code changed for this.** The menu order is untouched, the frozen `<= 32`
+assertion is untouched, and no throughput claim is made -- spill counts are not
+timings, and this project does not rank shapes it has not timed. The measured
+table is recorded in `planar_register_pressure`'s docstring in
+`test/test_planar_kernel.jl`. Phase F must decide whether `(16,6)`/`(32,6)`
+stays at the head of the menu or whether `(24,3)`/`(48,3)` (pressure 26, zero
+spills) should lead, **on measured throughput, not on this table.**
+
+### The `vfnmadd` prediction held exactly
+
+The freeze predicted `muladd(-ai, bi, cr)` would fold its `fneg` operand into
+`vfnmadd213pd/ps`, and required verification rather than assumption. Verified on
+Julia 1.12.6, counting `accumulate`'s inner loop at every menu shape: exactly
+`MV*NR` `vfnmadd231` + `3*MV*NR` `vfmadd231` = `4*MV*NR`, with **zero** separate
+negations (the single `vxorp` per function is prologue register-zeroing). The
+hoist of `nai_v` out of the `j` loop is therefore free, not merely cheap, and
+the 1.4% worst case the freeze budgeted for does not arise.
+
+### The adapter's frozen argument-checking order was violated by keyword evaluation
+
+**Found by the blind test author**, which is precisely what that role is for.
+The freeze places the conjugated-`C` rejection in `plan_contract`, on the
+argument that this protects direct `contract!` callers too. It does -- but both
+`TO.tensorcontract!` methods pass `workspace = _qs_task_workspace(eltype(C))`
+(or open an allocator checkpoint) as an **argument** to `plan_contract`, and
+Julia evaluates arguments before the call. So a rejected call would first
+acquire and possibly `reserve!`-grow a pooled workspace: process-visible
+mutation on behalf of a call that is about to throw, at a point the frozen order
+does not mention at all.
+
+Worse, the blind author's own `@test_throws ArgumentError` for the rejection was
+**passing for the wrong reason** -- the kernel-lookup error fired first. A test
+that passes for the wrong reason is worse than a missing one.
+
+**Fixed** by performing the rejection in `_qs_prepare` as well, immediately
+after the aliasing check, which is where the frozen order puts it. The
+duplication with `plan_contract`'s check is deliberate and commented: the engine
+keeps its own so neither entry point depends on the other. The frozen order now
+reads, for adapter callers:
+
+    eligibility -> argcheck -> dimcheck -> wrap -> aliasing -> conjugated-C rejection
+
+### The complex legacy shape is over the AVX2 register budget
+
+`_rule_applies_complex` correctly refuses to *derive* a complex shape off
+`:avx512`, but the legacy fallback would still hand one back -- and `(8,6,4)`
+under planar needs 30 registers against AVX2's 16 ymm, i.e. a guaranteed
+spill. **Fixed** by gating complex kernel *construction* by ISA as well
+(`_complex_default_supported`), so on an unmeasured ISA the engine refuses to
+pick a complex kernel and says why, rather than silently shipping a
+guaranteed-spilling default. An explicitly named `kernel =` is unaffected;
+this governs only what the engine chooses on its own.
+
+This is the same policy as the shape rule and the `:neon` precedent -- derive
+where measured, refuse elsewhere -- extended one step further down.
+
+### `_op_conjugates`' throwing fallback is unreachable through `StridedView`
+
+The freeze says the guard against a silently mishandled `op` is "three things",
+one of them `_op_conjugates`' throwing fallback. That **overstates what the
+fallback contributes**: `StridedViews` bounds its own `F` parameter to
+`Union{typeof(identity), typeof(conj), typeof(adjoint), typeof(transpose)}`, so
+a fifth `op` cannot be constructed at all and the fallback can only be reached
+by calling `_op_conjugates` directly. The guarantee comes from `StridedViews`'
+type bound; the fallback is a total table that documents the reasoning and
+would catch a future widening of that bound.
+
+Kept as written -- a total table is still the right shape, and it costs nothing
+(`@noinline`, unreachable) -- but the claim is corrected here. Two consequences
+for test authors, both now pinned: constructing a `StridedView` with an
+unsupported `op` raises `TypeError`, not `ArgumentError`; and `_qs_isconj`
+short-circuits on `T <: Complex` before consulting the table, so the totality
+guarantee is complex-only. The latter is consistent with "the real path cannot
+change" but the freeze did not say it.
+
+### Also corrected at integration
+
+- `_qs_task_workspace`'s return assertion was `ContractWorkspace{T, Vector{T}}`,
+  which would have **thrown for every complex call** (the packed panels are
+  `Vector{real(T)}`). Now `ContractWorkspace{T, Vector{real(T)}}` -- still fully
+  concrete, correct on both paths. A latent bug the freeze's `VT`-relaxation
+  reasoning implied but did not spell out.
+- The frozen signature `default_blocking(v, ::Type{T}, m::ComplexMethod) where
+  {T<:Complex}` is **ambiguous** with the `RealMethod` method at
+  `(Val, Type{<:Complex}, RealMethod)` -- neither is more specific. Dropping the
+  `T <: Complex` bound resolves it (the `RealMethod` method then strictly wins,
+  and `real(T) === T` makes the arm total). Behaviour is exactly as frozen; only
+  the signature differs.
+- `_reuse_workspace`'s packed-eltype guard is currently **unreachable**: the
+  `ContractWorkspace` inner constructor forces `eltype(VT) === real(T)` and
+  `_plan_contract` checks `scalartype(kernel) === T` first. Kept as
+  defence-in-depth; it becomes load-bearing only if the pool key or the `VT`
+  invariant changes.
+- `execute_tilewise!` needed the third `_pack_sliver!` transform (as the freeze
+  warned) but **not** the `packed_a_per_k` treatment: it hands whole `tw_packed_*`
+  buffers, already sized by `packed_*_length`, which already count reals.
+
+## Complex element-type milestone: Phase D/E findings, and a correction to Phase C
+
+### Correcting the Phase C planar spill table
+
+The Phase C table above is **partly wrong, and its qualitative conclusion is
+wrong in a way that matters.** Phase D built an independent spill detector and
+ran it over both methods; the two instruments agree on some rows and not others,
+and the disagreement is diagnosable rather than mysterious.
+
+Phase D's detector counts a stack *reload* even when it appears as a folded FMA
+memory operand (`vfmadd213pd zmm, zmm, [rbp-N]`), and matches `rbp`-relative
+traffic as well as `rsp`-relative. Phase C's counted neither. Evidence that the
+newer instrument is the trustworthy one: it **reproduces both of Phase C's real
+controls exactly** — real `SIMDKernel (32,6,8)` clean at pressure 29, and real
+`(48,6,8)` at 12 stores / 12 reloads at pressure 43.
+
+| shape | Phase C | Phase D | agree? |
+| --- | --- | --- | --- |
+| real `(32,6,8)` control | 0 / 0 @ 29 | 0 / 0 @ 29 | yes |
+| real `(48,6,8)` control | 12 / 12 @ 43 | 12 / 12 @ 43 | yes |
+| planar `(24,3,8)` / `(48,3,16)` | 0 / 0 @ 26 | 0 / 0 | yes |
+| planar `(16,6,8)` / `(32,6,16)` | 26 / 3 @ 30 | 24 / 6 | ~ (same conclusion) |
+| **planar `(8,8,8)` / `(16,8,16)`** | **0 / 0 @ 20** | **15 / 8 @ 20** | **no** |
+
+**What this overturns.** Phase C reported "the transition sits between 29 and
+30", which presented spilling as monotone in the pressure number and therefore
+as something the frozen budget inequality could predict. It is not monotone:
+`(24,3,8)` at pressure **26 is clean** while `(8,8,8)` at pressure **20 spills**.
+A single scalar budget cannot order these, so the inequality
+`2*MV*NR + 2*MV + 2 <= nregisters` is a **necessary condition at best, not a
+predictor** — aspect ratio matters independently of total pressure, presumably
+through how LLVM schedules the loop-carried tuple.
+
+Consequences, and what is deliberately *not* being done:
+
+- The frozen `<= 32` assertion stays in `test/test_target.jl`. It is still a
+  sound lower bar, and weakening or complicating it on the strength of a
+  spill-count reading would be the wrong trade.
+- The menu order still stays untouched. Phase C declined to reorder on spill
+  counts; Phase D's correction makes that restraint look better, not worse --
+  the quantity the menus would have been reordered on turns out to have been
+  misread. **Spill counts are not timings.** Phase F ranks on measured
+  throughput or not at all.
+- Phase G should treat "which spill detector is right" as an open item with a
+  concrete, cheap resolution (read the two regexes against one shared `.asm`
+  dump), not as a matter of opinion.
+
+The narrower Phase C claims that survive unchanged: the reference-seeded menu
+head does spill, the real kernel at an identical NV = 24 does not, and the cost
+is mostly store-port traffic rather than a load-use chain.
+
+### Every shipped 1m shape is spill-free
+
+Measured with the Phase D detector: 1m at `(12,8,8)`, `(16,6,8)`, `(8,8,8)` and
+`(8,4,4)` is **0 stores / 0 reloads**, at pressures 28, 29, 19, 21, issuing
+exactly `MV*NR` FMAs per *real* K step. That is the expected shape of the
+result -- 1m holds `MV*NR` accumulators against planar's `2*MV*NR` -- and it is
+measured on `kernel.inner`, because the code running 1m's K loop **is** the real
+path's `accumulate`, byte for byte. That is the reuse confirmed as an executed
+fact rather than an architectural intention.
+
+### Two things the freeze got wrong about `OneMKernel`
+
+1. **The frozen field spelling is not legal Julia.**
+
+       inner::SIMDKernel{2MR, NR, real(T), W}
+
+   cannot be a struct field type: `2MR` and `real(T)` are computations on
+   `TypeVar`s (`MethodError: *(::Int, ::TypeVar)`). Fixed with a fifth type
+   parameter carrying the computed type, pinned in the inner constructor to
+   exactly `SIMDKernel{2MR, NR, real(T), W}`. `OneMKernel{MR,NR,T,W}` still
+   works for `isa` and dispatch, and the field stays concrete.
+
+2. **`W` must be even, and the freeze never says so.** The freeze's stated
+   requirement is `mod(2MR, W) == 0`, which odd `W` can satisfy -- `MR = 3,
+   W = 3` does -- while a complex row straddles a vector boundary, silently
+   breaking the `OneM` tile reader's adjacency assumption. Now enforced at
+   construction and tested. This is the kind of gap that produces a wrong
+   answer rather than an error, so it is recorded rather than quietly fixed.
+
+The adjacency assumption itself was verified rather than assumed, structurally
+(`iseven(W)` and `mod(2MR,W) == 0` give `MR == MV*(W÷2)`, so rows partition
+cleanly and `2i`, `2i+1` always land in the same vector at adjacent lanes) and
+numerically (a ramp accumulator holding `1000j + r` at real row `r`, so any
+lane or row mis-assignment is visible in the output).
+
+### 1m on Julia 1.10 is better behaved than planar
+
+Both are allocation-free on 1.12.6 at every shape. On 1.10.11, where the
+compiler cannot keep a large `NTuple{NV,Vec}` accumulator register-resident,
+`accumulate` allocates for both -- but `execute_tile!` is **0 B for every 1m
+shape** against planar's 128 B (`ComplexF64`) / 96 B (`ComplexF32`). Consistent
+with 1m holding half planar's accumulator state. Recorded because the project's
+convention is to keep the 1.10 gap visible rather than hidden; the
+`skip=(VERSION < v"1.11")` markers are on the assertions, not on the knowledge.
+
+### The end-to-end randomized oracle, and what it pins that nothing else did
+
+`test/test_macro_driver.jl` gained the fourth oracle layer: 501 randomized
+complex cases (300 `ComplexF64` + 200 `ComplexF32`, spread over every available
+(method, shape) combination) against a dense-matmul oracle that uses **its own**
+conjugation table and rule, never the engine's `_qs_isconj`/`_op_conjugates`.
+The conj/`op` cross-product is **drawn, not enumerated**, under a fixed seed,
+with the seed and full case description printed on failure.
+
+Three pins there are worth naming because no other layer provides them:
+
+- **XOR, not `||`.** `conjA = true` on a `conj`-op view must *cancel*, and the
+  conjugated answer must be a demonstrably different matrix (so the assertion
+  cannot pass vacuously).
+- **`adjoint` must conjugate with no flag set.** An implementation written as
+  `v.op === conj` -- which is what TensorOperations' own TBLIS extension does --
+  fails *only* this case. This is the totality argument of "Phase C integration
+  findings" turned into an executable test.
+- **`execute!` against `execute_tilewise!` with conjugation forced on**, plus an
+  in-loop assertion that at least one operand really is conjugated. The freeze
+  warned that a missed third `_pack_sliver!` call site would make the in-tree
+  oracle silently wrong; this is what would catch it.
+
+Cache-crossing extents are **derived** from each method's own
+`default_blocking` and the crossing asserted against the plan's *effective*
+blocking, rather than hardcoded. That matters: 1m's `mc` really is half
+planar's, so one shape provably would not have covered both methods.
+
+**Tolerance, measured.** No complex case was granted a looser tolerance than
+its real counterpart, and none needed one. Worst-case consumption of the
+allowed error budget: real 0.0017 (`Float64`) / 0.0023 (`Float32`); complex
+0.012-0.021 across planar and 1m at both precisions. So complex uses 6-9x more
+of the budget than real -- expected, since a complex MAC is four real products
+plus two adds -- while staying roughly 50x inside it. Had a complex case needed
+widening, the freeze's rule is that this is a bug signal; it did not arise.
+
+## Complex element-type milestone: Phase F measurement
+
+All on `ccqlin038` (Xeon Gold 6244, Cascade Lake, `:avx512`), Julia 1.12.6,
+single-core, 21 reps, median. **No number here transfers to another
+microarchitecture**, and none of it is wired into dispatch beyond the two
+`_shape_override` rows named below.
+
+### The register shape: the derived rule was wrong for complex by 38-41%
+
+Phase C measured the reference-seeded planar menu head spilling and declined to
+reorder the menu on spill counts, deferring it here. That was the right call and
+the deferral resolved cleanly: **the spill analysis predicted the throughput
+ranking before the ranking was measured.**
+
+`benchmark/bench_complex_efficiency.jl` arm 2, ranked by geomean of per-shape
+time normalised to the best at that shape (1.000 = best), canary spread 0.4%:
+
+| ComplexF64 | | ComplexF32 | |
+| --- | --- | --- | --- |
+| planar **24x3** | **1.055** | planar **48x3** | **1.104** |
+| 1m 16x6 | 1.116 | 1m 16x8 | 1.170 |
+| 1m 12x8 | 1.179 | 1m 24x8 | 1.172 |
+| 1m 8x8 | 1.224 | 1m 32x6 | 1.202 |
+| planar 16x6 *(what the rule derived)* | **1.452** | planar 16x8 | 1.311 |
+| planar 8x8 | 1.502 | planar 32x6 *(what the rule derived)* | **1.562** |
+
+The shape the `MR = 2W, NR = 6` rule derives was the **worst planar
+configuration measured** -- 38% off the best for `ComplexF64`, 41% for
+`ComplexF32`. The spill-free `24x3`/`48x3` shape wins outright, and beats every
+1m shape as well.
+
+**Acted on**, via the `_shape_override` hook that has existed since Phase G for
+exactly this purpose and has until now been deliberately empty:
+
+    _shape_override(::Val{:avx512}, ::Type{ComplexF64}) = (24, 3, 8)
+    _shape_override(::Val{:avx512}, ::Type{ComplexF32}) = (48, 3, 16)
+
+These are the **only swept rows in the package**, and the asymmetry with the
+real path is deliberate and worth stating: the real rule landed within noise of
+its sweep's best, so a row there would have encoded noise (Phase G's argument,
+still standing). Here a row corrects a 38-41% error. The rule itself is
+untouched and still shared with the real path; `_complex_rule_shape` was
+factored out so the rule can be tested independently of the override. Off
+`:avx512`, `_rule_applies_complex` is false and the engine never reaches
+either, so no other machine is handed a ccqlin038 constant.
+
+The planar menus were reordered to lead with the swept winner, so that the menu
+head and the shape the engine resolves to agree. **The set is unchanged** --
+only the order -- so the compiled specialization count does not move, and a
+test pins that.
+
+### The headline metric: complex is treated better than real, by a lot
+
+Complex efficiency = one engine's complex GFLOP/s over its own real GFLOP/s at
+the same shape, complex charged 8 flops/MAC (the textbook count, not reduced
+for 1m). `1.0` means complex is treated exactly as well as real.
+
+| | geomean, derived shape | geomean, swept shape |
+| --- | --- | --- |
+| `ComplexF64` | 1.256 | **1.829** |
+| `ComplexF32` | 1.457 | **1.910** |
+
+Acceptance was "geomean >= 1.0 for planar". Met before the override and
+comfortably exceeded after. For scale, the reference project measures 1.42-1.47
+on the same class of machine, so 1.83/1.91 is on the high side of the expected
+range rather than anomalous -- complex really does amortise this engine's
+packing and per-call overheads better than real, because it is 4x the flops on
+2x the bytes.
+
+The shape change is visible as much more than a geomean shift. At the derived
+shape, efficiency **fell below 1.0 at the large compute-bound sizes** -- 0.870
+at 256^3 and 0.827 at 512^3 for `ComplexF64`, 0.838 at 512^3 for `ComplexF32`
+-- exactly where the microkernel rather than the overhead is the constraint,
+and therefore exactly where a spilling kernel should hurt. After the override
+that dip is gone: 1.628 and 1.515, and 1.544. In absolute terms `ComplexF64`
+512^3 went 40.5 -> 73.7 GF/s (+82%) and `ComplexF32` 512^3 went 82.1 -> 151.8
+GF/s (+85%). Canary spread 3.0% on that run.
+
+The shape of the remaining curve is the physically expected one: efficiency is
+highest where overhead dominates (2.59 on `shallowK_256x24x256`, 2.19-2.33 on
+`smallN`) and lowest where the kernel dominates (1.32 on `smallM_12x256x256`,
+which pads every micro-tile away). Nothing here is a claim about absolute
+competitiveness against a tuned vendor library; that comparison is
+`bench_tensoroperations.jl`'s and was not re-run this milestone.
+
+### Planar remains the default, and 1m is not promoted
+
+Planar `24x3` beats every 1m shape measured, so the default is unchanged and
+`OneMMethod` stays selectable only by naming the kernel. That agrees with the
+reference project's own default, but the agreement is a coincidence of this
+machine and must not be read as a general result: **1m's best shape (1.116) is
+closer to planar's best (1.055) than planar's own worst shape is (1.452)**, so
+"planar beats 1m" is a smaller effect here than "pick the right shape". The
+reference records four different method orderings on four machines; nothing in
+this run is evidence against that.
+
+### The real-path regression guard: no regression, and the resolution is ~5%
+
+`benchmark/bench_real_path_guard.jl` (new) runs the real default path across two
+trees -- the working tree and the milestone base `114e594` -- because that
+comparison cannot be made in one process, both trees defining a module named
+`QuasiStrided`.
+
+**Corrected after the gated review.** An earlier revision of this section quoted
+"overall geomean new/base = 0.9883" from four runs per tree. That number is
+**retracted**: it does not reproduce. Re-run in ABBA order with both trees
+explicitly labelled (`QS_GUARD_LABEL`, added for this reason), the same
+comparison gives
+
+    same-tree run-to-run noise:  base geomean 0.985 (range 0.922-1.059)
+                                 head geomean 0.937 (range 0.698-1.079)
+    between-tree effect, pooled: overall 1.020   (Float64 1.027, Float32 1.014)
+                                 slower on 13 of 18, range 0.957-1.089
+    per round:                   1.045 and 0.994  -- the sign flips
+
+The between-tree difference (2.0%) is **smaller than the same-tree
+run-to-run noise** (up to 6.3% on geomean, 30% on a single point), and the
+sign flips both between rounds within a session and between sessions (0.988
+then 1.020). So the only claim this instrument supports is:
+
+> **No real-path regression detectable at this measurement's resolution, which
+> is roughly 5-6% on geomean.** There is no systematic one-sided shift -- which
+> is what a lost specialization would look like -- and the resolved kernel shape
+> is identical at every point in both trees.
+
+That is sufficient for the acceptance criterion, which asks for absence of
+regression rather than a precise figure. It is not sufficient to claim a
+speedup, and the earlier revision should not have quoted one.
+
+Two things the review was right to object to, both now fixed:
+
+- **The artefacts did not identify which tree they measured.** `results_dir()`
+  is keyed by host and date, and `git_commit()` returns a human sentence in a
+  `git archive`-extracted tree, so all four files carried the same tag and were
+  indistinguishable from a same-tree noise run. A reviewer reading
+  `benchmark/results/` could not verify the claim -- and was correct not to take
+  it on trust. Filenames now carry an explicit label, and both trees' artefacts
+  are preserved side by side under the same results directory.
+- **The base-tree run lived only in ephemeral scratch.** Note that
+  `benchmark/results/` is gitignored by long-standing project convention, so
+  *no* benchmark evidence in this package is committed; the fix is that the two
+  sides are now co-located and self-identifying on disk, not that they are in
+  git. Anyone re-deriving this needs to extract `114e594`, copy in the current
+  `benchmark/` directory (the instrument must be shared, only the engine
+  differs), and set `QS_GUARD_LABEL`.
+
+Three methodological notes, recorded because each cost time to find:
+
+- **The guard's first ordering was confounded.** Running base-then-new twice
+  means any downward drift over wall-clock makes "new" look faster; the drift
+  was real (base run 2 came in 2.7% under run 1). Re-run in ABBA order and
+  pooled over four runs per tree, which is what the numbers above are.
+- **The guard overwrote its own data.** `results_dir()` is keyed by host and
+  date, so the second run of the day silently replaced the first -- and did,
+  destroying a round before it was noticed. Filenames now carry the commit and
+  a run counter, which matters specifically because comparing the *same* tree
+  twice is how the noise floor gets established.
+- **The canary's own first sample is a warm-up artefact.** `canary[start]` reads
+  ~10% faster than `canary[middle]`/`canary[end]` in every run of that script,
+  on both trees, while the middle-to-end spread is 0.2-3.4%. So the script
+  reported an 11% "canary spread" and tripped its own quietness warning on a
+  machine that the six-canary efficiency sweep measured at 0.4%. Judge
+  quietness from the middle/end pair; the start canary is a cross-run reference
+  only. Documented in the script header.
+
+### Arm 2's ranking is block-sequential, which bounds how finely it can be read
+
+Raised by the gated review and accepted. `bench_complex_efficiency.jl`'s arm 2
+loops `for method, for shape: time every case`, so all six configurations for a
+given element type run back to back over minutes rather than interleaved. That
+is the same class of confound the real-path guard was re-run in ABBA order to
+remove, and arm 2 did not get the same treatment.
+
+What bounds it: the canary bracket immediately around each element type's arm-2
+window reads 0.4-3.0%, so drift cannot manufacture the 38-41% headline effect,
+nor most of the finer ordering. What it does *not* bound: a ~6% gap between
+adjacently ranked configurations -- planar `24x3` at 1.055 against 1m `16x6` at
+1.116 -- is only about twice the canary-bounded drift. **So the headline result
+(the derived shape is the worst planar configuration, and `24x3`/`48x3` is the
+best) is load-bearing; the finer ordering between planar's winner and 1m's
+winner is not.** Nothing in the shipped code depends on that finer ordering:
+planar is the default for reasons the freeze fixed in advance, and no
+auto-dispatch rule is derived from any of it.
+
+### Harness defects fixed en route
+
+- `benchmark/bench_kernel_shape.jl`'s `FMA_RE = r"vfmadd"` does **not** match
+  `vfnmadd` -- verified against the literal strings. A planar kernel issues
+  `MV*NR` negated FMAs per K step out of `4*MV*NR`, so the validated spill
+  detector would have undercounted planar's FMAs by a quarter and read the
+  "fmas should equal NV" check as a spurious shortfall. Now `r"vfn?madd"`.
+- `benchmark/bench_tensoroperations.jl` timed at `reps = 9`, below the standing
+  `>= 15` rule, in the script whose output the README quotes. Raised to 15. Its
+  duplication of the harness is left in place with the reason narrowed and
+  written down: the original justification ("bench_driver.jl is not a library")
+  expired when `harness.jl` was factored out, and what keeps it now is that
+  every committed number for that script was taken against its own literals.
+- Two distinct bytes-per-flop metrics now exist and are documented as distinct,
+  because conflating them credits a method for its blocking rather than its
+  format: `panel_reals_per_element` (format only -- real 2, planar 4, 1m 6, so
+  1m/planar = **1.5x**, reproducing the reference's figure from the kernels' own
+  geometry) and `packed_bytes_per_flop` (one macro block at that method's own
+  shipped blocking, which comes out near 2x because `default_blocking` halves
+  1m's `mc` and the B term dominates at the shipped `nc`).
+
+### Amendment 4: the public tier gains `PlanarKernel` and `OneMKernel`
+
+Amends "Public / internal API split: three tiers", which froze the tier
+membership at 1 exported + 9 `public` + 34 internal.
+
+`PlanarKernel` and `OneMKernel` move into the `public` tier, alongside
+`ScalarKernel` and `SIMDKernel`. The tier count becomes 1 exported + 11
+`public`.
+
+The reason is narrow and is about `OneMKernel` specifically. The freeze's
+"Method ranking does not transfer between machines" decision means the engine
+**never** selects 1m on its own -- `_default_complex_method` returns
+`PlanarMethod()` unconditionally, and no sweep result is allowed to change
+that. So the only way any caller can ever use 1m is
+`plan_contract(...; kernel = OneMKernel(...))`. A selection mechanism whose
+sole handle is an internal name is not a selection mechanism: it would make 1m
+either unreachable in practice or reachable only by writing
+`QuasiStrided.OneMKernel`, which is precisely the internal-name dependency the
+three-tier split exists to prevent.
+
+`PlanarKernel` follows for symmetry and for a second reason: it is what
+`_default_kernel` returns for a complex element type, so it appears in the type
+of any `ContractPlan` a user inspects, and in the error message when a shape or
+ISA is rejected. A name a user is shown should be a name a user may write.
+
+Nothing is exported. The single export remains `QuasiStridedBackend`.
+
+## Complex element-type milestone: Phase G gated review disposition
+
+Two gated passes, both spent; `fable_review_complex_used: true`. Neither may be
+relaunched for this milestone.
+
+### Pass 1 (Fable) — conjugation semantics and record integrity
+
+Scoped deliberately narrow, to the one area whose failure mode is a *silently
+wrong number* rather than an error. **No blocking numerical finding.** The
+reviewer could not make the engine produce a wrong answer through any
+combination of `conjA`/`conjB`, the four `op` values, either operand, either
+element type, either complex kernel, either driver, the adapter, or `@tensor` --
+1352 adapter cases, 512 direct-engine cases (each run through both `execute!`
+and `execute_tilewise!`), and 4 macro cases, all against oracles the reviewer
+wrote rather than against this suite. Zero failures.
+
+Worth recording because it strengthens the freeze's own argument: **xor is
+TensorOperations' semantics, not merely TBLIS's convention.** TO 5.8.0's
+`StridedNative` realises `conjA` as `conj(SV(A))`, and StridedViews 0.5.2
+realises `conj` on a view by flipping `op` through its `_conj` table
+(`identity<->conj`, `adjoint<->transpose`). That is conjugation *parity* by
+construction, which is xor. The freeze inferred the rule from TBLIS; it turns
+out to be forced by the upstream implementation.
+
+Also independently hand-verified, by an argument worth preserving: the 1e 2x2
+block `[[re,-im],[im,re]]` is the real matrix representation `M(z)` of
+"multiply by z". Substituting `conj(z) = (re,-im)` yields
+`[[re,im],[-im,re]] = M(conj z) = M(z)ᵀ` -- so "negate the imaginary part
+before applying the layout" and "apply the layout to `conj(z)`" *coincide*,
+which is exactly what the restated `transform` contract requires. Confirmed
+numerically: the conj-packed panel is bit-equal to a hand-written layout, and
+read back as the real 4x4 matrix the 1m inner kernel sees, times a
+planar-packed B, it reproduces `conj(A)*B` exactly and differs from `A*B`.
+Padding writes literal `+0.0`, not `-0.0`, in all four 1e reals.
+
+Findings, all fixed:
+
+- **B1 (record).** Amendment 3 claimed the "Complex element types" bullet in
+  the closing summary's "Explicitly NOT done" list had been struck. It had not.
+  A reader landing there was told complex was blocked and that `op` is ignored
+  entirely -- both false of the shipped code. The bullet is now struck in
+  place, with the original reasoning retained (struck, not deleted) because it
+  was true of the code as it then stood and is why the work was necessary.
+- **B2 (record).** Amendment 3 claimed the real-path conjugation pin test
+  "stays, textually unchanged". It was renamed, its loop widened, and a
+  complex branch added. The real-path *assertion* survives and gained
+  `Rq ≈ A * B`, so the guard is intact and stronger -- but the claim about its
+  text was false, and the freeze's "git diff shows additions, not edits" proof
+  does not hold for that file. Reworded to "kept and strengthened".
+- **S1 (source).** `src/tensoroperations.jl` contradicted itself twenty lines
+  apart: the pre-Phase-C comment still said "the adapter does not duplicate
+  it", while the Phase C comment below said the duplication is deliberate and
+  why. Phase C corrected the record but not the comment. Rewritten.
+- **S2 (record).** The "Second addendum" stood uncorrected in place while Phase
+  C reversed it 70 lines later. Now carries an in-place forward pointer, which
+  is how every other superseded section in this file is handled.
+- **N3 (docs).** `plan_contract`'s docstring still advertised
+  `kernel = SIMDKernel(Val(8), Val(6), eltype(C))` as the default; the real
+  default has been `nothing` (resolved after the M/N/K groups exist, so the
+  extent-aware demotion can see `Qm`) since Phase G. Corrected, and extended to
+  say what it resolves to per element type and that 1m is never automatic.
+
+Accepted without action: on a non-`:avx512` machine an *eligible* complex
+adapter call throws from the workspace argument's `_default_kernel` before
+`plan_contract` runs -- an `ArgumentError`, never silent, but a step the frozen
+order does not mention. It is the same keyword-evaluation ordering quirk Phase C
+found, in a case where the outcome is a loud error either way.
+
+### Pass 2 (Sonnet-High) — everything else
+
+**One blocking finding, and it was right**: the real-path regression guard's
+quoted geomean was not substantiated by the artefacts on disk. See "The
+real-path regression guard" above for the correction -- the number is retracted,
+the conclusion narrowed to what the instrument can resolve, and the artefacts
+now identify which tree they measured. This is the most valuable finding of
+either pass, because it was a claim about *evidence* rather than about code, and
+the evidence did not support it.
+
+One should-fix on arm 2's block-sequential ordering, accepted and recorded above.
+
+Independently re-measured and confirmed, with numbers, rather than taken on
+trust: **zero allocation in all 24 cells** of (2 methods x 3 shipped shapes x 2
+precisions x `accumulate`/`execute_tile!`) on a *scattered* destination -- the
+fixture class that hid a real 24 KB regression in this project before. Also
+verified by direct reading: the planar arithmetic and its plane indices across
+`zero_accumulator`/accumulate/store; 1m's adjacency argument and `(2u+1, 2u+2)`
+lane extraction, with no shipped menu entry violating it; that no complex
+accumulate or store uses a runtime tuple index; that the relaxed
+`ContractWorkspace` bound leaves no field abstract and cannot be bypassed
+(immutable struct, single constructor path, pool keyed on `T` so `real(T)` is
+fixed); that `_workspace_sizes` genuinely needs no change; that logical `kc` and
+real counts are nowhere mixed, including at `OneEFormat` edge slivers; that the
+menu reorder left the specialization *set* unchanged (pinned by a test, not
+prose); and that all 16 `skip=(VERSION < v"1.11")` markers sit on allocation
+assertions only, never shielding a correctness assertion.
+
+The reviewer also confirmed the packing tests' "guard on the guard" is real: a
+positive assertion that the conj and identity packings genuinely differ, so the
+main bitwise pin is capable of failing.
+
+### The one open item, deliberately left open
+
+"Which spill detector is right" (Phase C's versus Phase D's) is **not settled**,
+and no longer needs to be. Phase F ranked the shapes on measured throughput,
+which supersedes the spill-count question as its own tie-breaker, and both
+detectors agreed on the shape that matters. Recorded so a future reader does not
+mistake the disagreement for a live risk: it is a disagreement about an
+instrument nothing shipped now depends on.
+
+## Comment/structure cleanup pass (post-milestone)
+
+A readability and de-duplication pass over the whole tree, with no behaviour
+change: no new features, no changed defaults, no changed error messages, and
+the suite unchanged at 34480/34480. Recorded because it moved material *into*
+this file and left pointers behind, which is a change a future reader can
+otherwise mistake for lost knowledge.
+
+**The rule applied.** This project keeps `docs/decisions.md` as the
+authoritative record of *why* and source comments as pointers to it. The
+milestone that just closed wrote a great deal of narrative into the source that
+this file already held -- the planar and 1m spill tables, the `vfnmadd`
+verification, the `_shape_override` ranking, the conjugation essay, the
+real-path guard's how-to-read notes, the two bytes-per-flop metrics. Those
+source blocks were condensed to a pointer plus the load-bearing number. Two
+pieces of material lived **only** in the source and are transcribed below
+before being condensed there.
+
+**Guardrail comments were deliberately kept in place, in the source**, tightened
+but never removed: the per-argument bound-type-parameter rule (`src/kernel.jl`,
+`_pack_sliver!`), the "do not collapse the barrier methods" warning, the
+borrowed-pointer-not-`view` result (`src/panel.jl`), the literal-tuple-index
+rule (Cliff B, 24576 B), `muladd(-ai, bi, c)` over `c - ai*bi`, 1m's even-`W`
+requirement, `complex_format.jl`'s reduction-to-the-frozen-format argument,
+`ContractWorkspace`'s `eltype(VT) === real(T)` invariant, and Amendment 3's
+three conjugation comments. A guardrail is one sharp sentence in the source, not
+a pointer to this file, because the reader who needs it is editing the line
+above it.
+
+### Transcribed from `src/kernels/onem.jl`: why the induced method works
+
+`OneEFormat` A at logical K step `p` occupies `4*MR` reals laid out as two
+consecutive *real* K steps of `2*MR`:
+
+    reals   0 .. 2MR-1 :  re_0, im_0, re_1, im_1, ...
+    reals 2MR .. 4MR-1 : -im_0, re_0, -im_1, re_1, ...
+
+and `PlanarFormat` B at that step occupies `2*NR` reals as two real K steps of
+`NR` (`re_0..re_{NR-1}`, then `im_0..im_{NR-1}`). A real `SIMDKernel{2MR,NR}`
+addresses A at `i' + 2MR*p'` and B at `j + NR*p'`, which walks both buffers
+linearly -- so it reads exactly those blocks, with real step `p' = 2p` the first
+and `p' = 2p+1` the second. The real product it computes is therefore
+
+    Ar[2t,   2p] =  re(A[t,p])   Ar[2t,   2p+1] = -im(A[t,p])
+    Ar[2t+1, 2p] =  im(A[t,p])   Ar[2t+1, 2p+1] =  re(A[t,p])
+    Br[j,    2p] =  re(B[p,j])   Br[j,    2p+1] =  im(B[p,j])
+
+whose row `2t` sums `re*re - im*im` (the real part) and whose row `2t+1` sums
+`im*re + re*im` (the imaginary part). Hence the accumulator's real row `2i` is
+the real part and real row `2i+1` the imaginary part of complex row `i`, which
+is what the `(2u+1, 2u+2)` lane pair in `_store_tile_onem!` reads back.
+
+The `2*kc` doubling is confined to 1m's own `accumulate` and never appears in a
+length, an offset or a driver loop bound.
+
+### Transcribed from `src/kernels/planar.jl`: the per-shape `vfnmadd` count
+
+Phase C recorded that `muladd(-ai, bi, cr)` folds its `fneg` into
+`vfnmadd231pd`/`ps` with zero separate negations. The per-shape table behind
+that claim lived only in the source. `@code_native` on the inner loop of
+`accumulate` (Julia 1.12.6, ccqlin038, cascadelake `:avx512`), per logical K
+step -- which is the shipped form, since `execute_tile!` calls out to
+`accumulate` rather than inlining it, on the real path too:
+
+| (MR,NR,W) | eltype | vfnmadd231 | vfmadd231 | vxorp | vsubp | vmulp |
+| --- | --- | --- | --- | --- | --- | --- |
+| (16,6,8) | `ComplexF64` | 12 | 36 | 0 | 0 | 0 |
+| (24,3,8) | `ComplexF64` | 9 | 27 | 0 | 0 | 0 |
+| ( 8,8,8) | `ComplexF64` | 8 | 24 | 0 | 0 | 0 |
+| (32,6,16) | `ComplexF32` | 12 | 36 | 0 | 0 | 0 |
+| (48,3,16) | `ComplexF32` | 9 | 27 | 0 | 0 | 0 |
+| (16,8,16) | `ComplexF32` | 8 | 24 | 0 | 0 | 0 |
+
+i.e. exactly `MV*NR` vfnmadd + `3*MV*NR` vfmadd = `4*MV*NR` FMAs and **zero**
+separate negations at every menu shape, so hoisting `nai_v = -ai_v` out of the
+`j` loop is free rather than merely cheap.
+
+### What was unified, and what was deliberately left alone
+
+Unified, each as one `@inline` helper with per-argument bound type parameters so
+no specialization is lost:
+
+- `execute_tile!`'s validation sequence, previously four near-identical copies
+  (`ScalarKernel`, `SIMDKernel`, `PlanarKernel`, `OneMKernel`) -- extent checks,
+  `kc >= 0`, the `convert`s, the empty short-circuit,
+  `checked_tile_storage_bounds`, both buffer-length checks, and the
+  `kc == 0 || iszero(alpha)` branch -- as `_execute_tile_prologue!`.
+- `store_tile!`'s alpha/beta preamble across the same four, as
+  `_store_prologue!`.
+- The `pack_a!`/`pack_b!` validation preambles across all four packer methods
+  (real and complex descriptors), as `_check_pack_a`/`_check_pack_b`. The
+  *loops* are untouched, which is what keeps the real path's generated code
+  provably unchanged.
+- Constructor validation: `_check_reg_tile` (shared by `KernelDescriptor` and
+  `ComplexKernelDescriptor`), `_check_lanewidth` (all three vector kernels) and
+  `_check_mr_multiple` (`SIMDKernel` and `PlanarKernel`). Every message is
+  byte-identical to what it replaced.
+Attempted and REVERTED, with a number, because this is the interesting one:
+
+- The two `TO.tensorcontract!` methods differ only in allocator handling, and
+  merging them into a single method over a dispatched `_qs_run!` helper reads
+  better and removes a duplicated 10-line signature. It also **measures
+  worse**: `+32 B/call` (`Float64`) and `+64 B/call` (`ComplexF64`) against the
+  two-method form, on *both* allocator regimes, reproducibly, and reverting the
+  merge restores the two-method numbers exactly (3952 / 8144 B and 3952 /
+  8624 B on a 40x40x40 `@tensor` call). The extra frame changes what escapes,
+  so the `ContractPlan` stops being elided. Dispatching on the allocator was
+  preserved in the merged form, so this is not the hazard the original split
+  was guarding -- it is a new one, found only because it was measured.
+
+  Left as two methods, with a comment in `src/tensoroperations.jl` carrying the
+  numbers so the merge is not re-proposed. **Worth generalising**: "reads
+  better" and "allocates the same" are independent properties in this
+  codebase, and a readability refactor of a plan-constructing entry point needs
+  an allocation measurement even when nothing about its typing changed.
+
+Everything else below was verified allocation-neutral: zero allocations in all
+21 cells of (17 shipped kernel configurations + 4 default paths) x `execute!`
+on a **scattered** fixture -- permuted A, negative-stride B, sliced C, the
+fixture class that hid a real 24 KB regression in this project before -- and
+the shared `_execute_tile_prologue!` infers to a concrete `Tuple{Bool,T,T}`
+with a concrete `execute_tile!` return at every shipped kernel type crossed
+with every `(rows, cols)` axis-kind pair.
+
+**Left alone deliberately.** `_pack_panel!` and `_pack_panel_complex!`
+(`src/packing.jl`) are parallel loops and stay parallel. The milestone kept them
+separate so that "the real path is byte-identical" is a `git diff` fact rather
+than an argument, and unifying them would require *proving* the real path's
+generated code unchanged -- which a hoisted `emit` callback cannot be shown to
+do without a per-shape `@code_native` comparison this pass did not run. The
+shared validation was extracted instead, which captures most of the duplicated
+text at none of that risk.
+
+The independent oracles in `test/` were not shrunk: several deliberately
+re-implement a packed format so they can catch the implementation being wrong,
+and they are the evidence this pass is safe.
+
+### Amendment 5: the engine fits a complex shape to the register file; it does not refuse
+
+Amends the Phase C finding "The complex legacy shape is over the AVX2 register
+budget" and its `_complex_default_supported` gate.
+
+**Phase C was wrong, and CI proved it within minutes of the first push.** That
+gate refused to pick a complex kernel on any ISA but `:avx512`, on the argument
+that "an error beats a guaranteed-spilling default". Three of five CI jobs
+failed on it: every Linux runner is AVX2 and every macOS runner is `:neon`, so
+complex support was **unavailable through `@tensor` on every machine this
+project tests on** -- and on most machines anyone would run it on. The two
+jobs that passed were the one configuration the work was developed against.
+
+The priority was backwards. "An error beats a guaranteed spill" is defensible
+only when the user has an alternative; here they did not, and a
+slow-but-correct kernel beats no complex support at all. `_shape_override`'s
+38-41% result had also made spilling feel more expensive than it is -- a spill
+costs tens of percent, while a refusal costs everything.
+
+**What ships instead.** Off `:avx512`, `_complex_fitted_shape` selects the
+largest shape **from the menu** that this host can actually run, subject to two
+necessary conditions: `W <= hardware lanes` (a `Vec{8,Float64}` on 128-bit NEON
+is emulated across four registers, so a shape that "fits" on paper would not)
+and `_planar_pressure <= nregisters`, with an unrecognised CPU assuming 16, the
+conservative x86 baseline. On AVX2 `ComplexF64` that lands on `(4, 6, 4)` at
+pressure 16, exactly the ymm budget.
+
+Two details that are load-bearing rather than incidental:
+
+- **Selection is from the menu, not free computation.**
+  `_complex_kernel_from_shape` is `@generated` over the menu and falls through
+  to its *last* entry on no match, so a freely computed shape absent from the
+  menu would silently build a different kernel than was asked for -- worse than
+  either a spill or an error. An earlier revision of this fix did compute
+  freely, and the test that sweeps synthetic `(vector_bytes, nregisters)` pairs
+  caught it. Selecting from the menu makes the membership invariant hold by
+  construction rather than by having enumerated the right hardware.
+- **Each planar menu gained one `MV = 1` entry per lane width** (so six
+  entries, still bounded), which is what guarantees something always fits: at
+  `MV = 1, NR = 6` the pressure is `2*6 + 4 = 16`. The 1m menus are unchanged
+  at three, since 1m is never selected automatically.
+
+The extent-aware demotion also stops falling back to `_legacy_shape`, which for
+`ComplexF64` is `(8, 6, 4)` at pressure 30 -- over AVX2's budget. It now
+demotes to the fitted shape.
+
+**These off-`:avx512` shapes are unmeasured** and are not claimed to be good,
+only to run without spilling by the budget's own reckoning. The measured
+`:avx512` rows are untouched.
+
+**The pattern, recurring for the third time.** `docs/decisions.md`'s Phase G
+already recorded: "making a constant hardware-derived silently converts every
+test that asserted its old value into a platform-dependent test." Phase C made
+the complex *default* hardware-gated and thereby converted every test that asks
+for a default complex kernel into a platform-dependent test -- roughly 50 of
+them, across four files. The lesson generalises one step further than Phase G
+put it: **gating a capability on detected hardware makes the capability itself
+platform-dependent, not merely the tests.** A local suite on the one machine the
+work was developed on cannot see either.
+
+Also fixed here: the complex packing allocation assertions were missing the
+`skip=(VERSION < v"1.11")` marker that every other allocation assertion in this
+suite carries, so Julia 1.10 LTS failed on the documented compiler gap rather
+than skipping it. Marked, not weakened.
+
+### Amendment 6: per-ISA complex shape rows, and why BLIS is not the source for them
+
+Amends Amendment 5, which left the off-`:avx512` complex shapes as a
+register-budget fit with no provenance beyond "it fits".
+
+**BLIS was the first place looked, and it is the wrong source for *planar*
+shapes.** Recorded because it is a reasonable thing to try and the reasoning
+is not obvious:
+
+- This project already took what BLIS has for the real path. `_legacy_shape`
+  `(8, 6, 4)` *is* BLIS's AVX2 dgemm shape -- see "The old default was BLIS's
+  AVX2 shape, on an AVX-512 machine" in the Phase G section.
+- BLIS computes complex two ways, and neither matches planar's register
+  profile. Its native complex asm kernels work on interleaved data and spend
+  registers on shuffles, which planar needs none of; its 1m path runs *real*
+  kernels. So a BLIS complex `MR`/`NR` encodes the register needs of a
+  different method. Transplanting it would be cargo-culting a number whose
+  justification does not apply.
+- Where BLIS *does* transfer is 1m, which runs a real kernel at `2MR x NR`, so
+  BLIS's real shapes are directly meaningful there. Low value at present: 1m is
+  never selected automatically, so the shape only matters to a caller who names
+  the kernel and could name the shape too.
+- Independently, "BLIS microkernels are not reachable from `blis_jll`" (Phase G)
+  means only the published shapes were ever available, not the kernels.
+
+**The right source was the sibling `tensorcontract-rs` project**, which sweeps
+planar specifically:
+
+| ISA | row | provenance | pressure / budget |
+| --- | --- | --- | --- |
+| `:avx512` | `ComplexF64 (24,3,8)`, `ComplexF32 (48,3,16)` | swept on ccqlin038, Phase F | 26 / 32 |
+| `:neon` | `ComplexF64 (4,6,2)`, `ComplexF32 (8,6,4)` | **measured on an Apple M3 Max** (`aarch64.rs`, `cfg_neon_*`, three arms at `kc = 384`) | 30 / 32 |
+| `:avx2` | `ComplexF64 (4,5,4)`, `ComplexF32 (8,5,8)` | **modelled, unmeasured** (`cfg_avx2_f64`, labelled so there) | 14 / 16 |
+| `:unknown` | -- | register-budget fit | 14 / 16 |
+
+Two things worth separating.
+
+**NEON is a pin, not a change.** The budget fit already selected exactly the
+M3 Max winners -- `(MV, NR) = (2, 6)` for both precisions, converted through
+`MR = MV * lanes`. Pinned anyway: arriving at a measured optimum by coincidence
+is fragile, because a later menu edit would move it silently and nothing would
+notice.
+
+**AVX2 is a change, and it is an argument about headroom rather than about the
+optimum.** The fit picked `NR = 6`, whose pressure is `2*6 + 2 + 2 = 16` out of
+AVX2's 16 registers -- *zero spare*, leaving LLVM nothing for address
+arithmetic or loop counters, so it would spill something regardless of how well
+the shape otherwise suits. `NR = 5` costs 14 and leaves two; the sibling
+project's own table records the same figure as `live 14`. **The headroom
+argument is sound independently of whether 5 is the exact optimum**, which is
+the part nobody has measured. Every shipped row now has at least two spare
+registers, and a test asserts strict inequality rather than `<=`.
+
+**This cannot be measured here.** `ccqlin038` has 32 registers, so forcing an
+AVX2 *shape* on it would not exercise the 16-register constraint that motivates
+the row. It needs AVX2-only hardware, and revisiting is cheap:
+`benchmark/bench_complex_efficiency.jl` arm 2 is the sweep.
+
+One structural fix came with this. `_shape_override` was consulted *after*
+`_rule_applies_complex`, which is `:avx512`-only -- so an AVX2 or NEON row
+could never have been reached and would have been dead code. Precedence is now
+uniform: override, then the derived rule where validated, then the fit.
+
+Menu membership is unchanged in size (six planar entries per dtype): the two
+zero-spare fit shapes were *replaced* by the AVX2 rows rather than added
+alongside. A test verifies every resolved shape constructs at the shape asked
+for, which is the invariant that matters -- `_complex_kernel_from_shape` falls
+through to the menu tail on no match, so a row absent from the menu would
+silently build a different kernel.
