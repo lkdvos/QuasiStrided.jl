@@ -485,13 +485,41 @@ Sonnet-High over everything since Phase A. Neither is spent yet;
       fallback was over AVX2's register budget; and B1's seam scaffolding test
       was replaced by its inverse. **20586/20586 passing** (Julia 1.12.6), Runic
       clean, 0 failed / 0 errored.
-- [ ] **Phase D** (1m).
-- [ ] **Phase E** (remaining test layers, four disjoint files in parallel).
+- [x] **Phase D** (1m): `src/kernels/onem.jl` (new). The freeze's "nearly free"
+      claim holds — the FMA loop, packing, lengths, sliver addressing, blocking
+      and `execute_tilewise!` are all reused unchanged, and the only genuinely
+      new logic is a ~25-line generated `OneM` tile reader. Two freeze defects
+      found: the frozen `inner::SIMDKernel{2MR,NR,real(T),W}` field spelling is
+      **not legal Julia** (computations on `TypeVar`s), and **`W` must be even**
+      — a requirement the freeze never stated, and one whose violation would
+      corrupt the tile reader silently rather than error. Both fixed and tested.
+      Every shipped 1m shape is spill-free; 1m is *better* behaved than planar
+      on Julia 1.10.
+- [x] **Phase E** (end-to-end randomized oracle): `test/test_macro_driver.jl`
+      gained the fourth oracle layer — 501 randomized complex cases against a
+      dense-matmul oracle with its **own** conjugation table, the conj/`op`
+      cross-product drawn rather than enumerated under a fixed seed. Pins the
+      xor (not `||`), pins that `adjoint` conjugates with no flag set (which an
+      `op === conj` implementation fails *only* here), and pins `execute!`
+      against `execute_tilewise!` with conjugation forced on. Cache-crossing
+      extents derived from each method's own blocking, crossing asserted.
+      Purely additive: 448 insertions, 0 deletions.
 - [ ] **Phase F** (measurement on `ccqlin038`).
 - [ ] **Phase G** (the two gated reviews).
 - [ ] **Phase H** (close: `docs/decisions.md`, this file, `README.md`).
 
-**Test count: 13299 at Phase A open → 20586 after Phase C** (Julia 1.12.6).
+**Phase D also corrected Phase C.** Phase C's planar spill table presented
+spilling as monotone in a single pressure number; Phase D's detector — which
+counts folded FMA reload operands and `rbp`-relative traffic, and which
+reproduces both of Phase C's *real* controls exactly — shows it is not:
+planar `(24,3,8)` at pressure 26 is clean while `(8,8,8)` at pressure 20
+spills. So the frozen budget inequality is a necessary condition, not a
+predictor. The menu order still stays untouched and unranked, which the
+correction vindicates rather than undermines: the quantity it would have been
+reordered on was being misread. Full account in `docs/decisions.md`.
+
+**Test count: 13299 at Phase A open → 20586 after Phase C → 34468 after
+Phase E** (Julia 1.12.6, 0 failed, 0 errored, Runic clean).
 B1's acceptance criterion — the real path unchanged with no complex kernel
 wired in — was proved on an isolated tree: pristine `7503fdd` 13299/13299,
 base + B1 alone 13612/13612, 0 failed, 0 errored. The measured half of that

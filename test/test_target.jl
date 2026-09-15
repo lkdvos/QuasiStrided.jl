@@ -356,10 +356,11 @@ end
 end
 
 @testset "the complex kernel constructor is an explicit, single seam" begin
-    # Phase C wired `_complex_kernel_from_shape`'s PlanarMethod arm; the
-    # method-generic arm still throws, so an unimplemented method can never
-    # silently fall back to planar -- a substitution that would make a
-    # planar-vs-1m measurement meaningless.
+    # Phase C wired `_complex_kernel_from_shape`'s PlanarMethod arm and Phase D
+    # its OneMMethod arm; the method-generic arm still throws, so an
+    # unimplemented method can never silently fall back to one that is
+    # implemented -- a substitution that would make a planar-vs-1m measurement
+    # meaningless.
     for T in (ComplexF64, ComplexF32)
         kernel = _default_kernel(T)
         @test kernel isa QuasiStrided.PlanarKernel
@@ -371,17 +372,31 @@ end
         @test (mr(kernel), nr(kernel), lanewidth(kernel)) ===
             first(QuasiStrided.kernel_shapes(T, PlanarMethod()))
     end
-    # A method with no constructor throws, naming itself; it does not degrade
-    # to the method that does have one.
+    # 1m is now constructible (Phase D) -- but only by asking for it by name.
+    # It is still not the default, and no rule may make it one.
+    for T in (ComplexF64, ComplexF32)
+        shape = first(QuasiStrided.kernel_shapes(T, OneMMethod()))
+        kernel = QuasiStrided._complex_kernel_from_shape(shape, T, OneMMethod())
+        @test kernel isa QuasiStrided.OneMKernel
+        @test scalartype(kernel) === T
+        @test QuasiStrided.complex_method(kernel) === OneMMethod()
+        @test (mr(kernel), nr(kernel), lanewidth(kernel)) === shape
+        # ... and the engine's own choice is still planar.
+        @test _default_kernel(T) isa QuasiStrided.PlanarKernel
+    end
+    # A method with no constructor still throws, naming itself; it does not
+    # degrade to a method that does have one. `RealMethod` stands in for any
+    # such method here -- it is a `ComplexMethod` with no complex kernel, so it
+    # reaches exactly the generic arm an unimplemented complex method would.
     for T in (ComplexF64, ComplexF32)
         shape = first(QuasiStrided.kernel_shapes(T, OneMMethod()))
         err = try
-            QuasiStrided._complex_kernel_from_shape(shape, T, OneMMethod())
+            QuasiStrided._complex_kernel_from_shape(shape, T, QuasiStrided.RealMethod())
         catch e
             e
         end
         @test err isa ArgumentError
-        @test occursin("OneMMethod", err.msg)
+        @test occursin("RealMethod", err.msg)
         @test occursin(string(T), err.msg)
     end
     # The real path's default kernel is unaffected.

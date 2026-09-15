@@ -246,9 +246,9 @@ _default_kernel(::Type{T}) where {T} = _kernel_for(target_profile(), T)
 # build a concrete kernel from literal `Val`s, because a plain loop would
 # construct `Val(cand[1])` dynamically and widen to `Any`.
 #
-# `OneMMethod` has no constructor yet (src/kernels/onem.jl, Phase D); its arm
-# throws rather than silently falling back to planar, since a silent method
-# substitution would make a planar-vs-1m measurement meaningless.
+# An unimplemented method's arm throws rather than silently falling back to
+# planar, since a silent method substitution would make a planar-vs-1m
+# measurement meaningless.
 @generated function _complex_kernel_from_shape(
         shape::Tuple{Int, Int, Int}, ::Type{T}, method::PlanarMethod
     ) where {T}
@@ -262,15 +262,41 @@ _default_kernel(::Type{T}) where {T} = _kernel_for(target_profile(), T)
     return ex
 end
 
+# The 1m arm, structurally identical to the planar one above and generated over
+# 1m's OWN menu -- each method has its own measured shapes because each has its
+# own packed A format and therefore its own register budget. Deliberately a
+# second method rather than a shared generic over `M <: ComplexMethod`: keeping
+# the planar arm byte-identical is a `git diff` fact rather than an argument.
+#
+# Reaching this arm requires `_default_complex_method` to return `OneMMethod()`,
+# which it never does -- `PlanarMethod()` is the unconditional default and 1m is
+# selectable ONLY by naming the kernel (docs/decisions.md, "Method ranking does
+# not transfer between machines"). No auto-dispatch, no env var, no shape-driven
+# rule. The arm exists so that `_complex_kernel_from_shape(shape, T,
+# OneMMethod())` is total for callers -- benchmarks, and a future explicit
+# request -- that name the method themselves.
+@generated function _complex_kernel_from_shape(
+        shape::Tuple{Int, Int, Int}, ::Type{T}, method::OneMMethod
+    ) where {T}
+    shapes = kernel_shapes(T, OneMMethod())
+    ex = :(OneMKernel(Val($(shapes[end][1])), Val($(shapes[end][2])), T, Val($(shapes[end][3]))))
+    for (MR, NR, W) in reverse(shapes[1:(end - 1)])
+        ex = :(
+            shape === ($MR, $NR, $W) ? OneMKernel(Val($MR), Val($NR), T, Val($W)) : $ex
+        )
+    end
+    return ex
+end
+
 @noinline function _complex_kernel_from_shape(
         shape::Tuple{Int, Int, Int}, ::Type{T}, method
     ) where {T}
     throw(
         ArgumentError(
             "no microkernel is available for $T at shape $shape under $(method). " *
-                "Only $(PlanarMethod()) is implemented; $(OneMMethod()) is the " *
-                "complex milestone's Phase D. Pass an explicit `kernel = ...` to " *
-                "plan_contract to use a kernel this engine does not pick itself."
+                "Only $(PlanarMethod()) and $(OneMMethod()) are implemented. Pass an " *
+                "explicit `kernel = ...` to plan_contract to use a kernel this " *
+                "engine does not pick itself."
         )
     )
 end

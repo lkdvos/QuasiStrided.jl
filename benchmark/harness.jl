@@ -103,6 +103,112 @@ end
 
 const DTYPES = (Float64, Float32)
 
+# Complex dtypes are a SEPARATE constant, deliberately. `DTYPES` is what
+# `bench_driver.jl`, `bench_kernel_shape.jl` and `bench_axis_group.jl` sweep,
+# and every committed real measurement was taken over it; widening it in place
+# would silently change what those scripts mean and make the real baseline
+# incomparable with its own history.
+const CDTYPES = (ComplexF64, ComplexF32)
+const ALL_DTYPES = (DTYPES..., CDTYPES...)
+
+"""
+    flops_per_mac(::Type{T}) -> Int
+
+Real floating-point operations per multiply-accumulate: 2 for a real type, 8
+for a complex one.
+
+**8 is the textbook count and is deliberately not reduced for induced
+methods.** 1m issues fewer real multiplies than the naive four-product form,
+and 3m (out of scope here) saves 25%; charging either of them its own lower
+number would flatter its throughput and make a method comparison meaningless.
+The reference project pins the same convention for the same reason
+(`crates/tensorcontract/src/element.rs`, `FLOPS_PER_MAC`).
+"""
+flops_per_mac(::Type{T}) where {T} = T <: Complex ? 8 : 2
+
+"""
+    gflops(::Type{T}, Ma, Ka, Na, seconds) -> Float64
+
+Throughput of an `Ma x Ka x Na` contraction in GFLOP/s, charging
+[`flops_per_mac`](@ref) per multiply-accumulate.
+"""
+gflops(::Type{T}, Ma::Int, Ka::Int, Na::Int, seconds::Float64) where {T} =
+    flops_per_mac(T) * Ma * Ka * Na / seconds / 1.0e9
+
+"""
+    panel_reals_per_element(kernel) -> Int
+
+Reals a *packed panel* holds per complex element, summed over both operands:
+2 + 2 = 4 for planar, 4 + 2 = 6 for 1m. The ratio between two methods'
+values is the reference project's "bytes per flop" figure -- 6/4 = **1.5x**
+for 1m over planar -- and it is a property of the *formats alone*, independent
+of blocking, shape, or machine.
+
+This is the number to quote when comparing methods. It is **not** the same as
+[`packed_bytes_per_flop`](@ref); see that docstring for why they differ.
+"""
+panel_reals_per_element(kernel) =
+    (QuasiStrided.packed_a_per_k(kernel) ÷ QuasiStrided.mr(kernel)) +
+    (QuasiStrided.packed_b_per_k(kernel) ÷ QuasiStrided.nr(kernel))
+
+"""
+    packed_bytes_per_flop(kernel, blocking) -> Float64
+
+Packed-panel bytes streamed per useful real flop **for one macro block at this
+method's own shipped blocking**, from the kernel's packed geometry
+(`packed_a_per_k`/`packed_b_per_k`, which already account for the format) and
+the *real* element size.
+
+Reported alongside GFLOP/s because the reference project's A7 is **refuted**:
+"the three complex methods differ mainly in flop count" is false -- they differ
+mainly in bytes moved per useful flop. 3m does 25% fewer FMAs and still loses,
+because it loads three planes of both operands to do it. A flops column alone
+cannot see that; this one can.
+
+**Do not read this as the reference's 1.5x figure for 1m over planar** -- use
+[`panel_reals_per_element`](@ref) for that. Two things make this quantity
+different, both deliberate:
+
+  * It uses each method's **own** `mc`, and `default_blocking` halves 1m's to
+    hold the L2 byte budget equal. That halves the block's flops while leaving
+    the B-panel traffic unchanged, so the ratio comes out near 2x rather than
+    1.5x. That is a true statement about what the shipped configuration streams,
+    and a misleading one about the formats.
+  * At the shipped `nc` the **B term dominates** (measured: ~196k reals against
+    ~33k for A on `ComplexF64` planar), so this metric is mostly B traffic and
+    is therefore insensitive to exactly the A-side difference that distinguishes
+    1m from planar.
+
+Both quantities are worth having; conflating them would credit or blame a method
+for its blocking rather than its format.
+"""
+function packed_bytes_per_flop(kernel, blocking)
+    T = QuasiStrided.scalartype(kernel)
+    R = QuasiStrided.realtype(kernel)
+    mc, kc, nc = blocking.mc, blocking.kc, blocking.nc
+    a_reals = QuasiStrided.packed_a_per_k(kernel) * kc * cld(mc, QuasiStrided.mr(kernel))
+    b_reals = QuasiStrided.packed_b_per_k(kernel) * kc * cld(nc, QuasiStrided.nr(kernel))
+    bytes = (a_reals + b_reals) * sizeof(R)
+    flops = flops_per_mac(T) * mc * kc * nc
+    return bytes / flops
+end
+
+"""
+    complex_efficiency(gf_complex, gf_real) -> Float64
+
+The milestone's headline metric: one engine's complex throughput divided by its
+own real throughput at the same shape, with complex charged 8 flops/MAC.
+
+`1.0` means complex is treated exactly as well as real. It should exceed 1:
+complex is 4x the flops on 2x the bytes, i.e. **twice the arithmetic
+intensity**, so packing and per-call overheads amortise *better*. The reference
+project measures 1.42-1.47 and replicates it on two microarchitectures.
+
+Below ~0.9 indicates a structural overhead specific to complex -- a packing
+cost or an accumulator spill -- and is a finding, not a result to publish.
+"""
+complex_efficiency(gf_complex::Float64, gf_real::Float64) = gf_complex / gf_real
+
 # ---------------------------------------------------------------------------
 # Ranking
 # ---------------------------------------------------------------------------

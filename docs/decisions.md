@@ -2628,3 +2628,135 @@ change" but the freeze did not say it.
 - `execute_tilewise!` needed the third `_pack_sliver!` transform (as the freeze
   warned) but **not** the `packed_a_per_k` treatment: it hands whole `tw_packed_*`
   buffers, already sized by `packed_*_length`, which already count reals.
+
+## Complex element-type milestone: Phase D/E findings, and a correction to Phase C
+
+### Correcting the Phase C planar spill table
+
+The Phase C table above is **partly wrong, and its qualitative conclusion is
+wrong in a way that matters.** Phase D built an independent spill detector and
+ran it over both methods; the two instruments agree on some rows and not others,
+and the disagreement is diagnosable rather than mysterious.
+
+Phase D's detector counts a stack *reload* even when it appears as a folded FMA
+memory operand (`vfmadd213pd zmm, zmm, [rbp-N]`), and matches `rbp`-relative
+traffic as well as `rsp`-relative. Phase C's counted neither. Evidence that the
+newer instrument is the trustworthy one: it **reproduces both of Phase C's real
+controls exactly** — real `SIMDKernel (32,6,8)` clean at pressure 29, and real
+`(48,6,8)` at 12 stores / 12 reloads at pressure 43.
+
+| shape | Phase C | Phase D | agree? |
+| --- | --- | --- | --- |
+| real `(32,6,8)` control | 0 / 0 @ 29 | 0 / 0 @ 29 | yes |
+| real `(48,6,8)` control | 12 / 12 @ 43 | 12 / 12 @ 43 | yes |
+| planar `(24,3,8)` / `(48,3,16)` | 0 / 0 @ 26 | 0 / 0 | yes |
+| planar `(16,6,8)` / `(32,6,16)` | 26 / 3 @ 30 | 24 / 6 | ~ (same conclusion) |
+| **planar `(8,8,8)` / `(16,8,16)`** | **0 / 0 @ 20** | **15 / 8 @ 20** | **no** |
+
+**What this overturns.** Phase C reported "the transition sits between 29 and
+30", which presented spilling as monotone in the pressure number and therefore
+as something the frozen budget inequality could predict. It is not monotone:
+`(24,3,8)` at pressure **26 is clean** while `(8,8,8)` at pressure **20 spills**.
+A single scalar budget cannot order these, so the inequality
+`2*MV*NR + 2*MV + 2 <= nregisters` is a **necessary condition at best, not a
+predictor** — aspect ratio matters independently of total pressure, presumably
+through how LLVM schedules the loop-carried tuple.
+
+Consequences, and what is deliberately *not* being done:
+
+- The frozen `<= 32` assertion stays in `test/test_target.jl`. It is still a
+  sound lower bar, and weakening or complicating it on the strength of a
+  spill-count reading would be the wrong trade.
+- The menu order still stays untouched. Phase C declined to reorder on spill
+  counts; Phase D's correction makes that restraint look better, not worse --
+  the quantity the menus would have been reordered on turns out to have been
+  misread. **Spill counts are not timings.** Phase F ranks on measured
+  throughput or not at all.
+- Phase G should treat "which spill detector is right" as an open item with a
+  concrete, cheap resolution (read the two regexes against one shared `.asm`
+  dump), not as a matter of opinion.
+
+The narrower Phase C claims that survive unchanged: the reference-seeded menu
+head does spill, the real kernel at an identical NV = 24 does not, and the cost
+is mostly store-port traffic rather than a load-use chain.
+
+### Every shipped 1m shape is spill-free
+
+Measured with the Phase D detector: 1m at `(12,8,8)`, `(16,6,8)`, `(8,8,8)` and
+`(8,4,4)` is **0 stores / 0 reloads**, at pressures 28, 29, 19, 21, issuing
+exactly `MV*NR` FMAs per *real* K step. That is the expected shape of the
+result -- 1m holds `MV*NR` accumulators against planar's `2*MV*NR` -- and it is
+measured on `kernel.inner`, because the code running 1m's K loop **is** the real
+path's `accumulate`, byte for byte. That is the reuse confirmed as an executed
+fact rather than an architectural intention.
+
+### Two things the freeze got wrong about `OneMKernel`
+
+1. **The frozen field spelling is not legal Julia.**
+
+       inner::SIMDKernel{2MR, NR, real(T), W}
+
+   cannot be a struct field type: `2MR` and `real(T)` are computations on
+   `TypeVar`s (`MethodError: *(::Int, ::TypeVar)`). Fixed with a fifth type
+   parameter carrying the computed type, pinned in the inner constructor to
+   exactly `SIMDKernel{2MR, NR, real(T), W}`. `OneMKernel{MR,NR,T,W}` still
+   works for `isa` and dispatch, and the field stays concrete.
+
+2. **`W` must be even, and the freeze never says so.** The freeze's stated
+   requirement is `mod(2MR, W) == 0`, which odd `W` can satisfy -- `MR = 3,
+   W = 3` does -- while a complex row straddles a vector boundary, silently
+   breaking the `OneM` tile reader's adjacency assumption. Now enforced at
+   construction and tested. This is the kind of gap that produces a wrong
+   answer rather than an error, so it is recorded rather than quietly fixed.
+
+The adjacency assumption itself was verified rather than assumed, structurally
+(`iseven(W)` and `mod(2MR,W) == 0` give `MR == MV*(W÷2)`, so rows partition
+cleanly and `2i`, `2i+1` always land in the same vector at adjacent lanes) and
+numerically (a ramp accumulator holding `1000j + r` at real row `r`, so any
+lane or row mis-assignment is visible in the output).
+
+### 1m on Julia 1.10 is better behaved than planar
+
+Both are allocation-free on 1.12.6 at every shape. On 1.10.11, where the
+compiler cannot keep a large `NTuple{NV,Vec}` accumulator register-resident,
+`accumulate` allocates for both -- but `execute_tile!` is **0 B for every 1m
+shape** against planar's 128 B (`ComplexF64`) / 96 B (`ComplexF32`). Consistent
+with 1m holding half planar's accumulator state. Recorded because the project's
+convention is to keep the 1.10 gap visible rather than hidden; the
+`skip=(VERSION < v"1.11")` markers are on the assertions, not on the knowledge.
+
+### The end-to-end randomized oracle, and what it pins that nothing else did
+
+`test/test_macro_driver.jl` gained the fourth oracle layer: 501 randomized
+complex cases (300 `ComplexF64` + 200 `ComplexF32`, spread over every available
+(method, shape) combination) against a dense-matmul oracle that uses **its own**
+conjugation table and rule, never the engine's `_qs_isconj`/`_op_conjugates`.
+The conj/`op` cross-product is **drawn, not enumerated**, under a fixed seed,
+with the seed and full case description printed on failure.
+
+Three pins there are worth naming because no other layer provides them:
+
+- **XOR, not `||`.** `conjA = true` on a `conj`-op view must *cancel*, and the
+  conjugated answer must be a demonstrably different matrix (so the assertion
+  cannot pass vacuously).
+- **`adjoint` must conjugate with no flag set.** An implementation written as
+  `v.op === conj` -- which is what TensorOperations' own TBLIS extension does --
+  fails *only* this case. This is the totality argument of "Phase C integration
+  findings" turned into an executable test.
+- **`execute!` against `execute_tilewise!` with conjugation forced on**, plus an
+  in-loop assertion that at least one operand really is conjugated. The freeze
+  warned that a missed third `_pack_sliver!` call site would make the in-tree
+  oracle silently wrong; this is what would catch it.
+
+Cache-crossing extents are **derived** from each method's own
+`default_blocking` and the crossing asserted against the plan's *effective*
+blocking, rather than hardcoded. That matters: 1m's `mc` really is half
+planar's, so one shape provably would not have covered both methods.
+
+**Tolerance, measured.** No complex case was granted a looser tolerance than
+its real counterpart, and none needed one. Worst-case consumption of the
+allowed error budget: real 0.0017 (`Float64`) / 0.0023 (`Float32`); complex
+0.012-0.021 across planar and 1m at both precisions. So complex uses 6-9x more
+of the budget than real -- expected, since a complex MAC is four real products
+plus two adds -- while staying roughly 50x inside it. Had a complex case needed
+widening, the freeze's rule is that this is a bug signal; it did not arise.

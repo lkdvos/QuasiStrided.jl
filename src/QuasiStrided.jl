@@ -29,6 +29,9 @@ include("kernels/simd.jl")
 # --- Complex milestone: planar (split-complex) microkernel ---
 include("kernels/planar.jl")
 
+# --- Complex milestone: 1m (induced) microkernel, reusing the real body ---
+include("kernels/onem.jl")
+
 # --- Macro-blocking milestone: BLIS five-loop driver ---
 include("blocking.jl")
 

@@ -30,8 +30,14 @@ if NTHREADS != 1
 end
 
 # Warm up once (discarded), then `reps` timed calls; median, not mean.
-# Identical convention to benchmark/bench_driver.jl's `median_time_s`.
-function median_time_s(f!::Function; reps::Int = 9)
+# Identical convention to benchmark/harness.jl's `median_time_s`.
+#
+# `reps` was 9, which is below this project's standing discipline: ccqlin038 is
+# not reliably exclusive, canary spreads of 4-15% are normal, and an 11-rep
+# comparison in the panel-addressing milestone invented two regressions that 21
+# reps erased (STATUS.md, "Measurement hygiene"). 15 is the floor; pass more for
+# anything whose conclusion depends on a difference under ~10%.
+function median_time_s(f!::Function; reps::Int = 15)
     f!()  # warm-up, discarded
     ts = Vector{Float64}(undef, reps)
     for r in 1:reps
@@ -43,9 +49,19 @@ function median_time_s(f!::Function; reps::Int = 9)
     return median(ts)
 end
 
-# Same shape grid as benchmark/bench_driver.jl's MAIN_SHAPES + EXTRA_SHAPES
+# Same shape grid as benchmark/harness.jl's MAIN_SHAPES + EXTRA_SHAPES
 # (matrix-shaped contraction C[m,n] = A[m,k]*B[k,n]), reproduced here verbatim
-# rather than included: bench_driver.jl is not meant to be used as a library.
+# rather than included.
+#
+# The original reason -- "bench_driver.jl is not meant to be used as a library"
+# -- expired when the hardware-derived-register-shape milestone factored
+# `benchmark/harness.jl` out of it for exactly this purpose. What keeps the
+# duplication now is narrower and worth stating rather than silently fixing:
+# every committed number in `benchmark/results/` for this script was taken
+# against these literals, and this is the script whose output the README quotes.
+# Collapsing onto the harness is a safe cleanup only when done together with a
+# re-run, not as a drive-by edit. Until then the two must be kept in step by
+# hand; they are identical today.
 struct ShapeSpec
     name::String
     Ma::Int
