@@ -2915,3 +2915,30 @@ Three methodological notes, recorded because each cost time to find:
   geometry) and `packed_bytes_per_flop` (one macro block at that method's own
   shipped blocking, which comes out near 2x because `default_blocking` halves
   1m's `mc` and the B term dominates at the shipped `nc`).
+
+### Amendment 4: the public tier gains `PlanarKernel` and `OneMKernel`
+
+Amends "Public / internal API split: three tiers", which froze the tier
+membership at 1 exported + 9 `public` + 34 internal.
+
+`PlanarKernel` and `OneMKernel` move into the `public` tier, alongside
+`ScalarKernel` and `SIMDKernel`. The tier count becomes 1 exported + 11
+`public`.
+
+The reason is narrow and is about `OneMKernel` specifically. The freeze's
+"Method ranking does not transfer between machines" decision means the engine
+**never** selects 1m on its own -- `_default_complex_method` returns
+`PlanarMethod()` unconditionally, and no sweep result is allowed to change
+that. So the only way any caller can ever use 1m is
+`plan_contract(...; kernel = OneMKernel(...))`. A selection mechanism whose
+sole handle is an internal name is not a selection mechanism: it would make 1m
+either unreachable in practice or reachable only by writing
+`QuasiStrided.OneMKernel`, which is precisely the internal-name dependency the
+three-tier split exists to prevent.
+
+`PlanarKernel` follows for symmetry and for a second reason: it is what
+`_default_kernel` returns for a complex element type, so it appears in the type
+of any `ContractPlan` a user inspects, and in the error message when a shape or
+ISA is rejected. A name a user is shown should be a name a user may write.
+
+Nothing is exported. The single export remains `QuasiStridedBackend`.

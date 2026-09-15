@@ -57,7 +57,15 @@ end
         Expr(
             :public, :contract!, :plan_contract, :execute!, :ContractPlan,
             :ContractWorkspace, :Blocking, :default_blocking,
-            :ScalarKernel, :SIMDKernel, :target_profile, :cache_topology,
+            :ScalarKernel, :SIMDKernel,
+            # Complex milestone. `PlanarKernel` is the default for a complex
+            # element type, and `OneMKernel` is reachable ONLY by naming it in
+            # `plan_contract(...; kernel = ...)` -- the engine never picks it,
+            # deliberately. A selection mechanism whose only handle is an
+            # internal name is not a selection mechanism, so both belong in
+            # this tier alongside `ScalarKernel`/`SIMDKernel`.
+            :PlanarKernel, :OneMKernel,
+            :target_profile, :cache_topology,
             :TargetProfile, :CacheLevel
         )
     )
