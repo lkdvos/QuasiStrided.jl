@@ -3398,3 +3398,126 @@ alongside. A test verifies every resolved shape constructs at the shape asked
 for, which is the invariant that matters -- `_complex_kernel_from_shape` falls
 through to the menu tail on no match, so a row absent from the menu would
 silently build a different kernel.
+
+## Store fast-path investigation: Phase A
+
+Opened 2026-09-15 on branch `store-fastpath-investigation`, base `main`
+(`71c1536`). Follow-up to the (unmerged) upstream TensorOperations.jl
+benchmark-suite comparison milestone
+(`https://github.com/lkdvos/QuasiStrided.jl/pull/5`, branch `upstream-bench`),
+whose profiling triage found the `ccsd_t_*_dim16` regression class (six-index
+output, 6.6-14.2x slower than `StridedBLAS`) traced to two separable,
+**unverified** causes: (A) the vectorized store fast-path guard in
+`src/kernels/simd.jl:217` (`_unit_stride_rows(destination.rows) &&
+destination.storage isa Vector{T}`) appearing unsatisfiable for any
+`Array`-backed destination; (B) that specific case class's output exceeding
+L3 with a cache/TLB-unfriendly stride pattern. This milestone resolves Cause
+A with evidence before touching anything, per this project's standing
+"scout/measure before committing" convention (macro-blocking Phase A,
+register-shape milestone).
+
+### Non-goals (frozen for this milestone)
+
+`QuasiStridedBackend`'s hard-reject/no-fallback invariant; the macro-blocking
+five-loop structure in `src/driver.jl`; the register-shape/blocking constant
+derivation in `src/target.jl`; a general fix for Cause B (output-side
+blocking or an accepted temp, like `StridedBLAS`'s own strategy); a wider
+profiling sweep across more upstream-suite cases (the prior triage explicitly
+recommended against this); repointing the `TensorOperationsBenchmarks`
+dependency (PR #303 upstream confirmed still unmerged, 2026-09-15, via `gh pr
+view 303 --repo QuantumKitHub/TensorOperations.jl`).
+
+### Planning-time evidence (E1-E7), to be confirmed or refuted by T1-T3
+
+- **E1.** The guard is analytically dead on every real driver path on Julia
+  >= 1.11, and live on Julia 1.10. The only destination-tile constructor on
+  the real path is `src/driver.jl:815` (`Cstorage = parent(C)`, inside
+  `_plan_contract(C::StridedView, ...)` at `:776`). StridedViews v0.5.2
+  (`~/.julia/packages/StridedViews/MHBDj/src/auxiliary.jl:50-55`) resolves
+  `parent` of an `Array`-backed `StridedView` to `Memory{T}` under `@static
+  if isdefined(Core, :Memory)` (true on 1.11+), and to a `Vector{T}` sharing
+  memory otherwise (1.10). The reference machine (`ccqlin038`) has run Julia
+  1.12.6 for this whole project, so **no driver-level real-path number ever
+  recorded here used the vectorized store**.
+- **E2.** `SIMD.jl` v3.7.2's `vload`/`vstore` array methods are defined on
+  `FastContiguousArray{T,1}` (`~/.julia/packages/SIMD/UiGbs/src/arrayops.jl`),
+  and `Memory{T} <: DenseVector{T}` -- no API gap is expected, but must be
+  confirmed by direct call (T1), not assumed.
+- **E3 (analytical prediction, T1/T3 confirm empirically).** In all four
+  `ccsd_t_*` equations the destination's M-composite's first label has a
+  large C-stride (e.g. `i`'s stride is 16^3 = 4096 for `dim=16`) and the
+  N-composite's first label likewise (`k` or `j`, stride 16^5 or 65536) --
+  every micro-tile's rows are a *regular but non-unit-stride* `AffineAxis`.
+  **`_unit_stride_rows` is predicted false for every tile in these four
+  cases regardless of storage type** -- so even a fully-restored fast path
+  would change nothing for the actual regression. If T1/T3 instead find a
+  unit-stride sliver in any of the four cases, that refutes E3 and the
+  attribution below must be redone before any fix decision.
+- **E4.** The `ccsd_t_1` flat profile (prior milestone,
+  `benchmark/results/ccqlin038.flatironinstitute.org-2026-09-15/profiles/ccsd_t_1_dim16-QuasiStridedComposite.flat.txt`)
+  shows `_store_tile_scattered!` dominating (19014 of 25182 `execute_tile!`
+  samples), confirming the store, not the FMA, is where time goes on this
+  case -- but the prior milestone's own `*.buckets.txt` files classify
+  88-96% of *all* samples as `other` because they also count the idle
+  profile-listener thread; do not cite those bucket percentages as if they
+  were the store's true share.
+- **E5.** The "SIMDKernel reaches 101-103 GFLOP/s, ~88% of peak" claim
+  (this file, "Attributed 2026-09-11 (Phase G...)" blockquote above) was an
+  **accumulate-only** isolated microkernel measurement (Float64, `kc=256`),
+  never through `store_tile!` at all, and is not reproduced by any script
+  currently committed to the tree (`benchmark/bench_kernel_shape.jl` times
+  `execute!` through the full driver, not a standalone tile). So that number
+  is unrelated to Cause A in either direction -- it neither used nor was
+  degraded by the scattered-store path. `benchmark/bench_kernel_shape.jl`'s
+  own driver-level numbers, and every other driver-level number in this
+  project's history, **were** taken on the scattered-store path, since the
+  driver has always gone through `Cstorage = parent(C)` on this project's
+  one measurement machine.
+- **E6.** Restoring the fast path is not a one-line change: its tail loop
+  (`simd.jl:234-238`) indexes the accumulator tuple dynamically, which is
+  exactly the allocation-cliff pattern the GUARDRAIL comment at
+  `simd.jl:158-166` forbids above `NV = 16` -- currently harmless only
+  because the branch is dead on 1.11+. A restored fast path needs a
+  statically-indexed tail (mirroring `_store_tile_scattered!`'s own
+  generated-code style), and the guard must stay rank-1
+  (`DenseVector{T}`, not `DenseArray{T}`) since SIMD's array methods only
+  exist for rank-1 arrays.
+- **E7.** `benchmark/bench_to_suite.jl`/`profile_to_suite.jl`/
+  `composite_backend.jl`/`benchmark/Project.toml` exist only on the unmerged
+  `upstream-bench` branch (PR #5). This milestone does not merge or rebase
+  onto that branch (two open PRs would become entangled); it recreates a
+  minimal, self-contained control script instead (`benchmark/bench_ccsd_t_store.jl`),
+  and its docs section cross-references PR #5's section by title rather than
+  duplicating it. Expect a trivial append-conflict between the two PRs at
+  merge time.
+
+### Decision boundaries (fixed now, before any `src/` edit)
+
+Choose **(a) fix** the guard only if: T1 confirms `vload`/`vstore` on
+`Memory{T}` is correct and allocation-free; T1/T3 confirm E3 (so the fix is
+not motivated by a false belief that it closes the regression); and T2's
+tile-level measurement shows a real, above-noise gain at the shipped
+register shapes from a genuine `Vector`/`Memory` destination taking the fast
+path. Choose **(b) docs-only correction** if T2 shows no tile-level gain at
+any shipped shape, or if a fix cannot reach zero steady-state allocation at
+the shipped register shapes (`NV` up to 28) with tail rows without touching
+`src/driver.jl`/`src/target.jl`/`src/blocking.jl` (frozen, non-goals above) --
+in that case the code is left as-is, the guard gets a comment stating its
+per-Julia-version reachability, and the deferral is recorded here. Choose
+**(c) escalate to the user** if T1 finds `SIMD.jl` misbehaves on
+`Memory{T}` (wrong results or allocation) -- a pointer-based store would then
+be a new design question, not a bug fix.
+
+**Replanning triggers**: T1/T3 finds a unit-stride C row in any of the four
+regression cases (E3 refuted -- redo the attribution before deciding
+anything); a fix would require touching `src/driver.jl`/`src/target.jl`/
+`src/blocking.jl`; the re-measurement shows a one-sided regression across
+shapes after a fix; the C-local label-order control (Arm 3) in
+`bench_ccsd_t_store.jl` runs materially faster than the adapter's own label
+order (Arm 1) on the `dim=16` cases -- that would point at a different,
+product-level lever (`_classify_labels`'s label ordering, currently pinned
+by an existing test) requiring the user's decision as a separate follow-up,
+not something this milestone acts on unilaterally.
+
+Review budget: one gated pass (independent review, after docs are written),
+`fable_review_storefastpath_used: false` -- not yet spent.

@@ -652,3 +652,41 @@ anything runs. And on the *first* full run after that, Aqua's
 subprocess, which on a cold depot has to precompile first (observed here at
 2m24s, against 5.5s once warm). It is not a real failure — re-run the suite,
 and check it in isolation before believing it.
+
+## Store fast-path investigation milestone — open
+
+Opened 2026-09-15 on branch `store-fastpath-investigation`, base `main`
+(`71c1536`). Follow-up to the (unmerged) upstream TensorOperations.jl
+benchmark-suite comparison (`https://github.com/lkdvos/QuasiStrided.jl/pull/5`,
+branch `upstream-bench`), which found and triaged one regression class
+(`ccsd_t_*_dim16`, six-index output, 6.6-14.2x slower than `StridedBLAS`) to
+two separable, unverified causes. Goal here: resolve Cause A (the vectorized
+store fast-path guard in `src/kernels/simd.jl:217` appears unsatisfiable for
+any `Array`-backed destination on Julia >= 1.11) with evidence, execute
+whichever of (a) fix / (b) docs-only correction / (c) escalate the evidence
+actually supports, then re-measure the four regression cases with controls
+that separate Cause A's contribution from Cause B's (the cache/TLB-driven
+cost on very large, non-monotonically-strided outputs, left explicitly
+out of scope for a fix here). Full design, every frozen decision boundary,
+and the planning-time evidence (E1-E7) are in `docs/decisions.md`, "Store
+fast-path investigation: Phase A" — that file, not this one, is authoritative
+for *why*.
+
+Non-goals: `QuasiStridedBackend`'s hard-reject invariant, the macro-blocking
+five-loop structure, `src/target.jl`'s register-shape derivation, a general
+fix for Cause B, a wider profiling sweep, repointing the `TensorOperationsBenchmarks`
+dependency (PR #303 upstream still unmerged, confirmed 2026-09-15).
+
+- [ ] **T1** (fact probes: storage-type reachability per Julia version, SIMD.jl
+      on `Memory{T}`, the four regression cases' actual C-side stride layout,
+      provenance of the "101-103 GFLOP/s" claim).
+- [ ] **T2** (tile-level store-path microbenchmark).
+- [ ] **T3** (ccsd_t regression + control script, no timing run yet).
+- [ ] **Decision gate** (fix / docs-only / escalate, per the evidence).
+- [ ] **T4** (fix, if the gate selects it — `src/kernels/simd.jl` +
+      `test/test_simd_kernel.jl` + one `test/test_driver.jl` testset only).
+- [ ] **T5** (measurement campaign).
+- [ ] **T7** (docs).
+- [ ] **T8** (one gated independent review — `fable_review_storefastpath_used`
+      not yet spent).
+- [ ] **T9/T10** (fix findings, close, PR).
