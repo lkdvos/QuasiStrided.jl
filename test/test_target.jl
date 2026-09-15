@@ -430,9 +430,24 @@ end
         @test QuasiStrided.realtype(kernel) === real(T)
         @test QuasiStrided.complex_method(kernel) === PlanarMethod()
         @test QuasiStrided._default_complex_method(T) === PlanarMethod()
-        # The default resolves to the head of that method's own menu.
-        @test (mr(kernel), nr(kernel), lanewidth(kernel)) ===
-            first(QuasiStrided.kernel_shapes(T, PlanarMethod()))
+
+        # What holds on EVERY host: the resolved shape is in the menu (so the
+        # `@generated` dispatch cannot have fallen through to the menu tail)
+        # and fits the detected register file.
+        shape = (mr(kernel), nr(kernel), lanewidth(kernel))
+        @test shape in QuasiStrided.kernel_shapes(T, PlanarMethod())
+        profile = QuasiStrided.target_profile()
+        budget = profile.nregisters > 0 ? profile.nregisters : 16
+        @test QuasiStrided._planar_pressure(shape...) <= budget
+
+        # Menu HEADSHIP holds only on `:avx512`, where the swept override
+        # applies. Asserting it unconditionally is what made an earlier
+        # revision of this testset fail on CI's AVX2 and NEON runners -- the
+        # engine was right and the test was machine-dependent. Third instance
+        # of that pattern in this project; see Amendment 5.
+        if profile.isa === :avx512
+            @test shape === first(QuasiStrided.kernel_shapes(T, PlanarMethod()))
+        end
     end
     # 1m is now constructible (Phase D) -- but only by asking for it by name.
     # It is still not the default, and no rule may make it one.

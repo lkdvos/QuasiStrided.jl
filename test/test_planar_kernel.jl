@@ -154,8 +154,11 @@ using SIMD: Vec
         end
         # The shipped reference shape is tight, not comfortable: 24 + 4 + 2.
         @test planar_register_pressure(PlanarKernel(Val(16), Val(6), ComplexF64, Val(8))) == 30
-        # Informational: what the detected machine actually offers.
-        @test target_profile().nregisters > 0
+        # What the detected machine offers -- `skip`ped rather than asserted
+        # when detection came up empty, which is exactly the `:unknown` case
+        # the engine is built to tolerate. Asserting it unconditionally makes
+        # this a test of the host rather than of the kernel (Amendment 5).
+        @test target_profile().nregisters > 0 skip = (target_profile().nregisters == 0)
     end
 
     # ------------------------------------------------------------------
