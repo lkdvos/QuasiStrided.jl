@@ -2760,3 +2760,158 @@ allowed error budget: real 0.0017 (`Float64`) / 0.0023 (`Float32`); complex
 of the budget than real -- expected, since a complex MAC is four real products
 plus two adds -- while staying roughly 50x inside it. Had a complex case needed
 widening, the freeze's rule is that this is a bug signal; it did not arise.
+
+## Complex element-type milestone: Phase F measurement
+
+All on `ccqlin038` (Xeon Gold 6244, Cascade Lake, `:avx512`), Julia 1.12.6,
+single-core, 21 reps, median. **No number here transfers to another
+microarchitecture**, and none of it is wired into dispatch beyond the two
+`_shape_override` rows named below.
+
+### The register shape: the derived rule was wrong for complex by 38-41%
+
+Phase C measured the reference-seeded planar menu head spilling and declined to
+reorder the menu on spill counts, deferring it here. That was the right call and
+the deferral resolved cleanly: **the spill analysis predicted the throughput
+ranking before the ranking was measured.**
+
+`benchmark/bench_complex_efficiency.jl` arm 2, ranked by geomean of per-shape
+time normalised to the best at that shape (1.000 = best), canary spread 0.4%:
+
+| ComplexF64 | | ComplexF32 | |
+| --- | --- | --- | --- |
+| planar **24x3** | **1.055** | planar **48x3** | **1.104** |
+| 1m 16x6 | 1.116 | 1m 16x8 | 1.170 |
+| 1m 12x8 | 1.179 | 1m 24x8 | 1.172 |
+| 1m 8x8 | 1.224 | 1m 32x6 | 1.202 |
+| planar 16x6 *(what the rule derived)* | **1.452** | planar 16x8 | 1.311 |
+| planar 8x8 | 1.502 | planar 32x6 *(what the rule derived)* | **1.562** |
+
+The shape the `MR = 2W, NR = 6` rule derives was the **worst planar
+configuration measured** -- 38% off the best for `ComplexF64`, 41% for
+`ComplexF32`. The spill-free `24x3`/`48x3` shape wins outright, and beats every
+1m shape as well.
+
+**Acted on**, via the `_shape_override` hook that has existed since Phase G for
+exactly this purpose and has until now been deliberately empty:
+
+    _shape_override(::Val{:avx512}, ::Type{ComplexF64}) = (24, 3, 8)
+    _shape_override(::Val{:avx512}, ::Type{ComplexF32}) = (48, 3, 16)
+
+These are the **only swept rows in the package**, and the asymmetry with the
+real path is deliberate and worth stating: the real rule landed within noise of
+its sweep's best, so a row there would have encoded noise (Phase G's argument,
+still standing). Here a row corrects a 38-41% error. The rule itself is
+untouched and still shared with the real path; `_complex_rule_shape` was
+factored out so the rule can be tested independently of the override. Off
+`:avx512`, `_rule_applies_complex` is false and the engine never reaches
+either, so no other machine is handed a ccqlin038 constant.
+
+The planar menus were reordered to lead with the swept winner, so that the menu
+head and the shape the engine resolves to agree. **The set is unchanged** --
+only the order -- so the compiled specialization count does not move, and a
+test pins that.
+
+### The headline metric: complex is treated better than real, by a lot
+
+Complex efficiency = one engine's complex GFLOP/s over its own real GFLOP/s at
+the same shape, complex charged 8 flops/MAC (the textbook count, not reduced
+for 1m). `1.0` means complex is treated exactly as well as real.
+
+| | geomean, derived shape | geomean, swept shape |
+| --- | --- | --- |
+| `ComplexF64` | 1.256 | **1.829** |
+| `ComplexF32` | 1.457 | **1.910** |
+
+Acceptance was "geomean >= 1.0 for planar". Met before the override and
+comfortably exceeded after. For scale, the reference project measures 1.42-1.47
+on the same class of machine, so 1.83/1.91 is on the high side of the expected
+range rather than anomalous -- complex really does amortise this engine's
+packing and per-call overheads better than real, because it is 4x the flops on
+2x the bytes.
+
+The shape change is visible as much more than a geomean shift. At the derived
+shape, efficiency **fell below 1.0 at the large compute-bound sizes** -- 0.870
+at 256^3 and 0.827 at 512^3 for `ComplexF64`, 0.838 at 512^3 for `ComplexF32`
+-- exactly where the microkernel rather than the overhead is the constraint,
+and therefore exactly where a spilling kernel should hurt. After the override
+that dip is gone: 1.628 and 1.515, and 1.544. In absolute terms `ComplexF64`
+512^3 went 40.5 -> 73.7 GF/s (+82%) and `ComplexF32` 512^3 went 82.1 -> 151.8
+GF/s (+85%). Canary spread 3.0% on that run.
+
+The shape of the remaining curve is the physically expected one: efficiency is
+highest where overhead dominates (2.59 on `shallowK_256x24x256`, 2.19-2.33 on
+`smallN`) and lowest where the kernel dominates (1.32 on `smallM_12x256x256`,
+which pads every micro-tile away). Nothing here is a claim about absolute
+competitiveness against a tuned vendor library; that comparison is
+`bench_tensoroperations.jl`'s and was not re-run this milestone.
+
+### Planar remains the default, and 1m is not promoted
+
+Planar `24x3` beats every 1m shape measured, so the default is unchanged and
+`OneMMethod` stays selectable only by naming the kernel. That agrees with the
+reference project's own default, but the agreement is a coincidence of this
+machine and must not be read as a general result: **1m's best shape (1.116) is
+closer to planar's best (1.055) than planar's own worst shape is (1.452)**, so
+"planar beats 1m" is a smaller effect here than "pick the right shape". The
+reference records four different method orderings on four machines; nothing in
+this run is evidence against that.
+
+### The real-path regression guard: no regression, and the resolution is ~5%
+
+`benchmark/bench_real_path_guard.jl` (new) runs the real default path across two
+trees -- the working tree and the milestone base `114e594` -- because that
+comparison cannot be made in one process, both trees defining a module named
+`QuasiStrided`. Four runs per tree, pooled:
+
+    overall geomean new/base = 0.9883      (Float64 1.0155, Float32 0.9617)
+    slower on 6 of 18 points, min 0.807, max 1.149
+
+**No regression.** But the honest reading is that the effect is *below this
+measurement's resolution*, not that a 1.2% speedup was found: within-tree
+run-to-run variation reached 8.9% (new tree, runs 1 to 3) against a 1.2%
+between-tree difference, and the two dtypes disagree in sign. The defensible
+claim is no real-path regression at roughly 5% resolution, which is what the
+acceptance criterion needs -- there is no systematic one-sided shift, which is
+what a lost specialization would look like, and the resolved kernel shape is
+identical at every point in both trees.
+
+Three methodological notes, recorded because each cost time to find:
+
+- **The guard's first ordering was confounded.** Running base-then-new twice
+  means any downward drift over wall-clock makes "new" look faster; the drift
+  was real (base run 2 came in 2.7% under run 1). Re-run in ABBA order and
+  pooled over four runs per tree, which is what the numbers above are.
+- **The guard overwrote its own data.** `results_dir()` is keyed by host and
+  date, so the second run of the day silently replaced the first -- and did,
+  destroying a round before it was noticed. Filenames now carry the commit and
+  a run counter, which matters specifically because comparing the *same* tree
+  twice is how the noise floor gets established.
+- **The canary's own first sample is a warm-up artefact.** `canary[start]` reads
+  ~10% faster than `canary[middle]`/`canary[end]` in every run of that script,
+  on both trees, while the middle-to-end spread is 0.2-3.4%. So the script
+  reported an 11% "canary spread" and tripped its own quietness warning on a
+  machine that the six-canary efficiency sweep measured at 0.4%. Judge
+  quietness from the middle/end pair; the start canary is a cross-run reference
+  only. Documented in the script header.
+
+### Harness defects fixed en route
+
+- `benchmark/bench_kernel_shape.jl`'s `FMA_RE = r"vfmadd"` does **not** match
+  `vfnmadd` -- verified against the literal strings. A planar kernel issues
+  `MV*NR` negated FMAs per K step out of `4*MV*NR`, so the validated spill
+  detector would have undercounted planar's FMAs by a quarter and read the
+  "fmas should equal NV" check as a spurious shortfall. Now `r"vfn?madd"`.
+- `benchmark/bench_tensoroperations.jl` timed at `reps = 9`, below the standing
+  `>= 15` rule, in the script whose output the README quotes. Raised to 15. Its
+  duplication of the harness is left in place with the reason narrowed and
+  written down: the original justification ("bench_driver.jl is not a library")
+  expired when `harness.jl` was factored out, and what keeps it now is that
+  every committed number for that script was taken against its own literals.
+- Two distinct bytes-per-flop metrics now exist and are documented as distinct,
+  because conflating them credits a method for its blocking rather than its
+  format: `panel_reals_per_element` (format only -- real 2, planar 4, 1m 6, so
+  1m/planar = **1.5x**, reproducing the reference's figure from the kernels' own
+  geometry) and `packed_bytes_per_flop` (one macro block at that method's own
+  shipped blocking, which comes out near 2x because `default_blocking` halves
+  1m's `mc` and the B term dominates at the shipped `nc`).

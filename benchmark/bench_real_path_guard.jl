@@ -26,7 +26,16 @@
 # How to read the result. A *systematic one-sided* shift across every shape is
 # a regression even if each individual point sits inside the noise band -- that
 # is what a lost specialization looks like. A single point outside the band
-# with the others clean is noise, not a finding.
+# with the others clean is noise, not a finding. And a pattern that does not
+# reproduce between two rounds is noise no matter how tidy it looks in one.
+#
+# Known artefact, measured: `canary[start]` reads systematically ~10% FASTER
+# than `canary[middle]`/`canary[end]`, in every run of this script so far, on
+# both trees. That is a warm-up effect in the canary itself, not machine drift
+# -- the middle-to-end spread is 0.2-3.4% in the same runs. So the reported
+# "canary spread" here reads ~11% and trips its own warning while the machine
+# is in fact quiet. Judge quietness from the middle/end pair; the start canary
+# is useful only as a fixed reference across runs.
 
 include(joinpath(@__DIR__, "harness.jl"))
 
@@ -35,8 +44,32 @@ const GUARD_SHAPES = vcat(MAIN_SHAPES, SMALL_SHAPES)
 
 const OUTDIR = results_dir()
 mkpath(OUTDIR)
-const CSV_PATH = joinpath(OUTDIR, "real_path_guard.csv")
-const PROV_PATH = joinpath(OUTDIR, "real_path_guard_PROVENANCE.txt")
+
+# The filename carries the commit and a run counter, which matters more here
+# than for any other script in this directory: this one exists to be run
+# against TWO trees and diffed, and `results_dir()` is keyed only by host and
+# date. Without this, the second run of the day silently overwrites the first
+# -- which happened on the first use of this script and destroyed a round of
+# data before it was noticed. A run counter as well as the commit, because the
+# interesting comparison is sometimes the *same* tree twice (that is how the
+# run-to-run noise floor is established, and a noise floor measured from one
+# run is not a noise floor).
+const RUN_TAG = let
+    c = git_commit()
+    # `git_commit()` returns a human sentence on failure ("unknown (git
+    # rev-parse failed)"), which is how a tree extracted with `git archive`
+    # reports -- exactly the situation this script is built for. Keep the
+    # filename filesystem-safe rather than assuming a hash.
+    safe = replace(c, r"[^A-Za-z0-9]" => "")
+    short = length(safe) >= 8 ? safe[1:8] : safe
+    n = 1
+    while isfile(joinpath(OUTDIR, "real_path_guard_$(short)_run$(n).csv"))
+        n += 1
+    end
+    "$(short)_run$(n)"
+end
+const CSV_PATH = joinpath(OUTDIR, "real_path_guard_$(RUN_TAG).csv")
+const PROV_PATH = joinpath(OUTDIR, "real_path_guard_$(RUN_TAG)_PROVENANCE.txt")
 
 # Pass no kernel and no blocking: this must take the real default path,
 # including the extent-aware demotion, exactly as a user gets it. Naming either

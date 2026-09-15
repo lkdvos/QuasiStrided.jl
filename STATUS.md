@@ -504,7 +504,21 @@ Sonnet-High over everything since Phase A. Neither is spent yet;
       against `execute_tilewise!` with conjugation forced on. Cache-crossing
       extents derived from each method's own blocking, crossing asserted.
       Purely additive: 448 insertions, 0 deletions.
-- [ ] **Phase F** (measurement on `ccqlin038`).
+- [x] **Phase F** (measurement on `ccqlin038`, 21 reps, canary spread 0.4-3.0%).
+      **The derived register-shape rule was wrong for complex by 38-41%.** The
+      shape `MR = 2W, NR = 6` derives was the *worst* planar configuration
+      measured; the spill-free `24x3`/`48x3` shape that Phase C's spill
+      analysis had flagged wins outright, and beats every 1m shape too — so the
+      spill analysis predicted the ranking before the ranking was measured.
+      Acted on through the `_shape_override` hook that has been deliberately
+      empty since Phase G; these are the **only swept rows in the package**, and
+      they apply on `:avx512` only. Complex-efficiency geomean went
+      **1.256 → 1.829** (`ComplexF64`) and **1.457 → 1.910** (`ComplexF32`),
+      and the sub-1.0 dip at the large compute-bound sizes disappeared
+      (`ComplexF64` 512³ 40.5 → 73.7 GF/s, +82%). Real-path guard: no
+      regression, pooled geomean 0.988 over four runs per tree, though the
+      honest reading is that the effect is below that measurement's ~5%
+      resolution. Planar stays the default; 1m stays selectable only by name.
 - [ ] **Phase G** (the two gated reviews).
 - [ ] **Phase H** (close: `docs/decisions.md`, this file, `README.md`).
 
@@ -518,8 +532,8 @@ predictor. The menu order still stays untouched and unranked, which the
 correction vindicates rather than undermines: the quantity it would have been
 reordered on was being misread. Full account in `docs/decisions.md`.
 
-**Test count: 13299 at Phase A open → 20586 after Phase C → 34468 after
-Phase E** (Julia 1.12.6, 0 failed, 0 errored, Runic clean).
+**Test count: 13299 at Phase A open → 20586 after Phase C → 34480 after
+Phase F** (Julia 1.12.6, 0 failed, 0 errored, Runic clean).
 B1's acceptance criterion — the real path unchanged with no complex kernel
 wired in — was proved on an isolated tree: pristine `7503fdd` 13299/13299,
 base + B1 alone 13612/13612, 0 failed, 0 errored. The measured half of that

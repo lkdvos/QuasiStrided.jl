@@ -230,20 +230,48 @@ end
 
 @testset "complex derivation rule: MR = 2W, with W taken from the REAL type" begin
     # The same one-line Phase G rule; only the `sizeof` argument moves to
-    # `real(T)`, because W is a count of real lanes. For ComplexF64 on AVX-512
-    # that is a 16x6 complex tile -- the reference's measured planar menu head.
-    for (T, W) in ((ComplexF64, 8), (ComplexF32, 16))
+    # `real(T)`, because W is a count of real lanes. Tested here as the *rule*,
+    # separately from the override that Phase F layered on top of it -- the two
+    # are independent and conflating them is what made the original version of
+    # this testset fail when the override landed.
+    for (T, W, swept) in ((ComplexF64, 8, (24, 3, 8)), (ComplexF32, 16, (48, 3, 16)))
         @test W == 64 ÷ sizeof(real(T))
-        @test _derived_shape(synthetic(:avx512, 64), T) === (2 * W, NR_DEFAULT, W)
-        # The derived shape is the head of the default (planar) menu.
+
+        # The rule itself, with the override factored out.
+        @test QuasiStrided._complex_rule_shape(64, T) === (2 * W, NR_DEFAULT, W)
+
+        # `_shape_override` on AVX-512 carries the Phase F sweep's winner, and
+        # is what `_derived_shape` therefore returns. This is the ONE swept row
+        # in the package: measured on ccqlin038 at 21 reps and a 0.4% canary
+        # spread, where the derived shape was the worst planar configuration by
+        # 38-41%. See `_shape_override`'s comment for the table.
+        @test _shape_override(Val(:avx512), T) === swept
+        @test _derived_shape(synthetic(:avx512, 64), T) === swept
+
+        # The resolved default and the menu head agree, so a reader of either
+        # sees the same shape.
         @test _derived_shape(synthetic(:avx512, 64), T) ===
             first(kernel_shapes(T, PlanarMethod()))
         @test _derived_shape(synthetic(:avx512, 64), T) in kernel_shapes(T, PlanarMethod())
-        # `_shape_override` is consulted from the complex path symmetrically
-        # with the real one, and is equally empty.
+
+        # Reordering the menu must not change the SET, or the compiled
+        # specialization count moves with it.
+        @test Set(kernel_shapes(T, PlanarMethod())) ==
+            Set(((2 * W, NR_DEFAULT, W), swept, (2 * W ÷ 2, 8, W)))
+
+        # The override is AVX-512-only; every other ISA takes the rule, and in
+        # fact does not even reach it (`_rule_applies_complex` is false there),
+        # so an unmeasured machine is never handed a ccqlin038 constant.
         for key in VALID_ISAS
+            key === :avx512 && continue
             @test _shape_override(Val(key), T) === nothing
         end
+    end
+    # The REAL override stays empty on every ISA: the real rule was within
+    # noise of its own sweep's best, so a row there would encode noise. That
+    # asymmetry is deliberate, not an oversight.
+    for T in (Float64, Float32), key in VALID_ISAS
+        @test _shape_override(Val(key), T) === nothing
     end
     # The REAL rule is untouched: `_derived_shape` gained a method, it was not
     # edited, so a real element type still reaches exactly the old code.

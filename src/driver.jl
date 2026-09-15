@@ -129,10 +129,43 @@ _legacy_shape(::Type{T}) where {T} = (8, 6, _default_lanewidth(T))
 # every `SIMD.Vec` below the kernel boundary is made of `real(T)`.
 _legacy_shape(::Type{T}) where {T <: Complex} = (8, 6, _default_lanewidth(real(T)))
 
-# Deliberately empty: after Phase H the rule above is already the measured
-# optimum (1st of 24 for Float32, 2nd of 33 by 0.01% for Float64), so a row
-# here would only pin this package to one machine's noise.
+# Deliberately empty for the REAL types: after Phase H the rule above is
+# already the measured optimum (1st of 24 for Float32, 2nd of 33 by 0.01% for
+# Float64), so a row here would only pin this package to one machine's noise.
 _shape_override(::Val, ::Type) = nothing
+
+# For COMPLEX types the rule is overridden, and this is the one place in the
+# package where a swept row beats the derived rule by enough to be worth the
+# machine-specificity. Measured on ccqlin038 (Cascade Lake, `:avx512`, Julia
+# 1.12.6), 21 reps, canary spread 0.4%, `benchmark/bench_complex_efficiency.jl`
+# arm 2, ranked by geomean of per-shape time normalised to the best at that
+# shape:
+#
+#   ComplexF64          ComplexF32
+#   planar 24x3  1.055  planar 48x3  1.104   <- overridden to these
+#   1m     16x6  1.116  1m     16x8  1.170
+#   1m     12x8  1.179  1m     24x8  1.172
+#   1m      8x8  1.224  1m     32x6  1.202
+#   planar 16x6  1.452  planar 16x8  1.311
+#   planar  8x8  1.502  planar 32x6  1.562   <- what the rule derives
+#
+# The derived `MR = 2W, NR = 6` shape is the *worst* planar configuration
+# measured, by 38% (`ComplexF64`) and 41% (`ComplexF32`) against the best. That
+# is not noise at a 0.4% canary spread, and it has a mechanism: Phase C
+# measured the derived shape spilling 24-26 accumulator stores per K step while
+# `24x3`/`48x3` is spill-free (docs/decisions.md, "Phase C integration
+# findings" and its Phase D correction). The spill analysis predicted the
+# ranking before the ranking was measured.
+#
+# Why an override rather than changing the rule: the rule is shared with the
+# real path, where it is the measured optimum and must not move. Why a row here
+# is acceptable when the real path deliberately has none: the real rule was
+# within noise of its sweep's best, so a row would have encoded noise; this one
+# corrects a 38-41% error. The cost is honest and stated -- these two rows are
+# ccqlin038 measurements, and on any other microarchitecture the engine falls
+# back to the derived rule via `_rule_applies_complex`, which is `:avx512`-only.
+_shape_override(::Val{:avx512}, ::Type{ComplexF64}) = (24, 3, 8)
+_shape_override(::Val{:avx512}, ::Type{ComplexF32}) = (48, 3, 16)
 
 # The rule applies only to the ISAs it was validated on. `:neon` is detected
 # but deliberately gets the legacy shape: there is no aarch64 measurement, and
@@ -169,8 +202,16 @@ end
 # lanes. `MR = 2W, NR = NR_DEFAULT` with `W = vector_bytes / sizeof(real(T))`
 # gives `(16, 6, 8)` for `ComplexF64` on AVX-512 -- a 16x6 complex tile, which
 # is exactly the reference's measured planar menu head `(MV, NR) = (2, 6)`.
-# `_shape_override` is consulted here symmetrically with the real path, and is
-# equally empty.
+# `_shape_override` is consulted here symmetrically with the real path, but --
+# unlike the real path -- it is NOT empty: Phase F measured the derived
+# `(16, 6, 8)` / `(32, 6, 16)` shape to be the worst planar configuration by
+# 38-41%, and the override carries the swept winner. See `_shape_override`.
+# The rule, factored out of `_derived_shape` so that it can be tested
+# independently of the override layered on top of it. `W` is a count of REAL
+# lanes, which is the whole complex adaptation.
+_complex_rule_shape(vb::Int, ::Type{T}) where {T <: Complex} =
+    (2 * (vb ÷ sizeof(real(T))), NR_DEFAULT, vb ÷ sizeof(real(T)))
+
 function _derived_shape(profile::TargetProfile, ::Type{T}) where {T <: Complex}
     R = real(T)
     vb = profile.vector_bytes
@@ -178,7 +219,7 @@ function _derived_shape(profile::TargetProfile, ::Type{T}) where {T <: Complex}
     (_rule_applies_complex(key) && vb > 0 && vb % sizeof(R) == 0) ||
         return _legacy_shape(T)
     ovr = _shape_override(key, T)
-    return ovr === nothing ? (2 * (vb ÷ sizeof(R)), NR_DEFAULT, vb ÷ sizeof(R)) : ovr
+    return ovr === nothing ? _complex_rule_shape(vb, T) : ovr
 end
 
 # Closed set, so compiled SIMDKernel (and driver) specializations are bounded.
@@ -192,9 +233,12 @@ const KERNEL_SHAPES_F32 = ((8, 6, 8), (32, 6, 16), (16, 6, 8))
 # The 1m menus look "unaligned" (MR = 12 with W = 8) only because the
 # reference's MV counts REAL rows: 1m runs a real microkernel of `2MR` rows, so
 # `2*12 = 24` is what must be a multiple of `W`.
-const KERNEL_SHAPES_C64_PLANAR = ((16, 6, 8), (24, 3, 8), (8, 8, 8))
+# Ordered with the Phase F winner first, so the menu head and the shape the
+# engine actually resolves to agree (see `_shape_override`). The set is
+# unchanged -- only the order -- so no specialization is added or removed.
+const KERNEL_SHAPES_C64_PLANAR = ((24, 3, 8), (16, 6, 8), (8, 8, 8))
 const KERNEL_SHAPES_C64_ONEM = ((12, 8, 8), (16, 6, 8), (8, 8, 8))
-const KERNEL_SHAPES_C32_PLANAR = ((32, 6, 16), (48, 3, 16), (16, 8, 16))
+const KERNEL_SHAPES_C32_PLANAR = ((48, 3, 16), (32, 6, 16), (16, 8, 16))
 const KERNEL_SHAPES_C32_ONEM = ((24, 8, 16), (32, 6, 16), (16, 8, 16))
 
 kernel_shapes(::Type{Float64}) = KERNEL_SHAPES_F64
