@@ -180,10 +180,15 @@ Gold 6244 / Cascade Lake):
   The complex register shape is the one place in the package with a swept,
   machine-specific constant: the shape the hardware rule *derives* turned out
   to be the worst planar configuration measured, by 38–41%, because it spills
-  accumulators. `_shape_override` carries the swept winner on AVX-512 only; every
-  other ISA gets the largest menu shape that fits its register file, which is
-  correct and unmeasured rather than fast and machine-specific. See
-  `docs/decisions.md`'s "Phase F measurement" and "Amendment 5".
+  accumulators. `_shape_override` now carries one row per ISA, each with its own
+  provenance: AVX-512 swept here, NEON measured on an Apple M3 Max by a sibling
+  project, AVX2 adopted from that project's model (and chosen over a
+  budget-fitted alternative because the fitted one used *all* 16 ymm registers,
+  leaving LLVM no scratch). An ISA with no row takes a register-budget fit.
+  Every shipped row leaves at least two registers spare. See
+  `docs/decisions.md`'s "Phase F measurement" and Amendments 5 and 6 — the
+  latter also records why BLIS, the obvious place to look, is the wrong source
+  for *planar* shapes specifically.
 - Zero steady-state allocation for `SIMDKernel` through the full driver on
   Julia >= 1.11. On Julia 1.10 (LTS), `SIMDKernel`'s `accumulate`/
   `execute_tile!` allocate tens of KB per call instead — a compiler

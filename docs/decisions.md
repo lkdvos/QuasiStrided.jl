@@ -3328,3 +3328,73 @@ Also fixed here: the complex packing allocation assertions were missing the
 `skip=(VERSION < v"1.11")` marker that every other allocation assertion in this
 suite carries, so Julia 1.10 LTS failed on the documented compiler gap rather
 than skipping it. Marked, not weakened.
+
+### Amendment 6: per-ISA complex shape rows, and why BLIS is not the source for them
+
+Amends Amendment 5, which left the off-`:avx512` complex shapes as a
+register-budget fit with no provenance beyond "it fits".
+
+**BLIS was the first place looked, and it is the wrong source for *planar*
+shapes.** Recorded because it is a reasonable thing to try and the reasoning
+is not obvious:
+
+- This project already took what BLIS has for the real path. `_legacy_shape`
+  `(8, 6, 4)` *is* BLIS's AVX2 dgemm shape -- see "The old default was BLIS's
+  AVX2 shape, on an AVX-512 machine" in the Phase G section.
+- BLIS computes complex two ways, and neither matches planar's register
+  profile. Its native complex asm kernels work on interleaved data and spend
+  registers on shuffles, which planar needs none of; its 1m path runs *real*
+  kernels. So a BLIS complex `MR`/`NR` encodes the register needs of a
+  different method. Transplanting it would be cargo-culting a number whose
+  justification does not apply.
+- Where BLIS *does* transfer is 1m, which runs a real kernel at `2MR x NR`, so
+  BLIS's real shapes are directly meaningful there. Low value at present: 1m is
+  never selected automatically, so the shape only matters to a caller who names
+  the kernel and could name the shape too.
+- Independently, "BLIS microkernels are not reachable from `blis_jll`" (Phase G)
+  means only the published shapes were ever available, not the kernels.
+
+**The right source was the sibling `tensorcontract-rs` project**, which sweeps
+planar specifically:
+
+| ISA | row | provenance | pressure / budget |
+| --- | --- | --- | --- |
+| `:avx512` | `ComplexF64 (24,3,8)`, `ComplexF32 (48,3,16)` | swept on ccqlin038, Phase F | 26 / 32 |
+| `:neon` | `ComplexF64 (4,6,2)`, `ComplexF32 (8,6,4)` | **measured on an Apple M3 Max** (`aarch64.rs`, `cfg_neon_*`, three arms at `kc = 384`) | 30 / 32 |
+| `:avx2` | `ComplexF64 (4,5,4)`, `ComplexF32 (8,5,8)` | **modelled, unmeasured** (`cfg_avx2_f64`, labelled so there) | 14 / 16 |
+| `:unknown` | -- | register-budget fit | 14 / 16 |
+
+Two things worth separating.
+
+**NEON is a pin, not a change.** The budget fit already selected exactly the
+M3 Max winners -- `(MV, NR) = (2, 6)` for both precisions, converted through
+`MR = MV * lanes`. Pinned anyway: arriving at a measured optimum by coincidence
+is fragile, because a later menu edit would move it silently and nothing would
+notice.
+
+**AVX2 is a change, and it is an argument about headroom rather than about the
+optimum.** The fit picked `NR = 6`, whose pressure is `2*6 + 2 + 2 = 16` out of
+AVX2's 16 registers -- *zero spare*, leaving LLVM nothing for address
+arithmetic or loop counters, so it would spill something regardless of how well
+the shape otherwise suits. `NR = 5` costs 14 and leaves two; the sibling
+project's own table records the same figure as `live 14`. **The headroom
+argument is sound independently of whether 5 is the exact optimum**, which is
+the part nobody has measured. Every shipped row now has at least two spare
+registers, and a test asserts strict inequality rather than `<=`.
+
+**This cannot be measured here.** `ccqlin038` has 32 registers, so forcing an
+AVX2 *shape* on it would not exercise the 16-register constraint that motivates
+the row. It needs AVX2-only hardware, and revisiting is cheap:
+`benchmark/bench_complex_efficiency.jl` arm 2 is the sweep.
+
+One structural fix came with this. `_shape_override` was consulted *after*
+`_rule_applies_complex`, which is `:avx512`-only -- so an AVX2 or NEON row
+could never have been reached and would have been dead code. Precedence is now
+uniform: override, then the derived rule where validated, then the fit.
+
+Menu membership is unchanged in size (six planar entries per dtype): the two
+zero-spare fit shapes were *replaced* by the AVX2 rows rather than added
+alongside. A test verifies every resolved shape constructs at the shape asked
+for, which is the invariant that matters -- `_complex_kernel_from_shape` falls
+through to the menu tail on no match, so a row absent from the menu would
+silently build a different kernel.

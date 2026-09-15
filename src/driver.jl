@@ -144,6 +144,39 @@ _shape_override(::Val, ::Type) = nothing
 _shape_override(::Val{:avx512}, ::Type{ComplexF64}) = (24, 3, 8)
 _shape_override(::Val{:avx512}, ::Type{ComplexF32}) = (48, 3, 16)
 
+# NEON: **measured**, on an Apple M3 Max, by the sibline `tensorcontract-rs`
+# project (`crates/tensorcontract/src/kernel/aarch64.rs`, `cfg_neon_f64` /
+# `cfg_neon_f32`, three arms at `kc = 384`). Its planar winner is
+# `(MV, NR) = (2, 6)` for both precisions, which converts to these two rows --
+# `MR = MV * lanes`, lanes being 2 for `ComplexF64` and 4 for `ComplexF32` on
+# 128-bit vectors.
+#
+# The register-budget fit already selected exactly these shapes, so this is a
+# pin rather than a change. Pinned anyway, because reaching a measured optimum
+# by coincidence is fragile: a later menu edit could move it silently, and
+# nothing would notice.
+_shape_override(::Val{:neon}, ::Type{ComplexF64}) = (4, 6, 2)
+_shape_override(::Val{:neon}, ::Type{ComplexF32}) = (8, 6, 4)
+
+# AVX2: **modelled, not measured** -- by anyone. Adopted from the same sibling
+# project (`cfg_avx2_f64`, explicitly labelled "provisional and unmeasured"),
+# whose planar choice is `(MV, NR) = (1, 5)`.
+#
+# It is adopted over what the budget fit picks -- `NR = 6` -- for one reason:
+# `NR = 6` at `MV = 1` costs `2*6 + 2 + 2 = 16` registers out of AVX2's 16,
+# leaving LLVM nothing for address arithmetic or loop counters, so it will
+# spill something. `NR = 5` costs 14 and leaves two. The sibling's table
+# records the same figure as `live 14`. The headroom argument is sound
+# independently of whether 5 is the exact optimum, which is the part nobody
+# has measured.
+#
+# This cannot be measured on `ccqlin038`: it has 32 registers, so forcing an
+# AVX2 *shape* there would not exercise the 16-register constraint that
+# motivates the row. It needs AVX2-only hardware, and is cheap to revisit --
+# `benchmark/bench_complex_efficiency.jl` arm 2 is the sweep.
+_shape_override(::Val{:avx2}, ::Type{ComplexF64}) = (4, 5, 4)
+_shape_override(::Val{:avx2}, ::Type{ComplexF32}) = (8, 5, 8)
+
 # The rule applies only to the ISAs it was validated on. `:neon` is detected
 # but deliberately gets the legacy shape: no aarch64 measurement exists, and
 # the rule would pick MR = 2W = 4 on 128-bit lanes -- narrower and smaller than
@@ -180,16 +213,20 @@ end
 _complex_rule_shape(vb::Int, ::Type{T}) where {T <: Complex} =
     (2 * (vb ÷ sizeof(real(T))), NR_DEFAULT, vb ÷ sizeof(real(T)))
 
+# Precedence, uniform across ISAs: an explicit override row, then the derived
+# rule where it is validated, then a register-budget fit. The override is
+# consulted FIRST and for every ISA -- an earlier revision checked
+# `_rule_applies_complex` before it, which meant an AVX2 or NEON row could
+# never be reached, so the non-AVX-512 rows below would have been dead code.
 function _derived_shape(profile::TargetProfile, ::Type{T}) where {T <: Complex}
+    key = Val(profile.isa)
+    ovr = _shape_override(key, T)
+    ovr === nothing || return ovr
     R = real(T)
     vb = profile.vector_bytes
-    key = Val(profile.isa)
-    # Off the measured ISA, fit to the register file rather than refuse or hand
-    # back a shape that cannot fit (see `_complex_fitted_shape`).
     (_rule_applies_complex(key) && vb > 0 && vb % sizeof(R) == 0) ||
         return _complex_fitted_shape(profile, T)
-    ovr = _shape_override(key, T)
-    return ovr === nothing ? _complex_rule_shape(vb, T) : ovr
+    return _complex_rule_shape(vb, T)
 end
 
 # Closed set, so compiled SIMDKernel (and driver) specializations are bounded.
@@ -216,11 +253,11 @@ const KERNEL_SHAPES_F32 = ((8, 6, 8), (32, 6, 16), (16, 6, 8))
 # fitted shape is present. They are unmeasured and are not claimed to be good,
 # only to fit.
 const KERNEL_SHAPES_C64_PLANAR = (
-    (24, 3, 8), (16, 6, 8), (8, 8, 8), (4, 6, 4), (4, 6, 2), (2, 6, 2),
+    (24, 3, 8), (16, 6, 8), (8, 8, 8), (4, 5, 4), (4, 6, 2), (2, 6, 2),
 )
 const KERNEL_SHAPES_C64_ONEM = ((12, 8, 8), (16, 6, 8), (8, 8, 8))
 const KERNEL_SHAPES_C32_PLANAR = (
-    (48, 3, 16), (32, 6, 16), (16, 8, 16), (8, 6, 8), (8, 6, 4), (4, 6, 4),
+    (48, 3, 16), (32, 6, 16), (16, 8, 16), (8, 5, 8), (8, 6, 4), (4, 6, 4),
 )
 const KERNEL_SHAPES_C32_ONEM = ((24, 8, 16), (32, 6, 16), (16, 8, 16))
 

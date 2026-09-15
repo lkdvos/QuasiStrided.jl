@@ -244,10 +244,11 @@ end
         @test QuasiStrided._complex_rule_shape(64, T) === (2 * W, NR_DEFAULT, W)
 
         # `_shape_override` on AVX-512 carries the Phase F sweep's winner, and
-        # is what `_derived_shape` therefore returns. This is the ONE swept row
-        # in the package: measured on ccqlin038 at 21 reps and a 0.4% canary
-        # spread, where the derived shape was the worst planar configuration by
-        # 38-41%. See `_shape_override`'s comment for the table.
+        # is what `_derived_shape` therefore returns. This is the only row in
+        # the package swept on the host that runs it: measured on ccqlin038 at
+        # 21 reps and a 0.4% canary spread, where the derived shape was the
+        # worst planar configuration by 38-41%. See `_shape_override`'s
+        # comment for the table, and for the NEON and AVX2 rows' provenance.
         @test _shape_override(Val(:avx512), T) === swept
         @test _derived_shape(synthetic(:avx512, 64), T) === swept
 
@@ -257,27 +258,37 @@ end
             first(kernel_shapes(T, PlanarMethod()))
         @test _derived_shape(synthetic(:avx512, 64), T) in kernel_shapes(T, PlanarMethod())
 
-        # The menu is the three AVX-512 shapes plus three `MV = 1` entries --
-        # one per lane width the package compiles -- which is what guarantees
-        # `_complex_fitted_shape` always finds something that fits off
-        # `:avx512`. Pinned as a SET so a reorder cannot change the compiled
-        # specialization count silently, and so adding a shape is a deliberate
-        # edit here rather than a side effect.
+        # The menu is the three AVX-512 shapes, the AVX2 row, the NEON row,
+        # and a narrow floor entry that guarantees `_complex_fitted_shape`
+        # always finds something on an ISA with no row of its own. Pinned as a
+        # SET so a reorder cannot change the compiled specialization count
+        # silently, and so adding a shape is a deliberate edit here rather than
+        # a side effect.
         @test Set(kernel_shapes(T, PlanarMethod())) == Set(
             (
                 (2 * W, NR_DEFAULT, W), swept, (2 * W ÷ 2, 8, W),
-                (W ÷ 2, NR_DEFAULT, W ÷ 2), (W ÷ 2, NR_DEFAULT, W ÷ 4),
+                _shape_override(Val(:avx2), T), _shape_override(Val(:neon), T),
                 (W ÷ 4, NR_DEFAULT, W ÷ 4),
             )
         )
 
-        # The override is AVX-512-only; every other ISA takes the rule, and in
-        # fact does not even reach it (`_rule_applies_complex` is false there),
-        # so an unmeasured machine is never handed a ccqlin038 constant.
-        for key in VALID_ISAS
-            key === :avx512 && continue
-            @test _shape_override(Val(key), T) === nothing
+        # There is now an override row per *measured or modelled* ISA, each
+        # with its own provenance (see `_shape_override`): AVX-512 swept on
+        # ccqlin038, NEON measured on an M3 Max by the sibling project, AVX2
+        # adopted from that project's model. What must hold for all of them is
+        # that they fit their ISA's register file with room to spare, and are
+        # in the menu -- no ISA may be handed another ISA's constant, and none
+        # may be handed a zero-spare shape.
+        for (key, nreg) in ((:avx512, 32), (:avx2, 16), (:neon, 32))
+            ovr = _shape_override(Val(key), T)
+            @test ovr !== nothing
+            @test QuasiStrided._planar_pressure(ovr...) <= nreg
+            @test QuasiStrided._planar_pressure(ovr...) < nreg  # scratch left over
+            @test ovr in kernel_shapes(T, PlanarMethod())
         end
+        # `:unknown` gets no row: there is nothing to base one on, so it takes
+        # the register-budget fit.
+        @test _shape_override(Val(:unknown), T) === nothing
     end
     # The REAL override stays empty on every ISA: the real rule was within
     # noise of its own sweep's best, so a row there would encode noise. That
@@ -301,14 +312,27 @@ end
         # since CI, rather than refused. What must hold is that the result fits
         # the budget and is in the menu; the exact shape is an implementation
         # detail of `_complex_fitted_shape` and is deliberately not pinned here.
-        for key in (:avx2, :neon, :unknown, :somethingelse)
+        # `:unknown` and an unrecognised key have no override row, so they
+        # exercise the fit itself: whatever it returns must fit the budget it
+        # was given and be in the menu.
+        for key in (:unknown, :somethingelse)
             @test !_rule_applies_complex(Val(key))
+            @test _shape_override(Val(key), T) === nothing
             for vb in (0, 16, 32, 64), nreg in (0, 16, 32)
                 shape = _derived_shape(synthetic(key, vb; nregisters = nreg), T)
                 MR, NR, W = shape
                 @test QuasiStrided._planar_pressure(MR, NR, W) <=
                     (nreg > 0 ? nreg : 16)
                 @test shape in kernel_shapes(T, PlanarMethod())
+            end
+        end
+        # `:avx2` and `:neon` do have rows, so the override short-circuits the
+        # rule and the fit alike -- and, unlike the fit, is width-independent.
+        for key in (:avx2, :neon)
+            @test !_rule_applies_complex(Val(key))
+            for vb in (0, 16, 32, 64), nreg in (0, 16, 32)
+                @test _derived_shape(synthetic(key, vb; nregisters = nreg), T) ===
+                    _shape_override(Val(key), T)
             end
         end
         # On :avx512 with no width detected, the rule cannot apply either, so
