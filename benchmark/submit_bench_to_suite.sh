@@ -19,7 +19,10 @@
 #SBATCH --output=benchmark/results/slurm-%j.out
 
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+# Slurm copies this script into a spool directory before running it, so
+# `${BASH_SOURCE[0]}`/`dirname "$0"` point there, not into the repo. Use
+# SLURM_SUBMIT_DIR (the directory `sbatch` was invoked from) instead.
+cd "${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR not set -- run this script via sbatch, not directly}"
 
 module load julia 2>/dev/null || true
 
