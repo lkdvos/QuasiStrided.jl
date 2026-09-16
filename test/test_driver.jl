@@ -960,3 +960,41 @@ end
     @test Cmat ≈ Amat * Bmat
     @test allocs_tw == 0 skip = (VERSION < v"1.11")
 end
+
+# =====================================================================
+# Store fast path (docs/decisions.md, "Store fast-path investigation:
+# Phase A"). `store_tile!`'s vectorized path is only reachable from the
+# real driver now that its guard admits any `DenseVector{T}`: the driver's
+# destination storage is `parent(C)`, i.e. `Memory{T}` on Julia >= 1.11.
+# That made the path's row tail a live allocation risk (a dynamically
+# indexed accumulator heap-allocates above NV = 16), so the driver-level
+# assertion below deliberately uses M and N extents that are NOT multiples
+# of the kernel's MR/NR -- every other allocation testset in this file
+# happens to be tail-free in M or exercises the scattered fallback instead.
+# =====================================================================
+
+@testset "execute! allocation: the vectorized store path with tail rows is zero" begin
+    Random.seed!(20260915)
+    MRk, NRk, Wk = 8, 6, 4
+    kernel = SIMDKernel(Val(MRk), Val(NRk), Float64, Val(Wk))
+    Ma, Ka, Na = 3 * MRk - 3, 11, 2 * NRk - 1  # tail block in both M and N
+    Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
+    Cmat = zeros(Ma, Na)
+    plan = _mm_plan(
+        Cmat, Amat, Bmat;
+        kernel = kernel, mc = 2 * MRk, kc = 5, nc = NRk + 2
+    )
+
+    # The destination really is the widened guard's case, and its micro-tile
+    # rows really are unit-stride (C is column-major and M is its first index),
+    # so `execute!` below takes the vectorized store, tail rows included.
+    Cstorage = parent(StridedView(Cmat))
+    @test Cstorage isa DenseVector{Float64}
+    @test QuasiStrided._vector_store_eligible(
+        DestinationTile(Cstorage, 0, AffineAxis(0, 1, MRk - 3), AffineAxis(0, Ma, NRk)), Float64
+    )
+
+    allocs = _steady_allocs!(execute!, plan, Cmat)
+    @test Cmat ≈ Amat * Bmat
+    @test allocs == 0 skip = (VERSION < v"1.11")
+end
