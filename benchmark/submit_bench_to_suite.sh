@@ -24,7 +24,14 @@ set -euo pipefail
 # SLURM_SUBMIT_DIR (the directory `sbatch` was invoked from) instead.
 cd "${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR not set -- run this script via sbatch, not directly}"
 
-module load julia 2>/dev/null || true
+# juliaup's own toolchain lives on this workstation's LOCAL disk (/home, not
+# /mnt/home -- see this org's CLAUDE.md filesystem table), so it isn't visible
+# on a compute node at all, and the site's bare `module load julia` resolves
+# to julia/1.11.2, whose depot (this repo's Manifest, precompiled for 1.12)
+# fails to precompile under it. `module spider julia/1.12.6` shows it needs a
+# newer `modules` meta-module loaded first to become visible.
+module load modules/2.5-beta1
+module load julia/1.12.6
 
 julia --project=benchmark benchmark/bench_to_suite.jl \
     --categories pairwise \
