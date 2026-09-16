@@ -637,18 +637,35 @@ end
     end
 end
 
-@testset "hard-reject: tensoradd! always throws" begin
+@testset "tensoradd! falls back to StridedNative (amended 2026-09-16)" begin
     A = randn(Float64, (3, 4))
-    @test_throws ArgumentError begin
-        @tensor backend = qsbackend C[i, j] := A[i, j]
-    end
+    C1 = zeros(Float64, (4, 3))
+    @tensor backend = qsbackend C1[j, i] = A[i, j]
+    C2 = zeros(Float64, (4, 3))
+    @tensor backend = StridedNative() C2[j, i] = A[i, j]
+    @test C1 == C2
+
+    # A network mixing a contraction with an add/trace step -- this is
+    # exactly the scope limitation the fallback amendment removes; it must
+    # run wholesale under `qsbackend` now, not throw.
+    B = randn(Float64, (4, 5))
+    D1 = zeros(Float64, (3, 5))
+    @tensor backend = qsbackend D1[i, k] = A[i, j] * B[j, k]
+    @test D1 ≈ A * B
+
+    # The fallback forwards the allocator argument through unchanged.
+    C3 = zeros(Float64, (4, 3))
+    @tensor backend = qsbackend allocator = TensorOperations.ManualAllocator() C3[j, i] = A[i, j]
+    @test C3 == C1
 end
 
-@testset "hard-reject: tensortrace! always throws" begin
+@testset "tensortrace! falls back to StridedNative (amended 2026-09-16)" begin
     A = randn(Float64, (4, 3, 3))
-    @test_throws ArgumentError begin
-        @tensor backend = qsbackend C[i] := A[i, j, j]
-    end
+    C1 = zeros(Float64, 4)
+    @tensor backend = qsbackend C1[i] = A[i, j, j]
+    C2 = zeros(Float64, 4)
+    @tensor backend = StridedNative() C2[i] = A[i, j, j]
+    @test C1 == C2
 end
 
 # =====================================================================
