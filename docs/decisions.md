@@ -3520,7 +3520,7 @@ by an existing test) requiring the user's decision as a separate follow-up,
 not something this milestone acts on unilaterally.
 
 Review budget: one gated pass (independent review, after docs are written),
-`fable_review_storefastpath_used: false` -- not yet spent.
+`fable_review_storefastpath_used: true` -- spent, do not relaunch for this milestone. Disposition: no blocking findings; several should-fix findings addressed (see "T4-T5" subsection and this milestone's T9 commit).
 
 ### T1-T3 results and the decision gate
 
@@ -3538,11 +3538,13 @@ Julia 1.10's behavior is otherwise established by direct reading of
 `StridedViews.jl`'s source (E1), not merely inferred.
 
 **T2** (`benchmark/bench_store_path.jl`): the core deliverable for the gate.
-`Memory{T}` (D-mem, today's real path) costs **~4-5x more per element to
-store than `Vector{T}`** (D-vec, today's fast path) when rows ARE
-unit-stride -- a consistent ~1.8-2.3 ns/element gap across all 4 kernel
-shapes x 2 `kc` values x both beta regimes, far above the 3.7% canary noise
-floor. Zero unexpected allocation in any of the 144 measured cells.
+`Memory{T}` (D-mem, today's real path) costs **more per element to store
+than `Vector{T}`** (D-vec, today's fast path) when rows ARE unit-stride --
+a consistent 1.69-2.26 ns/element gap across all 4 kernel shapes x 2 `kc`
+values x both beta regimes (a **3.9x-9.9x ratio**, not a flat "4-5x" -- the
+ratio varies by shape since the D-vec baseline itself varies; re-derived
+from `summary_store_path.txt` at review, T8), far above the 3.7% canary
+noise floor. Zero unexpected allocation in any of the 144 measured cells.
 Separately, D-strided-hot/cold (non-unit-stride rows, approximating the
 actual `ccsd_t_*` addressing pattern) cost 8-25 ns/element **regardless of
 storage type** -- confirming the storage-type gap and the regression are
@@ -3610,22 +3612,41 @@ on this machine, 2026-09-15.
   warm-up effect) — all middle/end spreads were small (0.21-5.58%).
 - Re-run of `benchmark/bench_store_path.jl` (unmodified script) on the fixed
   tree: the D-mem vs D-vec per-element store-cost gap that T2 measured
-  before the fix (~1.8-2.3 ns/element, ~4-5x, "far above noise") is now
+  before the fix (1.69-2.26 ns/element, 3.9x-9.9x, "far above noise") is now
   eliminated — post-fix delta(mem-vec) ranges from -0.10 to +0.06 ns/element
-  across all 8 (shape,kc) x 2 beta-regime cells, i.e. statistically
-  indistinguishable from zero. Native-code stack-store instruction counts for
-  D-vec and D-mem are now identical (8 total vector stores, 4 stack, 4 other,
-  at both shipped shapes) — direct confirmation the two code paths are now
-  genuinely the same path. Zero allocation confirmed again (144 cells).
+  across all 8 (shape,kc) x 2 beta-regime cells. **This run's own canary
+  spread was 9.19%** (worse than T2's original 3.7%, `T5_summary_store_path_after_fix.txt`)
+  -- the residual +/-0.10 ns/elem is below this run's own resolution, so read
+  "eliminated" as "below this run's resolution", not as a bitwise-proven zero;
+  the conclusion still holds because the gap closed by 3.1x-30x depending on
+  shape (e.g. shipped F64 kc=16: 2.56 -> 0.03 ns/elem), vastly larger than
+  either run's noise. Native-code stack-store instruction counts for D-vec and
+  D-mem are now identical (8 total vector stores, 4 stack, 4 other, at both
+  shipped shapes) — direct confirmation the two code paths are now genuinely
+  the same path. Zero allocation confirmed again (144 cells).
 - Full sweep of `benchmark/bench_ccsd_t_store.jl` (both dims, both dtypes,
   all 3 arms, post-fix): Arm 1 (`QuasiStridedBackend` via the TensorOperations
-  adapter) at `dim=16` is essentially UNCHANGED from this milestone's opening
-  characterization of the regression (ratios: `ccsd_t_1` 10.1x/12.1x,
-  `ccsd_t_2` 14.4x/12.9x, `ccsd_t_3` 9.6x/8.1x, `ccsd_t_4` 14.4x/11.6x for
-  F64/F32 respectively) — **confirming the fix does not move this regression
-  class, exactly as predicted** (E3: zero unit-stride M/N-slivers under the
-  adapter's own label order, reconfirmed at `dim=16` specifically, not just
-  analytically inferred).
+  adapter) at `dim=16` (ratios: `ccsd_t_1` 10.1x/12.1x, `ccsd_t_2` 14.5x/12.9x,
+  `ccsd_t_3` 9.5x/8.1x, `ccsd_t_4` 14.4x/11.6x for F64/F32 respectively) is
+  close to, but not perfectly matching, this milestone's opening
+  characterization of the regression (6.6-14.2x, from
+  `benchmark/results/.../summary_to_suite.txt` on the pre-fix `upstream-bench`
+  harness, cited here at review time since the original comparison wasn't
+  otherwise traceable to an artifact): Float64 agrees to within +/-3%, but
+  **Float32 drifted +5% to +23%** (the pre-fix F32 range's own low end, 6.6x,
+  came from this same `ccsd_t_3` case). Some of that drift is run-to-run
+  noise, not a real change: at `dim=16` Arms 1 and 2 measure the identical
+  contraction with identical labels, and for `ccsd_t_3` F32 they differ by
+  27% from each other in this same run (1.270 s vs 0.999 s, reps=15) — so the
+  dim=16 F32 numbers carry roughly +/-25% run-to-run uncertainty on this
+  machine, and the observed F32 drift is inside that band. **Read this
+  regression class as "not moved by the fix, within this machine's
+  measurement precision" rather than as a precise "unchanged" claim** — the
+  mechanism-level evidence (below) is the stronger support, not the timing
+  comparison. **Confirming the fix does not move this regression class**
+  (E3: zero unit-stride M/N-slivers under the adapter's own label order,
+  reconfirmed at `dim=16` specifically, not just analytically inferred, in
+  every one of the 8 case x dtype cells).
 
 **Confirmed closing statement**: Cause A fixed for ordinary
 (unit-stride-destination) contractions on Julia >= 1.11; Cause B (the
@@ -3641,7 +3662,7 @@ stride-1 axis) to be that operand's own first physical axis gives a **3.3x
 to 20x speedup** over Arm 1 on the SAME four regression cases, consistently
 across all 8 case x dtype combinations (`ccsd_t_1`: 20.0x F64 / 13.6x F32;
 `ccsd_t_2`: 4.1x / 3.7x; `ccsd_t_3`: 4.1x / 4.2x; `ccsd_t_4`: 4.0x / 3.3x —
-quoted exactly from `T5_summary_ccsd_t_full.txt`, already committed). This is
+derived from the medians in `T5_summary_ccsd_t_full.txt`, already committed). This is
 **far larger** than anything this milestone's own scope (the store fast-path)
 could ever deliver for this case class. Per this milestone's own frozen
 "replanning trigger" language (above, "Decision boundaries"/"Replanning
@@ -3672,3 +3693,22 @@ fully resolved.
   not started, needs a decision from the user.
 - Any remaining upstream benchmark-suite categories (this milestone's own
   frozen non-goals already excluded a wider profiling sweep).
+- **Stale `_acc_lane` cross-references** (found at T8 review; not fixed here
+  since the affected files are this milestone's own frozen non-goals):
+  `_acc_lane` is now unused by any store path (both `_store_tile_scattered!`
+  and the new `_store_tile_vector!` are `@generated` with literal indices),
+  but `src/kernels/planar.jl` and `src/kernels/onem.jl` each have a comment
+  stating the real path *uses* `_acc_lane`, and `test/test_quality.jl`'s Aqua
+  `unbound_args = false` justification cites it as the reason -- all three
+  are now stale (the justification is not wrong, `_acc_lane` still exists
+  and is still unbound-arg-shaped, but its "still in use" premise no longer
+  holds). A future task touching those files should update the three
+  comments (or delete `_acc_lane` and re-enable `unbound_args = true`, which
+  T8 notes would be a net Aqua-coverage gain) -- out of scope here since none
+  of the three files were in this milestone's edit scope.
+- A tile-level numerical-agreement test for the new vectorized store path
+  with unit-stride rows but scattered/irregular *columns* (`ScatterAxis`
+  cols) -- found at T8 review as a coverage gap: this combination is newly
+  routed to `_store_tile_vector!` and is exercised for allocation by
+  `test/test_target.jl`'s sliced-C fixture, but that test only asserts zero
+  allocation, not numerical correctness, for this specific combination.

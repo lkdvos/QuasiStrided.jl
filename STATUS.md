@@ -676,8 +676,8 @@ This milestone is **complete as a real `src/` fix**, not just a benchmarking
 exercise: the evidence-gated decision (T1-T3) selected "(a) fix", T4 shipped
 it (`src/kernels/simd.jl`, `test/test_simd_kernel.jl`, `test/test_driver.jl`),
 and T5 measured its effect both in isolation and through the real
-`ccsd_t_*_dim16` regression this milestone exists to investigate. T6 review
-and T8/close/PR are the remaining next steps (see checklist below).
+`ccsd_t_*_dim16` regression this milestone exists to investigate. T8 review
+and T9/T10 close/PR are the remaining next steps (see checklist below).
 
 Non-goals: `QuasiStridedBackend`'s hard-reject invariant, the macro-blocking
 five-loop structure, `src/target.jl`'s register-shape derivation, a general
@@ -696,9 +696,14 @@ dependency (PR #303 upstream still unmerged, confirmed 2026-09-15).
 - [x] **T5** (measurement campaign).
 - [x] **T7** (docs — this section and `docs/decisions.md`'s "T4-T5: the fix
       and its measured effect").
-- [ ] **T8** (one gated independent review — `fable_review_storefastpath_used`
-      not yet spent).
-- [ ] **T9/T10** (fix findings, close, PR).
+- [x] **T8** (one gated independent review — no blocking findings; several
+      should-fix findings on evidence precision addressed in T9).
+- [x] **T9** (fix review findings: corrected an overstated ratio figure, an
+      under-hedged regression-comparison claim, an undisclosed noise floor,
+      a stale task-graph reference, and added a test-coverage gap the review
+      found — unit-stride rows with scattered columns on the new vectorized
+      store path).
+- [ ] **T10** (close, PR).
 
 **What shipped (T4).** `src/kernels/simd.jl`'s store fast-path guard
 (`_vector_store_eligible`) widened from an inline `isa Vector{T}` check to
@@ -709,14 +714,23 @@ tail (an allocation-cliff risk once the branch became reachable). Test
 additions in `test/test_simd_kernel.jl` and `test/test_driver.jl`.
 
 **Measured.** Full suite 34853/34853 passing (was 34654; +199 assertions, no
-regressions). Post-fix, the D-mem vs D-vec per-element store-cost gap (was
-~1.8-2.3 ns/element, ~4-5x) is eliminated (delta now -0.10 to +0.06 ns/elem,
-noise-level); native-code stack-store counts for D-mem and D-vec are now
-identical. Two-tree ABBA re-benchmark (`bench_real_path_guard.jl`): no
-one-sided regression on any of 18 shapes, up to ~2.5-3.3x speedup on
-unit-stride-destination shapes. The `ccsd_t_*_dim16` regression itself
-(Arm 1, adapter path) is unchanged by the fix, as predicted (ratios vs
-`StridedBLAS` still 8.1x-14.4x across the four cases and both dtypes).
+regressions) -- re-verified independently by the coordinator. Post-fix, the
+D-mem vs D-vec per-element store-cost gap (was 1.69-2.26 ns/element,
+3.9x-9.9x) is eliminated to below this run's own measurement resolution
+(delta now -0.10 to +0.06 ns/elem; this run's canary spread was 9.19%, worse
+than the original 3.7%, but the gap closed by 3.1x-30x depending on shape,
+far larger than either run's noise); native-code stack-store counts for
+D-mem and D-vec are now identical. Two-tree ABBA re-benchmark
+(`bench_real_path_guard.jl`): no one-sided regression on any of 18 shapes,
+up to ~2.5-3.3x speedup on unit-stride-destination shapes. The
+`ccsd_t_*_dim16` regression itself (Arm 1, adapter path) is not moved by the
+fix, as predicted -- ratios vs `StridedBLAS` are 8.1x-14.5x post-fix,
+close to but not exactly matching the 6.6-14.2x pre-fix baseline (Float64
+agrees to +/-3%; Float32 drifted +5% to +23%, within this machine's
+~25% same-contraction run-to-run noise at this size, per `docs/decisions.md`
+-- the mechanism-level evidence (zero unit-stride slivers in all 8
+case x dtype cells, both before and after) is the stronger support for
+"not moved", not the timing comparison.
 
 **Still out of scope**: repointing `TensorOperationsBenchmarks` (PR #303
 still unmerged upstream); the label-ordering lever surfaced by Arm 3 (see

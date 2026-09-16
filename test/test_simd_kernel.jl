@@ -481,6 +481,35 @@ using StridedViews: StridedView
             @test all(==(-999.0), collect(storage)[1:pad])
             @test all(==(-999.0), collect(storage)[(end - pad + 1):end])
         end
+
+        @testset "vectorized store path with unit-stride rows but SCATTERED columns" begin
+            # _vector_store_eligible only inspects `tile.rows`/`tile.storage`
+            # -- a ScatterAxis on the COLUMN side is untouched by the guard
+            # and still takes the vectorized path (axis_offset dispatches on
+            # the axis type generically). Found as an untested combination at
+            # milestone review (T8): this is the case QuasiStrided exists
+            # for (irregular/permuted output axes), and it depends on
+            # `colbase` being computed from `axis_offset(cols, j)` only
+            # inside the `j < n` guard (src/kernels/simd.jl).
+            m, n = MR - 3, NR - 1
+            col_offsets = collect(0:2:(2 * (n - 1)))  # a non-affine (but here regular) permutation-style column map
+            rows = AffineAxis(0, 1, m)
+            cols = ScatterAxis(col_offsets, n)
+            span = m * (maximum(col_offsets) + 1)
+
+            Cold = rand(rng, span)
+            fast = dense_storage(copy(Cold))
+            dst_fast = DestinationTile(fast, 0, rows, cols)
+            @test _vector_store_eligible(dst_fast, Float64)  # rows are unit-stride and dense; cols type is irrelevant to the guard
+            execute_tile!(k, dst_fast, pa, pb, kc, 1.5, 0.5)
+
+            slow = copy(Cold)
+            dst_slow = DestinationTile(view(slow, 1:span), 0, rows, cols)
+            @test !_vector_store_eligible(dst_slow, Float64)  # SubArray storage forces the fallback
+            execute_tile!(k, dst_slow, pa, pb, kc, 1.5, 0.5)
+
+            @test collect(fast) ≈ slow atol = 1.0e-10 rtol = 1.0e-10
+        end
     end
 
     @testset "allocation: execute_tile! on dense 1-D storage WITH TAIL ROWS is allocation-free" begin
