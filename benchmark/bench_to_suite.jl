@@ -4,6 +4,7 @@
 #   julia --project=benchmark benchmark/bench_to_suite.jl [options]
 #
 # Options (all optional):
+#   --categories pairwise,tccg
 #   --dtypes Float64,Float32
 #   --pairwise-sizes 15,63,128
 #   --tccg-sizes 8,16
@@ -29,6 +30,7 @@ const TOB = TensorOperationsBenchmarks
 
 const REPS = argopt("reps", 21)
 const DTYPES = parse_dtypes(argopt("dtypes", "Float64,Float32"))
+const CATEGORIES = Symbol.(split(argopt("categories", "pairwise,tccg"), ','))
 const PAIRWISE_SIZES = parse_ints(argopt("pairwise-sizes", "15,63,128"))
 const TCCG_SIZES = parse_ints(argopt("tccg-sizes", "8,16"))
 const MAX_CASE_BYTES = argopt("max-bytes", 2 * 2^30)
@@ -44,7 +46,10 @@ const BACKENDS = (
 @assert TOB.REGISTRY[:pairwise] === TOB._pairwise_cases
 @assert TOB.REGISTRY[:tccg] === TOB._tccg_cases
 
-const CASES = vcat(TOB._pairwise_cases(PAIRWISE_SIZES), TOB._tccg_cases(TCCG_SIZES))
+const CASES = vcat(
+    :pairwise in CATEGORIES ? TOB._pairwise_cases(PAIRWISE_SIZES) : BenchmarkCase[],
+    :tccg in CATEGORIES ? TOB._tccg_cases(TCCG_SIZES) : BenchmarkCase[],
+)
 
 _nelem(spec::ContractSpec, I) = prod((spec.dims[l] for l in I); init = 1)
 
@@ -248,7 +253,7 @@ open(SUMMARY_PATH, "w") do io
     end
 
     for T in DTYPES
-        for cat in (:pairwise, :tccg)
+        for cat in CATEGORIES
             println(io, "\n===== ", T, " / ", cat, " =====")
             ids = unique(r.id for r in raw if r.dtype == T && r.category == cat)
             for id in ids
@@ -376,6 +381,7 @@ open(PROVENANCE_PATH, "w") do io
     println(io, "backends = ", collect(keys(BACKENDS)), " (QuasiStrided = QuasiStridedBackend() directly)")
     println(io, "dtypes = ", collect(DTYPES))
     println(io, "reps = ", REPS, " (median, one discarded warm-up)")
+    println(io, "categories = ", CATEGORIES)
     println(io, "pairwise sizes = ", PAIRWISE_SIZES)
     println(io, "tccg sizes = ", TCCG_SIZES)
     println(io, "cases generated = ", length(CASES), " per dtype")
