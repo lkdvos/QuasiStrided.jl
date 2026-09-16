@@ -653,7 +653,7 @@ subprocess, which on a cold depot has to precompile first (observed here at
 2m24s, against 5.5s once warm). It is not a real failure — re-run the suite,
 and check it in isolation before believing it.
 
-## Store fast-path investigation milestone — open
+## Store fast-path investigation milestone — complete
 
 Opened 2026-09-15 on branch `store-fastpath-investigation`, base `main`
 (`71c1536`). Follow-up to the (unmerged) upstream TensorOperations.jl
@@ -672,21 +672,75 @@ and the planning-time evidence (E1-E7) are in `docs/decisions.md`, "Store
 fast-path investigation: Phase A" — that file, not this one, is authoritative
 for *why*.
 
+This milestone is **complete as a real `src/` fix**, not just a benchmarking
+exercise: the evidence-gated decision (T1-T3) selected "(a) fix", T4 shipped
+it (`src/kernels/simd.jl`, `test/test_simd_kernel.jl`, `test/test_driver.jl`),
+and T5 measured its effect both in isolation and through the real
+`ccsd_t_*_dim16` regression this milestone exists to investigate. T6 review
+and T8/close/PR are the remaining next steps (see checklist below).
+
 Non-goals: `QuasiStridedBackend`'s hard-reject invariant, the macro-blocking
 five-loop structure, `src/target.jl`'s register-shape derivation, a general
 fix for Cause B, a wider profiling sweep, repointing the `TensorOperationsBenchmarks`
 dependency (PR #303 upstream still unmerged, confirmed 2026-09-15).
 
-- [ ] **T1** (fact probes: storage-type reachability per Julia version, SIMD.jl
+- [x] **T1** (fact probes: storage-type reachability per Julia version, SIMD.jl
       on `Memory{T}`, the four regression cases' actual C-side stride layout,
       provenance of the "101-103 GFLOP/s" claim).
-- [ ] **T2** (tile-level store-path microbenchmark).
-- [ ] **T3** (ccsd_t regression + control script, no timing run yet).
-- [ ] **Decision gate** (fix / docs-only / escalate, per the evidence).
-- [ ] **T4** (fix, if the gate selects it — `src/kernels/simd.jl` +
-      `test/test_simd_kernel.jl` + one `test/test_driver.jl` testset only).
-- [ ] **T5** (measurement campaign).
-- [ ] **T7** (docs).
+- [x] **T2** (tile-level store-path microbenchmark).
+- [x] **T3** (ccsd_t regression + control script, no timing run yet).
+- [x] **Decision gate** (fix / docs-only / escalate, per the evidence — chose
+      "(a) fix").
+- [x] **T4** (fix — `src/kernels/simd.jl` + `test/test_simd_kernel.jl` + one
+      `test/test_driver.jl` testset only).
+- [x] **T5** (measurement campaign).
+- [x] **T7** (docs — this section and `docs/decisions.md`'s "T4-T5: the fix
+      and its measured effect").
 - [ ] **T8** (one gated independent review — `fable_review_storefastpath_used`
       not yet spent).
 - [ ] **T9/T10** (fix findings, close, PR).
+
+**What shipped (T4).** `src/kernels/simd.jl`'s store fast-path guard
+(`_vector_store_eligible`) widened from an inline `isa Vector{T}` check to
+any concrete `DenseVector{T}` (covering `Memory{T}`, the type the real driver
+actually hands the kernel on Julia >= 1.11), with a `@generated`,
+statically-indexed `_store_tile_vector!` replacing the old runtime-indexed
+tail (an allocation-cliff risk once the branch became reachable). Test
+additions in `test/test_simd_kernel.jl` and `test/test_driver.jl`.
+
+**Measured.** Full suite 34853/34853 passing (was 34654; +199 assertions, no
+regressions). Post-fix, the D-mem vs D-vec per-element store-cost gap (was
+~1.8-2.3 ns/element, ~4-5x) is eliminated (delta now -0.10 to +0.06 ns/elem,
+noise-level); native-code stack-store counts for D-mem and D-vec are now
+identical. Two-tree ABBA re-benchmark (`bench_real_path_guard.jl`): no
+one-sided regression on any of 18 shapes, up to ~2.5-3.3x speedup on
+unit-stride-destination shapes. The `ccsd_t_*_dim16` regression itself
+(Arm 1, adapter path) is unchanged by the fix, as predicted (ratios vs
+`StridedBLAS` still 8.1x-14.4x across the four cases and both dtypes).
+
+**Still out of scope**: repointing `TensorOperationsBenchmarks` (PR #303
+still unmerged upstream); the label-ordering lever surfaced by Arm 3 (see
+callout below — a candidate new milestone, not started); any remaining
+upstream benchmark-suite categories.
+
+> **Callout: an unplanned finding that needs a decision, not yet acted on.**
+> T5's measurement sweep also ran a label-order diagnostic control (Arm 3,
+> built by T3 only to separate the store fast-path's contribution from other
+> effects — not part of this milestone's own goals). At `dim=16`, simply
+> permuting the operand carrying the destination's stride-1 label to be that
+> operand's own first physical axis gives a **3.3x-20x speedup** over the
+> adapter's real path (Arm 1) on the exact four `ccsd_t_*_dim16` regression
+> cases, for both Float64 and Float32 — far larger than anything this
+> milestone's own scope (the store fast-path) could ever have delivered for
+> this case class. This points at a different, product-level lever
+> (`_classify_labels`'s label ordering in `src/driver.jl`, currently pinned
+> by an existing test) that this milestone's task graph did **not**
+> authorize touching, per its own frozen "replanning trigger" language
+> (`docs/decisions.md`, "Store fast-path investigation: Phase A"). **No code
+> was changed in response to this finding.** It is reported here, prominently,
+> as a candidate follow-up milestone requiring the user's/coordinator's
+> decision — closing this milestone does not mean the `ccsd_t_*` regression
+> story is finished, only that the specific hypothesis this milestone was
+> built to test (Cause A, the store fast-path) is now fully resolved. See
+> `docs/decisions.md`'s "T4-T5: the fix and its measured effect" for the
+> exact per-case numbers.

@@ -3572,3 +3572,103 @@ with a statically-indexed tail body (per E6) verified allocation-free at
 `ccsd_t_*_dim16` regression at all, and the docs close-out (T7) must state
 that explicitly so nobody reads a future `Pkg.test()`-adjacent benchmark
 re-run as evidence either way for that specific case class.
+
+### T4-T5: the fix and its measured effect
+
+**T4 (the fix, already committed on this branch, `f467b45`).**
+`src/kernels/simd.jl`'s store fast-path guard (`_vector_store_eligible`,
+formerly an inline `isa Vector{T}` check) was widened to accept any concrete
+`DenseVector{T}` (covering `Memory{T}`, which is what the real driver always
+hands the kernel on Julia >= 1.11), while continuing to exclude
+`Matrix`/`SubArray`/non-unit-stride destinations. The old fast path's tail
+handling used a runtime-indexed accumulator access (an allocation-cliff risk
+once the branch became reachable, per the GUARDRAIL convention already
+established elsewhere in this file for the scattered-store path) — replaced
+with a `@generated`, statically-indexed `_store_tile_vector!`, mirroring
+`_store_tile_scattered!`'s existing style. Verified: full test suite
+34853/34853 passing (was 34654 before this milestone; +199 new assertions, no
+regressions); zero steady-state allocation with tail rows at register widths
+up to `NV=28` on Julia >= 1.11 (skip-marked on 1.10, this project's existing
+convention); `@code_native` confirmed the vectorized path (direct `vmovupd`
+to the destination pointer) is genuinely reached for `Memory{Float64}`-backed
+tiles, with the scattered path (element-by-element, stack round-tripping)
+still reached for `SubArray`/`Matrix`/`ScatterAxis`-backed tiles.
+
+**T5 (the measurement campaign).** All results below are from
+`benchmark/results/ccqlin038.flatironinstitute.org-2026-09-15/T5_*` files, run
+on this machine, 2026-09-15.
+
+- Two-tree ABBA guard comparison (`benchmark/bench_real_path_guard.jl`, base
+  commit `d1127dd` vs fixed commit `f467b45`, 21 reps): no one-sided
+  regression on any of 18 measured shapes; ratios (fixed/base) ranged from
+  ~0.98 (near-parity, e.g. scattered-input shapes untouched by this fix) to
+  ~0.31-0.41 (shapes with unit-stride destinations, e.g.
+  `shallowK_256x24x256` at 0.407x/0.305x for F64/F32 — a ~2.5-3.3x speedup).
+  Canary bracket judged quiet by this project's own established convention
+  (middle-vs-end spread, not the full start/mid/end spread, since the
+  script's own documented caveat is that the start point reads faster from a
+  warm-up effect) — all middle/end spreads were small (0.21-5.58%).
+- Re-run of `benchmark/bench_store_path.jl` (unmodified script) on the fixed
+  tree: the D-mem vs D-vec per-element store-cost gap that T2 measured
+  before the fix (~1.8-2.3 ns/element, ~4-5x, "far above noise") is now
+  eliminated — post-fix delta(mem-vec) ranges from -0.10 to +0.06 ns/element
+  across all 8 (shape,kc) x 2 beta-regime cells, i.e. statistically
+  indistinguishable from zero. Native-code stack-store instruction counts for
+  D-vec and D-mem are now identical (8 total vector stores, 4 stack, 4 other,
+  at both shipped shapes) — direct confirmation the two code paths are now
+  genuinely the same path. Zero allocation confirmed again (144 cells).
+- Full sweep of `benchmark/bench_ccsd_t_store.jl` (both dims, both dtypes,
+  all 3 arms, post-fix): Arm 1 (`QuasiStridedBackend` via the TensorOperations
+  adapter) at `dim=16` is essentially UNCHANGED from this milestone's opening
+  characterization of the regression (ratios: `ccsd_t_1` 10.1x/12.1x,
+  `ccsd_t_2` 14.4x/12.9x, `ccsd_t_3` 9.6x/8.1x, `ccsd_t_4` 14.4x/11.6x for
+  F64/F32 respectively) — **confirming the fix does not move this regression
+  class, exactly as predicted** (E3: zero unit-stride M/N-slivers under the
+  adapter's own label order, reconfirmed at `dim=16` specifically, not just
+  analytically inferred).
+
+**Confirmed closing statement**: Cause A fixed for ordinary
+(unit-stride-destination) contractions on Julia >= 1.11; Cause B (the
+`ccsd_t_*_dim16` regression) confirmed untouched by this fix, exactly as this
+milestone predicted from the start.
+
+**A new, unplanned finding, flagged prominently — not folded quietly into the
+close-out.** T5's full sweep also ran Arm 3 (a label-order diagnostic control
+T3 built, NOT part of this milestone's own goals — it exists only to check
+whether the store fast-path or something else was the real lever). At
+`dim=16`, permuting the operand carrying label `a` (the destination's
+stride-1 axis) to be that operand's own first physical axis gives a **3.3x
+to 20x speedup** over Arm 1 on the SAME four regression cases, consistently
+across all 8 case x dtype combinations (`ccsd_t_1`: 20.0x F64 / 13.6x F32;
+`ccsd_t_2`: 4.1x / 3.7x; `ccsd_t_3`: 4.1x / 4.2x; `ccsd_t_4`: 4.0x / 3.3x —
+quoted exactly from `T5_summary_ccsd_t_full.txt`, already committed). This is
+**far larger** than anything this milestone's own scope (the store fast-path)
+could ever deliver for this case class. Per this milestone's own frozen
+"replanning trigger" language (above, "Decision boundaries"/"Replanning
+triggers"):
+
+> the C-local label-order control (Arm 3) in `bench_ccsd_t_store.jl` runs
+> materially faster than the adapter's own label order (Arm 1) on the
+> `dim=16` cases — that would point at a different, product-level lever
+> (`_classify_labels`'s label ordering, currently pinned by an existing test)
+> requiring the user's decision as a separate follow-up, not something this
+> milestone acts on unilaterally.
+
+This is being **reported, NOT acted on**: it points at a different,
+product-level lever (`_classify_labels`'s label ordering, currently pinned by
+an existing test per that same frozen text) that needs the user's/
+coordinator's decision as a SEPARATE follow-up milestone, not something this
+milestone's own task graph authorized touching. **No code was changed in
+response to this finding.** Closing THIS milestone does not mean the
+`ccsd_t_*` regression's story is finished — only that the specific hypothesis
+(Cause A, the store fast-path) this milestone was built to test has been
+fully resolved.
+
+**Follow-ups, explicitly out of scope for this milestone:**
+
+- Repointing the `TensorOperationsBenchmarks` dependency (still blocked, PR
+  #303 upstream unmerged).
+- The label-ordering lever surfaced by Arm 3 — a candidate NEW milestone,
+  not started, needs a decision from the user.
+- Any remaining upstream benchmark-suite categories (this milestone's own
+  frozen non-goals already excluded a wider profiling sweep).
