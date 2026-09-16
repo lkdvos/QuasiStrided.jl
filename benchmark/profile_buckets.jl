@@ -1,6 +1,5 @@
 # Bucketed cost-attribution helper for benchmark/profile_to_suite.jl.
-# `include`d, not a module -- consistent with benchmark/harness.jl and
-# benchmark/composite_backend.jl's own convention.
+# `include`d, not a module, consistent with benchmark/harness.jl.
 #
 # Parses `Profile.fetch()`'s raw backtrace data directly (rather than relying
 # on `Profile.print`'s text output) so we can compute, per frame, which named
@@ -23,13 +22,9 @@ const QS_BUCKETS = [
     ("adapter/prepare", ["_qs_prepare", "StridedView", "argcheck", "dimcheck", "mightalias", "tensoroperations.jl"]),
     ("planning", ["plan_contract", "_plan_contract", "AxisGroup", "fill_offsets!", "block_descriptors!", "driver.jl", "axis_group.jl"]),
     ("packing", ["pack_a!", "pack_b!", "_pack_panel!", "_pack_sliver!", "packing.jl"]),
-    # "store" MUST be listed (and therefore matched) before "microkernel":
-    # the store path's own frames (`_store_tile_scattered!`, `tile_store!`,
-    # `tile_offset`, `_axpby_tile!`) live in the same file (kernels/simd.jl)
-    # as the FMA microkernel, so a bare "kernels/" file-path substring on
-    # "microkernel" would swallow them first-match-wins. Found by review
-    # (T6) of an earlier ordering that put "microkernel" first and so
-    # mis-attributed all store cost as arithmetic.
+    # Must precede "microkernel": the store path's own frames live in the
+    # same file (kernels/simd.jl) as the FMA microkernel, so a bare
+    # "kernels/" substring on "microkernel" would swallow them first-match-wins.
     (
         "store",
         [

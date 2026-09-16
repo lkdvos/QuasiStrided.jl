@@ -1,45 +1,18 @@
-# Head-to-head timing of `StridedNative()`, `StridedBLAS()` and
-# `QuasiStridedBackend()` on the *upstream* TensorOperations.jl benchmark
-# suite's own cases -- the `:pairwise` and `:tccg` categories of
-# `TensorOperationsBenchmarks` -- rather than on this repo's hand-written
-# matmul-shaped grid. (This script previously ran QuasiStrided through a
-# benchmark-only `QuasiStridedComposite()` wrapper so the suite's
-# one-backend-per-provider interface could also exercise `:permute`/`:trace`
-# categories against it; `QuasiStridedBackend` now falls back to
-# `StridedNative()` for those two operations itself -- see
-# docs/decisions.md, "Amendment 7" -- so the wrapper is retired and every
-# case here runs against the real backend directly.)
+# Head-to-head timing of StridedNative(), StridedBLAS() and QuasiStridedBackend()
+# on the upstream TensorOperations.jl benchmark suite's :pairwise/:tccg cases.
 #
-#   julia --project=benchmark benchmark/bench_to_suite.jl
-#   # or, warm: jld --project=benchmark run benchmark/bench_to_suite.jl
+#   julia --project=benchmark benchmark/bench_to_suite.jl [options]
 #
-# writes bench_to_suite.csv / canary_to_suite.csv / summary_to_suite.txt /
+# Options (all optional):
+#   --dtypes Float64,Float32
+#   --pairwise-sizes 15,63,128
+#   --tccg-sizes 8,16
+#   --reps 21
+#   --max-bytes 2147483648      # per-case skip ceiling
+#
+# Writes bench_to_suite.csv / canary_to_suite.csv / summary_to_suite.txt /
 # mismatches_to_suite.txt / PROVENANCE_to_suite.txt to
 # benchmark/results/<hostname>-<date>/.
-#
-# Why this is a sibling of benchmark/bench_tensoroperations.jl and not an
-# extension of it: that script is the evidence base quoted in the README and
-# every committed number under benchmark/results/ for it was taken against its
-# own literal shape grid (see the comment there). This script keeps that
-# script's measurement conventions verbatim -- warm-up-then-median timing,
-# reps >= 15, a StridedBLAS 64^3 Float64 canary at start/middle/end, CSV +
-# summary + PROVENANCE -- while taking its CASES from upstream, reusing
-# benchmark/harness.jl's shared `median_time_s`/`results_dir`/`git_commit`/
-# `print_env_header`/`relative_spread` rather than a local copy (StridedViews
-# was added to benchmark/Project.toml so harness.jl can be `include`d here).
-#
-# TRIMMING APPLIED: none beyond upstream's own filter. The design contract
-# allowed dropping Float32 and/or reducing `:tccg` if a dry run projected more
-# than 45 minutes of wall clock; a dry run over the three most expensive cases
-# projected well under that, so the full bounded grid below is run as
-# specified: dtypes (Float64, Float32); `:pairwise` at dims {15, 63, 128};
-# `:tccg` (all 24 chemistry specs) at dims {8, 16}. Note that
-# `_pairwise_cases` yields 11 -- not 15 -- cases for those dims because
-# upstream's own `within_memory_budget` (registry.jl, MAX_CASE_BYTES = 256 MiB
-# assuming Float64 elements) drops dim63_2_2_2, dim128_2_1_2, dim128_2_2_2 and
-# dim128_1_3_1. That is upstream's filter, not a trim by this script, and it is
-# left in place deliberately: overriding it would change what the upstream
-# suite's `:pairwise` category means.
 
 using TensorOperations
 using TensorOperations: StridedNative, StridedBLAS
@@ -50,28 +23,15 @@ using QuasiStrided
 using QuasiStrided: QuasiStridedBackend
 import Pkg
 
-include(joinpath(@__DIR__, "harness.jl"))  # median_time_s, results_dir, git_commit,
-# print_env_header, relative_spread, and the single-core measurement pinning
-# (LinearAlgebra/Random/Printf/Dates already `using`d there too).
+include(joinpath(@__DIR__, "harness.jl"))
 
 const TOB = TensorOperationsBenchmarks
 
-# 21 reps, not the 15-rep floor: STATUS.md "Measurement hygiene" records that
-# an 11-rep comparison once invented two regressions that 21 reps erased, and
-# this grid is cheap enough (see the dry-run note above) to afford the margin.
-const REPS = 21
-
-const DTYPES = (Float64, Float32)
-
-const PAIRWISE_SIZES = (15, 63, 128)
-const TCCG_SIZES = (8, 16)
-
-# Per-case memory ceiling for *this* script, applied per dtype before any
-# allocation. Upstream's own `within_memory_budget` (256 MiB, Float64-assumed)
-# is stricter and has already run inside the generators, so this is a belt-and-
-# braces guard that is expected never to fire; a case it does reject is logged
-# and skipped, never an error.
-const MAX_CASE_BYTES = 2 * 2^30  # 2 GiB
+const REPS = argopt("reps", 21)
+const DTYPES = parse_dtypes(argopt("dtypes", "Float64,Float32"))
+const PAIRWISE_SIZES = parse_ints(argopt("pairwise-sizes", "15,63,128"))
+const TCCG_SIZES = parse_ints(argopt("tccg-sizes", "8,16"))
+const MAX_CASE_BYTES = argopt("max-bytes", 2 * 2^30)
 
 const BACKENDS = (
     StridedNative = StridedNative(),
@@ -79,29 +39,16 @@ const BACKENDS = (
     QuasiStrided = QuasiStridedBackend(),
 )
 
-# ---------------------------------------------------------------------------
-# Cases: pulled from the upstream suite's own category generators
-# ---------------------------------------------------------------------------
-#
-# The generators are plain `sizes -> Vector{BenchmarkCase}` functions
-# (TensorOperationsBenchmarks/src/registry.jl, `register_category!`), and
-# `REGISTRY[:pairwise]`/`REGISTRY[:tccg]` hold exactly those two functions --
-# asserted below so a rename upstream is a loud failure here rather than a
-# silent divergence. They are called directly, bypassing
-# `build_suite`/BenchmarkTools, because this script needs this project's own
-# timing discipline (explicit reps, median, canary bracket) and not
-# BenchmarkTools' statistics.
+# `REGISTRY[:pairwise]`/`[:tccg]` are called directly, bypassing
+# `build_suite`/BenchmarkTools, for this project's own timing discipline.
 @assert TOB.REGISTRY[:pairwise] === TOB._pairwise_cases
 @assert TOB.REGISTRY[:tccg] === TOB._tccg_cases
 
 const CASES = vcat(TOB._pairwise_cases(PAIRWISE_SIZES), TOB._tccg_cases(TCCG_SIZES))
 
-# Element counts per operand, from the spec's labels/dims alone.
 _nelem(spec::ContractSpec, I) = prod((spec.dims[l] for l in I); init = 1)
 
-# Total operand bytes at element type `T`. `bytes(spec)` itself always assumes
-# Float64-sized elements (cost.jl's `_elsize(::Nothing)`), so it cannot be used
-# directly for the Float32 rows; this reduces to `bytes(spec)` for Float64.
+# `bytes(spec)` assumes Float64 elements; this is dtype-generic.
 function case_bytes(spec::ContractSpec, ::Type{T}) where {T}
     n = _nelem(spec, spec.IA) + _nelem(spec, spec.IB) + _nelem(spec, spec.IC)
     return n * sizeof(T)
@@ -110,16 +57,6 @@ end
 params_string(params::NamedTuple) =
     join(("$k=$(getfield(params, k))" for k in keys(params)), ";")
 
-# Build the operands for one case. `pA`/`pB`/`pAB` come from
-# `TensorOperations.contract_indices(IA, IB, IC)` -- TO's own label-to-position
-# resolver, the very call the upstream suite's `maketensors(::ContractSpec, ...)`
-# (lowering.jl) and TO's own `@tensor`/`ncon` lowering use. Deriving the
-# `Index2Tuple`s by hand here would be a needless reimplementation of exactly
-# that function and the obvious place for a silent transposition bug, so it is
-# not done. Operands are built through the upstream `ArrayProvider{T}` (plain
-# `Array{T}` filled by `randn!` from the provider's stored Xoshiro), so the
-# data is the upstream suite's own; `C` is allocated here, pre-zeroed and
-# fresh per backend.
 function build_case(spec::ContractSpec, provider, ::Type{T}) where {T}
     dimsA = ntuple(i -> spec.dims[spec.IA[i]], length(spec.IA))
     dimsB = ntuple(i -> spec.dims[spec.IB[i]], length(spec.IB))
@@ -130,19 +67,12 @@ function build_case(spec::ContractSpec, provider, ::Type{T}) where {T}
     return A, B, pA, pB, pAB, dimsC
 end
 
-# One in-place contraction under a given backend, alpha = 1, beta = 0 --
-# the same call the upstream suite's `execute(::ContractSpec, ...)` makes,
-# with only `backend` varying across the three columns.
 function run_case!(backend, C, A, pA, conjA, B, pB, conjB, pAB)
     return TensorOperations.tensorcontract!(
         C, A, pA, conjA, B, pB, conjB, pAB,
         one(eltype(C)), zero(eltype(C)), backend
     )
 end
-
-# ---------------------------------------------------------------------------
-# Output
-# ---------------------------------------------------------------------------
 
 const OUTDIR = results_dir()
 mkpath(OUTDIR)
@@ -170,13 +100,8 @@ end
 print_env_header(stdout, "bench_to_suite.jl")
 println("cases = ", length(CASES), " per dtype (before per-dtype byte skips)")
 
-# ---------------------------------------------------------------------------
-# Canary -- byte-for-byte the same case as benchmark/bench_tensoroperations.jl:
-# StridedBLAS, 64^3 Float64, matmul-shaped `@tensor`, 15 reps, run at the
-# start / middle / end of the sweep to catch drift (thermal throttling,
-# background load).
-# ---------------------------------------------------------------------------
-
+# Canary: StridedBLAS, 64^3 Float64 matmul-shaped @tensor, 15 reps, at
+# start/middle/end -- drift detection (thermal throttling, background load).
 function canary_contract!(backend, C, A, B)
     @tensor backend = backend C[i, j] = A[i, k] * B[k, j]
     return C
@@ -195,22 +120,15 @@ canary_rng = MersenneTwister(0xB3_C4_0003)
 canary_results = Float64[]
 push!(canary_results, run_canary(canary_rng, "A (start)"))
 
-# ---------------------------------------------------------------------------
-# Sweep
-# ---------------------------------------------------------------------------
-
 raw = Vector{NamedTuple}()          # successful timings
 mismatches = Vector{NamedTuple}()   # QuasiStrided result != StridedBLAS result
 failures = Vector{NamedTuple}()     # a backend threw
-skipped = Vector{NamedTuple}()      # over this script's byte ceiling
+skipped = Vector{NamedTuple}()      # over --max-bytes
 
 const MIDPOINT = cld(length(CASES) * length(DTYPES), 2)
 progress = 0
 
 for T in DTYPES
-    # One fresh provider per dtype: its Xoshiro is seeded deterministically
-    # (0x5eed5eed5eed5eed) and stateful, so the whole dtype sweep is
-    # reproducible while individual tensors still differ.
     provider = ArrayProvider{T}()
     rtol = T === Float64 ? 1.0e-10 : 1.0e-5
     for case in CASES
@@ -226,11 +144,8 @@ for T in DTYPES
         A, B, pA, pB, pAB, dimsC = build_case(spec, provider, T)
         fl = flops(spec)
 
-        # -------------------------------------------------------------------
-        # Correctness gate, BEFORE any timing: one untimed call per backend.
-        # StridedBLAS is the reference; QuasiStrided must match it to `rtol`
-        # or its timing for this case is not taken at all.
-        # -------------------------------------------------------------------
+        # Correctness gate before any timing: StridedBLAS is the reference,
+        # QuasiStrided must match to `rtol` or its timing is skipped.
         results = Dict{Symbol, Any}()
         for (bname, backend) in pairs(BACKENDS)
             C = zeros(T, dimsC)
@@ -269,9 +184,6 @@ for T in DTYPES
             end
         end
 
-        # -------------------------------------------------------------------
-        # Timing
-        # -------------------------------------------------------------------
         for (bname, backend) in pairs(BACKENDS)
             haskey(results, bname) || continue           # threw above
             bname === :QuasiStrided && !qs_ok && continue # mismatched above
@@ -315,10 +227,6 @@ open(CANARY_PATH, "w") do io
 end
 println("canary spread (max-min)/min = ", @sprintf("%.4f", canary_spread))
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
-
 const NOISE_FLOOR = max(0.1, canary_spread)
 
 open(SUMMARY_PATH, "w") do io
@@ -331,13 +239,6 @@ open(SUMMARY_PATH, "w") do io
         io,
         "NOISE: read any difference smaller than max(10%, canary spread) = ",
         @sprintf("%.1f%%", 100 * NOISE_FLOOR), " as noise, not as a result."
-    )
-    println(
-        io,
-        "NOTE: the QuasiStrided column is QuasiStridedBackend() directly -- ",
-        "every case here IS a contraction, so no timing below measures its ",
-        "StridedNative tensoradd!/tensortrace! fallback (see docs/decisions.md, ",
-        "\"Amendment 7\")."
     )
     if !isempty(mismatches)
         println(io, "\n!! ", length(mismatches), " CORRECTNESS MISMATCH(ES) -- see mismatches_to_suite.txt")
@@ -376,7 +277,6 @@ open(SUMMARY_PATH, "w") do io
                 )
             end
 
-            # Category-level geometric means of the two headline ratios.
             gq, gn = Float64[], Float64[]
             for id in ids
                 rows = filter(r -> r.dtype == T && r.category == cat && r.id == id, raw)
@@ -396,10 +296,6 @@ open(SUMMARY_PATH, "w") do io
     end
 end
 println(read(SUMMARY_PATH, String))
-
-# ---------------------------------------------------------------------------
-# Mismatches / rejections
-# ---------------------------------------------------------------------------
 
 open(MISMATCH_PATH, "w") do io
     println(io, "# Correctness mismatches, backend rejections and skips")
@@ -427,7 +323,7 @@ open(MISMATCH_PATH, "w") do io
             )
         end
     end
-    println(io, "\n## Cases skipped by this script's ", MAX_CASE_BYTES, "-byte ceiling")
+    println(io, "\n## Cases skipped by --max-bytes=", MAX_CASE_BYTES)
     if isempty(skipped)
         println(io, "none (upstream's own 256 MiB within_memory_budget is stricter and ran first)")
     else
@@ -437,10 +333,6 @@ open(MISMATCH_PATH, "w") do io
     end
 end
 println(read(MISMATCH_PATH, String))
-
-# ---------------------------------------------------------------------------
-# Provenance -- format matched to benchmark/bench_tensoroperations.jl's.
-# ---------------------------------------------------------------------------
 
 commit = git_commit()
 
@@ -481,33 +373,17 @@ open(PROVENANCE_PATH, "w") do io
     println(io, "blas_config = ", LinearAlgebra.BLAS.get_config())
     println(io, "TensorOperations = ", to_version)
     println(io, "TensorOperationsBenchmarks = ", tob_rev)
-    println(
-        io, "TensorOperationsBenchmarks pinned rev (benchmark/Project.toml) = ",
-        "528dd85d8bf886c734a207732a7cb591a3691dd3 ",
-        "(QuantumKitHub/TensorOperations.jl, branch \"benchmark\", subdir benchmark, PR #303)"
-    )
-    println(io, "backends = ", collect(keys(BACKENDS)))
-    println(io, "  QuasiStrided column = QuasiStridedBackend() directly (docs/decisions.md, \"Amendment 7\").")
+    println(io, "backends = ", collect(keys(BACKENDS)), " (QuasiStrided = QuasiStridedBackend() directly)")
     println(io, "dtypes = ", collect(DTYPES))
     println(io, "reps = ", REPS, " (median, one discarded warm-up)")
-    println(io, "case source = TensorOperationsBenchmarks._pairwise_cases / ._tccg_cases,")
-    println(io, "  called directly (asserted identical to REGISTRY[:pairwise]/[:tccg]);")
-    println(io, "  build_suite/BenchmarkTools deliberately bypassed for this project's timing discipline.")
     println(io, "pairwise sizes = ", PAIRWISE_SIZES)
     println(io, "tccg sizes = ", TCCG_SIZES)
     println(io, "cases generated = ", length(CASES), " per dtype")
-    println(io, "cases actually timed (rows/3 nominal) = ", length(raw), " backend-rows total")
+    println(io, "cases actually timed = ", length(raw), " backend-rows total")
     println(io, "case list = ")
     for case in CASES
         println(io, "  ", case.category, "/", case.id, "  ", params_string(case.params))
     end
-    println(io, "trimming = none applied beyond upstream's own within_memory_budget")
-    println(io, "  (registry.jl MAX_CASE_BYTES = 256 MiB, Float64-assumed), which drops")
-    println(io, "  dim63_2_2_2, dim128_2_1_2, dim128_2_2_2 and dim128_1_3_1 from :pairwise,")
-    println(io, "  leaving 11 of a nominal 15. A dry run over the three most expensive")
-    println(io, "  cases projected total wall time far under the 45-minute budget, so")
-    println(io, "  neither the Float32 drop nor the :tccg reduction the design contract")
-    println(io, "  allowed was needed.")
     println(io, "mismatches = ", length(mismatches), " (see mismatches_to_suite.txt)")
     for m in mismatches
         println(
@@ -520,8 +396,6 @@ open(PROVENANCE_PATH, "w") do io
         println(io, "  ", f.category, "/", f.id, " dtype=", f.dtype, " backend=", f.backend)
     end
     println(io, "skipped_cases = ", length(skipped))
-    println(io, "canary = StridedBLAS, 64^3 Float64 matmul-shaped @tensor, 15 reps,")
-    println(io, "  identical to benchmark/bench_tensoroperations.jl's canary; run at start/middle/end.")
     println(io, "canary_medians_s = ", canary_results)
     println(io, "canary_relative_spread = ", @sprintf("%.4f", canary_spread))
     println(io, "noise_floor_used = ", @sprintf("%.4f", NOISE_FLOOR))
@@ -530,19 +404,7 @@ open(PROVENANCE_PATH, "w") do io
     for line in split(top_procs, '\n')
         println(io, "  ", line)
     end
-    println(
-        io,
-        "measurement_hygiene_caveat = this machine is NOT guaranteed exclusive; the load ",
-        "average and process list above were captured by this run. Any difference under ",
-        @sprintf("%.1f%%", 100 * NOISE_FLOOR), " must be read as noise."
-    )
-    println(io, "caveat = single machine ($(gethostname())), single measurement session; ")
-    println(
-        io,
-        "  not averaged across machines or repeated sessions. Numbers are indicative of ",
-        "this reference machine only, matching the caveat in the macro-blocking ",
-        "milestone's benchmark/results/ccqlin038.flatironinstitute.org-2026-09-08/PROVENANCE.txt."
-    )
+    println(io, "caveat = single machine ($(gethostname())), single measurement session.")
 end
 
 println("\nDone. Results in ", OUTDIR)
