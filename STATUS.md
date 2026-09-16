@@ -703,7 +703,7 @@ dependency (PR #303 upstream still unmerged, confirmed 2026-09-15).
       a stale task-graph reference, and added a test-coverage gap the review
       found — unit-stride rows with scattered columns on the new vectorized
       store path).
-- [ ] **T10** (close, PR).
+- [x] **T10** (close, PR). Full suite 34856/34856 passing.
 
 **What shipped (T4).** `src/kernels/simd.jl`'s store fast-path guard
 (`_vector_store_eligible`) widened from an inline `isa Vector{T}` check to
