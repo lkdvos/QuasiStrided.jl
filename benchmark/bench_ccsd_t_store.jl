@@ -1,68 +1,29 @@
-# Store fast-path investigation, Phase A / task T3.
-#
-# Measurement TOOL for a later task (T5) to run at full scale (docs/decisions.md,
-# "Store fast-path investigation: Phase A"). This script builds and SMOKE-TESTS
-# the campaign only; it does not run the full timed sweep itself.
-#
-#   julia --project=. benchmark/bench_ccsd_t_store.jl            # full sweep (T5)
-#   julia --project=. benchmark/bench_ccsd_t_store.jl --smoke    # quick check, dim=8 only
-#
-# Writes benchmark/results/<hostname>-<date>/{bench_ccsd_t_store.csv,
-# summary_ccsd_t_store.txt,PROVENANCE_ccsd_t_store.txt}.
-#
-# ----------------------------------------------------------------------------
-# The four cases (TCCG quantum-chemistry benchmark, prior unmerged milestone,
-# PR #5 "upstream-bench"; this script recreates a minimal, self-contained
-# control rather than merging that branch -- E7):
+# Times four TCCG quantum-chemistry contractions (6-index output, 1
+# contracted index) across three "arms":
 #
 #   ccsd_t_1: C[a,b,c,i,j,k] = A[i,j,m,a] * B[m,k,b,c]
 #   ccsd_t_2: C[a,b,c,i,j,k] = A[i,j,m,b] * B[m,k,a,c]
 #   ccsd_t_3: C[a,b,c,i,j,k] = A[i,j,m,c] * B[m,k,a,b]
 #   ccsd_t_4: C[a,b,c,i,j,k] = A[i,k,m,b] * B[m,j,a,c]
 #
-# Three "arms" per (case, dim, dtype):
+#   Arm 1: TO.tensorcontract! under StridedNative()/StridedBLAS()/QuasiStridedBackend().
+#   Arm 2: QuasiStrided.plan_contract/execute! directly, with the same label
+#          order TO.tensorcontract! derives internally (via _qs_labels).
+#   Arm 3: same as Arm 2, but with whichever operand carries `a` (C's
+#          stride-1 axis) permuted so `a` is that operand's own first
+#          physical axis -- isolates whether label ordering, not the store
+#          fast-path, is the lever for this shape class. Effect's sign
+#          depends on dim vs the kernel's MR/NR (see per-case perm below).
 #
-#   Arm 1: TO.tensorcontract!(...) under StridedNative()/StridedBLAS()/
-#          QuasiStridedBackend() -- apples-to-apples with the prior milestone.
-#   Arm 2: QuasiStrided.plan_contract/execute! directly, using the SAME label
-#          order the adapter derives (via _qs_labels(pA,pB,pAB), the exact
-#          function the adapter itself calls -- not a hand-guessed
-#          re-derivation, so this arm's labels are provably identical to what
-#          Arm 1's QuasiStridedBackend row actually uses internally).
-#   Arm 3: QuasiStrided direct API again, but with A or B's physical axis
-#          order permuted (via `permutedims(StridedView(...), perm)`) so that
-#          the SAME label that is C's fastest-varying (stride-1) axis --
-#          always `a`, since C is always built a,b,c,i,j,k -- becomes the
-#          FIRST axis of whichever operand carries it (A for ccsd_t_1, B for
-#          ccsd_t_2/3/4). This is a diagnostic control for whether label
-#          ordering, not the store fast-path, is the actual lever for this
-#          case class (docs/decisions.md's "replanning trigger": if Arm 3 is
-#          materially faster than Arm 1 on dim=16, that points at
-#          `_classify_labels`' label ordering as a separate, product-level
-#          decision, not something this milestone acts on itself).
+#   julia --project=. benchmark/bench_ccsd_t_store.jl [options]
 #
-# CONFIDENCE NOTE on Arm 3 (checked directly by hand during authoring, not
-# just asserted): the reordering provably changes `plan_contract`'s internal
-# M/N `AxisGroup` classification, at least at dim=8:
-#   - ccsd_t_1 (A permuted, M-side, MR=16 > dim=8): moves the C-side
-#     descriptor from `regular=true,stride=512` (dim^3; the group's axis
-#     order, taken from indA, put `i` -- not `a` -- as its fastest label) to
-#     `regular=false` (because MR=16 straddles `a`'s own extent of 8, so the
-#     sliver crosses a carry boundary from `a` into `i`). I.e. at THIS dim/MR
-#     combination the reordering makes the classification worse, not better --
-#     it would need MR<=dim (true again at dim=16 with the shipped MR=16) to
-#     actually land a clean unit-stride sliver. This is a real, checked effect,
-#     not a hypothetical one, but its SIGN depends on dim vs MR/NR, which is
-#     exactly the kind of thing this diagnostic exists to surface for T5 to
-#     look at empirically across both dims.
-#   - ccsd_t_2 (B permuted, N-side, NR=6 < dim=8): moves the C-side descriptor
-#     from `regular=true,stride=32768` to `regular=true,stride=1` -- a clean,
-#     unambiguous unit-stride win at this dim. Reproduced directly with
-#     `QuasiStrided.block_descriptors!` during authoring (see report).
-# So: yes, the reordering is confirmed (not just assumed) to change the
-# measurable internal classification, but T5 must not assume the direction is
-# always "Arm 3 better" -- check both dims, both M-side and N-side cases.
-# ----------------------------------------------------------------------------
+# Options:
+#   --smoke              dims=(8,) only, quick check
+#   --dims 8,16
+#   --dtypes Float64,Float32
+#
+# Writes benchmark/results/<hostname>-<date>/{bench_ccsd_t_store.csv,
+# summary_ccsd_t_store.txt,PROVENANCE_ccsd_t_store.txt}.
 
 using TensorOperations
 import TensorOperations as TO
@@ -72,22 +33,16 @@ using QuasiStrided: QuasiStridedBackend
 using StridedViews
 using StridedViews: StridedView
 using Random
-using Printf
-using Dates
 
-include(joinpath(@__DIR__, "harness.jl"))  # median_time_s, gflops, results_dir, git_commit,
-# print_env_header, run_canary, relative_spread, single-core discipline/warning.
+include(joinpath(@__DIR__, "harness.jl"))
 
-const SMOKE = "--smoke" in ARGS
+const SMOKE = hasflag("smoke")
+const DIMS = SMOKE ? (8,) : parse_ints(argopt("dims", "8,16"))
+const CORRECTNESS_DTYPES = parse_dtypes(argopt("dtypes", "Float64,Float32"))
 
-# ----------------------------------------------------------------------------
-# Case specifications
-# ----------------------------------------------------------------------------
-
-# `arm3_target` names which operand (:A or :B) carries `a` (C's stride-1
-# axis) and therefore gets permuted for Arm 3; `arm3_perm` is that operand's
-# own 4-axis permutation moving `a` to the front, holding the relative order
-# of the other three axes fixed.
+# `arm3_target` names which operand carries `a` (C's stride-1 axis) and
+# therefore gets permuted for Arm 3; `arm3_perm` is that operand's own
+# 4-axis permutation moving `a` to the front.
 struct CaseSpec
     name::String
     IA::NTuple{4, Symbol}
@@ -116,34 +71,16 @@ const CASES = [
     ),
 ]
 
-const DIMS = SMOKE ? (8,) : (8, 16)
-const CORRECTNESS_DTYPES = (Float64, Float32)  # same as the timed sweep
-
-# ----------------------------------------------------------------------------
-# Reps policy (task spec + this project's own "fewer reps allowed for
-# expensive rows, more required where the conclusion depends on <10%
-# differences" convention).
-# ----------------------------------------------------------------------------
-
+# dim=16 QuasiStrided calls run ~1-2s each; keep those at 15 reps, everything
+# else (dim=8, and dim=16 StridedNative/StridedBLAS) at 21.
 function reps_for(dim::Int, arm::Int, backend_name::AbstractString)
     dim == 8 && return 21
-    # dim == 16: the QuasiStrided engine (arm 2/3, or arm 1's own
-    # QuasiStridedBackend row -- same engine underneath) is the expensive one
-    # (prior milestone: ~1-2s/call at dim=16); StridedNative/StridedBLAS stay fast.
     (arm == 1 && backend_name != "QuasiStrided") && return 21
     return 15
 end
 
-# ----------------------------------------------------------------------------
-# Layout diagnostic (E3): tally M/N register-slivers of a plan's mgroup/ngroup
-# by whether their C-side BlockDescriptor is `regular && stride == 1`.
-# `benchmark/probes/probe_ccsd_t_layout.jl` did not exist in `benchmark/probes/`
-# at the time this file was written (T1 had not landed it yet), so this is an
-# independent implementation built directly from `src/axis_group.jl`'s
-# `block_descriptors!`/`BlockDescriptor` and the usage pattern in
-# `src/driver.jl`'s `_scale_all_of_C!`/`_classify_slivers!`.
-# ----------------------------------------------------------------------------
-
+# Tallies M/N register-slivers of a plan's mgroup/ngroup by whether their
+# C-side BlockDescriptor is `regular && stride == 1`.
 function tally_group_slivers(group, reg_tile::Int)
     Q = QuasiStrided.axis_length(group)
     buf1 = Vector{Int}(undef, reg_tile)
@@ -232,9 +169,6 @@ println("dims = ", collect(DIMS))
 
 const rng = MersenneTwister(0xC7_5D_00_03)
 
-# Canary bracket (reused from harness.jl's own SIMDKernel/64^3/mc,kc,nc
-# combo; same spirit as every other script in this project -- a fixed,
-# unrelated shape timed at the start/middle/end of the sweep to catch drift).
 canary_results = Float64[]
 push!(canary_results, run_canary(rng, "A (start)"))
 
@@ -392,7 +326,7 @@ end
 
 open(PROVENANCE_PATH, "w") do io
     println(io, "git_commit = ", git_commit())
-    println(io, "command = julia --project=. benchmark/bench_ccsd_t_store.jl", SMOKE ? " --smoke" : "")
+    println(io, "command = julia --project=. benchmark/bench_ccsd_t_store.jl ", join(ARGS, " "))
     println(io, "hostname = ", gethostname())
     println(io, "cpu = ", Sys.CPU_NAME)
     println(io, "julia = ", VERSION)
@@ -419,4 +353,3 @@ open(PROVENANCE_PATH, "w") do io
 end
 
 println("\nDone. Results in ", OUTDIR)
-println(SMOKE ? "(--smoke: dim=8 only, quick check -- NOT the full T5 sweep)" : "(full sweep)")

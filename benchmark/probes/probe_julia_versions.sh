@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
-# T1 probe: what Julia versions/toolchains are available on this machine,
-# to check whether Julia 1.10 (LTS, this package's compat floor) can be
-# tested locally for the storage-type guard's behavior, or whether CI's
-# `lts` matrix entry is the only 1.10 gate.
+# Reports which Julia versions/toolchains are available on this machine.
 #
 # Usage: bash benchmark/probes/probe_julia_versions.sh
-# Writes benchmark/results/<hostname>-<date>/probes_T1_julia_versions.txt
+# Writes benchmark/results/<hostname>-<date>/probes_julia_versions.txt
 set -uo pipefail
 
 OUTDIR="$(dirname "$0")/../results/$(hostname)-$(date +%Y-%m-%d)"
 mkdir -p "$OUTDIR"
-OUTPATH="$OUTDIR/probes_T1_julia_versions.txt"
+OUTPATH="$OUTDIR/probes_julia_versions.txt"
 
 {
     echo "hostname = $(hostname)"

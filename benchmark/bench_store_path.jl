@@ -1,22 +1,17 @@
-# Store fast-path investigation (docs/decisions.md, "Store fast-path
-# investigation: Phase A") -- task T2.
+# Tile-level cost of the scattered-store path (`_store_tile_scattered!`) vs.
+# the vectorized fast path in `store_tile!` (src/kernels/simd.jl), across
+# destination-storage variants (`Vector{T}`, `Memory{T}`, strided-hot,
+# strided-cold, and MR-tail versions of the first two). Also attempts to
+# reproduce the "SIMDKernel reaches 101-103 GFLOP/s" accumulate-only claim
+# (docs/decisions.md, Float64, kc=256). Report-only, no fix applied.
 #
-# Tile-level cost of the scattered-store path (`_store_tile_scattered!`,
-# src/kernels/simd.jl) vs. the vectorized fast path in `store_tile!`
-# (src/kernels/simd.jl:217, `_unit_stride_rows(destination.rows) &&
-# destination.storage isa Vector{T}` -- analytically dead on Julia >= 1.11
-# per E1, since the real driver hands the kernel `Memory{T}`), across four
-# destination-storage variants plus MR-tail variants of the two that matter
-# for the guard (`Vector{T}` vs `Memory{T}`, otherwise-identical geometry).
+#   julia --project=. benchmark/bench_store_path.jl [options]
 #
-# Also attempts to reproduce the "SIMDKernel reaches 101-103 GFLOP/s, ~88% of
-# peak" accumulate-only claim (docs/decisions.md, "NV is held at 12
-# deliberately", Float64, kc=256, packed panel "as plain Vector").
-#
-# Report-only: builds no fix. See docs/decisions.md's "Decision boundaries"
-# for what this feeds into.
-#
-#   julia --project=. benchmark/bench_store_path.jl
+# Options:
+#   --reps 21  --batch 50000  --alloc-batch 100
+#   --kc 16,256
+#   --cold-npos 4096  --cold-step 8191
+#   --skip-repro  --skip-native
 
 include(joinpath(@__DIR__, "harness.jl"))
 
@@ -26,61 +21,37 @@ using QuasiStrided: SIMDKernel, mr, nr, lanewidth, scalartype,
     execute_tile!, PackedPanel, packed_panel
 using InteractiveUtils: code_native
 
-# ---------------------------------------------------------------------------
-# Measurement constants
-# ---------------------------------------------------------------------------
+const REPS = argopt("reps", 21)
+const BATCH = argopt("batch", 50_000)          # calls per timed rep, for median_time_s
+const ALLOC_BATCH = argopt("alloc-batch", 100) # calls per @allocated probe (after warm-up)
 
-const REPS = 21
-const BATCH = 50_000          # calls per timed rep, for median_time_s
-const ALLOC_BATCH = 100       # calls per @allocated probe (after warm-up)
-
-# "Cold" destination: cycle the tile's base across COLD_NPOS positions spaced
-# COLD_STEP elements apart.
-#
-# DEVIATION FROM THE TASK TEXT'S LITERAL "e.g. cycle through 4096 distinct
-# tile positions" reading: the task's own D-strided-hot/cold geometry (row
-# stride 4096, col stride 4096*MR, mimicking the real ccsd_t_* stride
-# pattern, E3) already makes one tile's own address footprint ~0.4-0.9M
-# elements (~3-7 MB for Float64) at the shapes swept here. 4096 *fully
-# disjoint* copies of that footprint would need tens of GB per shape, which
-# is not a reasonable thing for a benchmark script to allocate on a shared
-# machine. Instead this sweeps COLD_NPOS=4096 positions spaced COLD_STEP=8191
-# elements apart (coprime-ish to the 4096-element row stride, so consecutive
-# positions land on different pages), spanning ~270 MB of address space per
-# shape -- comfortably larger than one core's L2 (1 MiB) and most of one
-# socket's L3 (~24.75 MiB) on the reference machine, while keeping total
-# script memory in the hundreds-of-MB range. This is an approximation of "a
-# large, mostly-cold output", not a reproduction of the exact regression
-# case's address arithmetic (that is out of scope -- E3/Cause B, non-goals).
-const COLD_NPOS = 4096
-const COLD_STEP = 8191
+# "Cold" destination: cycles the tile's base across COLD_NPOS positions
+# spaced COLD_STEP elements apart (not COLD_NPOS fully disjoint tile-sized
+# regions, which would need tens of GB at these shapes) -- an approximation
+# of "a large, mostly-cold output", spanning ~270 MB by default.
+const COLD_NPOS = argopt("cold-npos", 4096)
+const COLD_STEP = argopt("cold-step", 8191)
 
 # ---------------------------------------------------------------------------
 # Kernel shapes
 # ---------------------------------------------------------------------------
 
-# (dtype, (MR,NR,W), label). Shipped defaults confirmed by reading
-# src/driver.jl's `_derived_shape`/`_legacy_shape`/`KERNEL_SHAPES_F64`/
-# `KERNEL_SHAPES_F32` directly (AVX-512, this machine): Float64 -> (16,6,8),
-# Float32 -> (32,6,16). (16,14,8) and (32,6,8) are the two Phase G/H "NV is
-# held at 12 deliberately" / "panel addressing" swept shapes (docs/
-# decisions.md), reused here verbatim for comparability.
+# (dtype, (MR,NR,W), label). Float64 (16,6,8) and Float32 (32,6,16) are the
+# shipped AVX-512 register shapes; (16,14,8) and (32,6,8) are other swept
+# shapes reused here for comparability.
 const SHAPES = [
     (Float64, (16, 6, 8), "F64_16x6x8 (shipped default)"),
-    (Float64, (16, 14, 8), "F64_16x14x8 (Phase G/H skx dgemm family)"),
-    (Float64, (32, 6, 8), "F64_32x6x8 (Phase G/H swept)"),
+    (Float64, (16, 14, 8), "F64_16x14x8"),
+    (Float64, (32, 6, 8), "F64_32x6x8"),
     (Float32, (32, 6, 16), "F32_32x6x16 (shipped default)"),
 ]
 
-const KC_VALUES = (16, 256)
+const KC_VALUES = parse_ints(argopt("kc", "16,256"))
 
 shape_label(MR, NR, W) = "$(MR)x$(NR)x$(W)"
 
-# ---------------------------------------------------------------------------
-# Packed-panel construction (mirrors test/test_simd_kernel.jl's
-# `packed_from_matrices` helper -- same offset formulas, same construction
-# order).
-# ---------------------------------------------------------------------------
+# Packed-panel construction: mirrors test/test_simd_kernel.jl's
+# `packed_from_matrices` (same offset formulas/order).
 
 function build_packed(::Type{T}, kernel, kc::Int, rng) where {T}
     MR, NR = mr(kernel), nr(kernel)
@@ -192,15 +163,8 @@ function bench_execute(kernel, dests::Vector, packed_a, packed_b, kc::Int, alpha
     return nothing
 end
 
-# ---------------------------------------------------------------------------
-# Native-code inspection (report-only; mirrors bench_kernel_shape.jl's own
-# stack-store regex approach, reimplemented here since that file is out of
-# this task's edit scope)
-# ---------------------------------------------------------------------------
-
-# A stack store has the [rsp/rbp] operand first, i.e. followed by a comma --
-# same pattern bench_kernel_shape.jl's `stack_store_re` uses for spill
-# detection.
+# Native-code inspection (report-only). A stack store has the [rsp/rbp]
+# operand first, i.e. followed by a comma.
 const VEC_STORE_RE = r"v(?:mov(?:up|ap)[sd]|movdq[ua])\s+(?:zmmword|ymmword|xmmword)\s+ptr\s+\[([^\]]*)\]\s*,"
 
 function native_store_counts(f, argtypes::Tuple)
@@ -382,16 +346,10 @@ open(CANARY_PATH, "w") do io
 end
 println("canary spread (max-min)/min = ", @sprintf("%.4f", CANARY_SPREAD))
 
-# ---------------------------------------------------------------------------
-# Reproduction attempt: "SIMDKernel reaches 101-103 GFLOP/s, ~88% of peak"
-# (docs/decisions.md, "NV is held at 12 deliberately"; that table's own
-# "as plain Vector" column at Float64, kc=256, listed (16,14,8) => 101.8 and
-# (32,6,8) => 102.6). Uses a plain packed `Vector`, not a `PackedPanel`, to
-# match the cited table's own column, and additionally reports the same cell
-# using `PackedPanel` (the real driver's actual panel type today) for
-# comparison.
-# ---------------------------------------------------------------------------
-
+# Reproduction attempt for "SIMDKernel reaches 101-103 GFLOP/s, ~88% of
+# peak" (docs/decisions.md), Float64/Float32, kc=256. Times both a plain
+# `Vector` panel (matching that table's column) and a `PackedPanel` (the
+# real driver's actual panel type).
 const REPRO_SHAPES = [
     (Float64, (16, 6, 8)),
     (Float64, (16, 14, 8)),
@@ -401,7 +359,7 @@ const REPRO_SHAPES = [
 const REPRO_KC = 256
 
 repro_rows = NamedTuple[]
-for (T, (MR, NR, W)) in REPRO_SHAPES
+for (T, (MR, NR, W)) in (hasflag("skip-repro") ? [] : REPRO_SHAPES)
     kernel = SIMDKernel(Val(MR), Val(NR), T, Val(W))
     pa, pb = build_packed(T, kernel, REPRO_KC, rng)
 
@@ -432,6 +390,7 @@ end
 
 native_rows = NamedTuple[]
 for (T, (MR, NR, W), label) in SHAPES
+    hasflag("skip-native") && continue
     occursin("shipped default", label) || continue
     kernel = SIMDKernel(Val(MR), Val(NR), T, Val(W))
     kc = 4

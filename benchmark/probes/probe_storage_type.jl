@@ -1,32 +1,22 @@
-# T1 probe: is `parent(StridedView(::Array{T}))` a `Vector{T}` (satisfying
-# `src/kernels/simd.jl:217`'s fast-path guard `destination.storage isa
-# Vector{T}`) or a `Memory{T}` (never satisfying it), on this Julia version?
-# And does `SIMD.vload`/`vstore` work correctly and allocation-free on
-# whichever storage type `parent` actually returns?
+# Checks whether `parent(StridedView(::Array{T}))` is a `Vector{T}` (would
+# satisfy the store fast-path guard) or a `Memory{T}` (never satisfies it),
+# and whether `SIMD.vload`/`vstore` work correctly and allocation-free on it.
 #
 # Usage: julia --project=. benchmark/probes/probe_storage_type.jl
-# Writes benchmark/results/<hostname>-<date>/probes_T1_storage_type.txt
-# (results/ is gitignored; only this script is committed).
+# Writes benchmark/results/<hostname>-<date>/probes_storage_type.txt
 
 using StridedViews
 using SIMD
-using Dates
 
-const OUTDIR = joinpath(
-    @__DIR__, "..", "results", "$(gethostname())-$(Dates.format(now(), "yyyy-mm-dd"))"
-)
-mkpath(OUTDIR)
-const OUTPATH = joinpath(OUTDIR, "probes_T1_storage_type.txt")
+include(joinpath(@__DIR__, "..", "harness.jl"))
+
+const OUTPATH = joinpath(results_dir(), "probes_storage_type.txt")
+mkpath(dirname(OUTPATH))
 
 io = open(OUTPATH, "w")
 out(args...) = (println(io, args...); println(args...))
 
-commit = try
-    strip(read(`git -C $(joinpath(@__DIR__, "..", "..")) rev-parse HEAD`, String))
-catch
-    "unknown"
-end
-out("git_commit = ", commit)
+out("git_commit = ", git_commit())
 out("hostname = ", gethostname())
 out("julia_version = ", VERSION)
 out("date = ", now())
