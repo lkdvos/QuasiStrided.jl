@@ -699,6 +699,52 @@ add/trace step therefore cannot be run wholesale under this backend this
 milestone. That is a known, accepted scope limitation, and `README.md` (T12)
 must say so plainly.
 
+### Amendment 7 (2026-09-16): `tensoradd!`/`tensortrace!` fall back to `StridedNative`
+
+Reverses clause 1 of "Hard-reject, never fall back" above, at the user's
+explicit direction, prompted by the upstream benchmark-suite comparison
+milestone's benchmark-only `QuasiStridedComposite` wrapper (`benchmark/composite_backend.jl`
+on branch `upstream-bench`) — a type built only so that suite's
+one-backend-per-provider interface could exercise `:permute`/`:trace`
+categories against `QuasiStridedBackend`. Rather than keep that forwarding
+logic quarantined in `benchmark/`, it becomes `QuasiStridedBackend`'s own
+default behavior for these two operations, and the composite wrapper is
+retired (no longer needed — `QuasiStridedBackend` itself now handles every
+category the suite's `ArrayProvider` interface can throw at it).
+
+**What changes:** `TO.tensoradd!`/`TO.tensortrace!` now forward
+unconditionally to `TO.StridedNative()` instead of throwing. **What does
+not change:** clause 2 — `TO.tensorcontract!` still hard-rejects (throws,
+never falls back) every ineligible input (wrong/mixed eltype, non-strided
+operand, aliased or conjugated output). A timing taken on a *contraction*
+under `QuasiStridedBackend()` still always measures this engine, unaffected
+by this amendment; only a timing taken on a bare `tensoradd!`/`tensortrace!`
+call (or the add/trace portion of a mixed `@tensor` network) now measures
+`StridedNative`, not this engine — callers comparing against a `StridedNative`
+baseline should be aware the two are no longer independently distinguishable
+on that portion of the work.
+
+The original rationale for hard-rejecting add/trace ("a fallback makes the
+observed performance of `backend=QuasiStridedBackend()` silently depend on
+whether the request was actually served by this engine") is **not
+refuted** — it is accepted, with the same tradeoff the benchmark-only
+composite already made and documented, in exchange for `@tensor` networks
+mixing contraction with an add/trace step now being runnable wholesale
+under one backend (removing the exact scope limitation the prior paragraph
+just described as "known, accepted" — it's the reason a fallback was worth
+building in the first place, first as a benchmark-only wrapper and now as
+the real default). The frozen `QuasiStridedBackend` struct (no fields, no
+type parameters — see above) is unchanged; the fallback target is hardcoded
+to `TO.StridedNative()`, not configurable, matching the composite wrapper's
+own default and keeping the struct a plain singleton.
+
+`benchmark/composite_backend.jl` and `benchmark/check_composite_backend.jl`
+(from the upstream-bench milestone) are removed as part of this amendment —
+their forwarding logic is now `QuasiStridedBackend`'s own behavior, so the
+benchmark-only wrapper has no remaining purpose; `benchmark/bench_to_suite.jl`
+is updated to call `QuasiStridedBackend()` directly wherever it previously
+built a `QuasiStridedComposite()`.
+
 ### Eligibility predicate, and the conjugation invariant
 
 `TO.tensorcontract!` for `QuasiStridedBackend` accepts exactly:
@@ -3460,6 +3506,20 @@ results accordingly. This pass never times those categories (only
 `:pairwise`/`:tccg`, both pure contractions), so the hazard did not
 materialize here, but it is recorded because the next milestone to touch this
 file may not re-read this reasoning.
+
+**Superseded 2026-09-16, at the user's explicit direction** (see
+"Amendment 7" above, in the TensorOperations integration milestone's
+frozen section): the "must not migrate into `src/`" statement two
+paragraphs up no longer holds. `QuasiStridedComposite`'s
+`tensoradd!`/`tensortrace!` forwarding to `StridedNative()` is now
+`QuasiStridedBackend`'s own default behavior, and `benchmark/composite_backend.jl`/
+`benchmark/check_composite_backend.jl` are removed — this section is kept as
+the historical record of why the wrapper was built benchmark-only in the
+first place (the tradeoff it accepted is the same one Amendment 7 accepts),
+not as a statement of the current design. `benchmark/bench_to_suite.jl` now
+calls `QuasiStridedBackend()` directly wherever it previously built a
+`QuasiStridedComposite()`; every hazard/label-clearly caveat above applies
+identically to the real backend now.
 
 ### T3 measurement results
 

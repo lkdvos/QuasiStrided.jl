@@ -1,4 +1,4 @@
-# Profiling tool for triaging QuasiStridedComposite() vs TensorOperations'
+# Profiling tool for triaging QuasiStridedBackend() vs TensorOperations'
 # StridedBLAS() on individual tensor-contraction cases drawn from the upstream
 # `TensorOperationsBenchmarks` suite's `:pairwise`/`:tccg` categories.
 #
@@ -31,21 +31,22 @@
 # each tick, including this process's persistently-idle helper thread(s) (GC/IO/etc)
 # sitting in `__futex_abstimed_wait_common`. On this machine that shows up as a large,
 # roughly workload-size-independent share of "other" in the bucket tables below (~50%
-# for StridedBLAS, higher for QuasiStridedComposite) -- confirmed present identically in
+# for StridedBLAS, higher for QuasiStridedBackend) -- confirmed present identically in
 # `Profile.print`'s own `.flat.txt` output, not an artifact of this script's bucket
 # parsing. It does not affect the sanity check that matters (a nonzero `blas` bucket for
 # StridedBLAS): that bucket is computed only from LEAF/self-time samples classified by
 # substring match, and idle-thread futex samples never match any bucket's substrings, so
 # they fall into "other" rather than stealing from `blas`/`microkernel`/etc.
 #
-# For each case, both `QuasiStridedComposite()` and `TensorOperations.StridedBLAS()`
+# For each case, both `QuasiStridedBackend()` and `TensorOperations.StridedBLAS()`
 # execute the identical `tensorcontract!(C, A, pA, false, B, pB, false, pAB, 1, 0, backend)`
 # call, where `pA, pB, pAB = TensorOperations.contract_indices(IA, IB, IC)` -- the exact
 # same helper `TensorOperationsBenchmarks/src/lowering.jl`'s `maketensors(::ContractSpec, ...)`
 # uses to build its own `pA`/`pB`/`pAB`, so this script's contraction-index convention is
-# guaranteed to match both `benchmark/composite_backend.jl`'s worked examples and
-# `bench_to_suite.jl`'s (T3's) cases without needing to reimplement the label-set
-# arithmetic (`intersect`/`setdiff` over `IA`/`IB`/`IC`) by hand.
+# guaranteed to match `bench_to_suite.jl`'s cases without needing to reimplement the
+# label-set arithmetic (`intersect`/`setdiff` over `IA`/`IB`/`IC`) by hand. (Every case
+# below is a contraction, so QuasiStridedBackend()'s tensoradd!/tensortrace! fallback --
+# docs/decisions.md, "Amendment 7" -- is never exercised here.)
 
 using Profile
 using Printf
@@ -53,8 +54,8 @@ using Random
 using Dates
 using TensorOperations
 using TensorOperations: StridedBLAS
+using QuasiStrided: QuasiStridedBackend
 
-include(joinpath(@__DIR__, "composite_backend.jl"))
 include(joinpath(@__DIR__, "profile_buckets.jl"))
 
 # ---------------------------------------------------------------------------
@@ -116,7 +117,7 @@ const CASES = [
 ]
 
 const BACKENDS = [
-    ("QuasiStridedComposite", QuasiStridedComposite()),
+    ("QuasiStridedBackend", QuasiStridedBackend()),
     ("StridedBLAS", StridedBLAS()),
 ]
 

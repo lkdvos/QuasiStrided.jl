@@ -1,8 +1,14 @@
-# Head-to-head timing of `StridedNative()`, `StridedBLAS()` and QuasiStrided
-# (via `QuasiStridedComposite()`, benchmark/composite_backend.jl) on the
-# *upstream* TensorOperations.jl benchmark suite's own cases -- the `:pairwise`
-# and `:tccg` categories of `TensorOperationsBenchmarks` -- rather than on this
-# repo's hand-written matmul-shaped grid.
+# Head-to-head timing of `StridedNative()`, `StridedBLAS()` and
+# `QuasiStridedBackend()` on the *upstream* TensorOperations.jl benchmark
+# suite's own cases -- the `:pairwise` and `:tccg` categories of
+# `TensorOperationsBenchmarks` -- rather than on this repo's hand-written
+# matmul-shaped grid. (This script previously ran QuasiStrided through a
+# benchmark-only `QuasiStridedComposite()` wrapper so the suite's
+# one-backend-per-provider interface could also exercise `:permute`/`:trace`
+# categories against it; `QuasiStridedBackend` now falls back to
+# `StridedNative()` for those two operations itself -- see
+# docs/decisions.md, "Amendment 7" -- so the wrapper is retired and every
+# case here runs against the real backend directly.)
 #
 #   julia --project=benchmark benchmark/bench_to_suite.jl
 #   # or, warm: jld --project=benchmark run benchmark/bench_to_suite.jl
@@ -59,8 +65,6 @@ import Pkg
 
 const TOB = TensorOperationsBenchmarks
 
-include(joinpath(@__DIR__, "composite_backend.jl"))
-
 # Single-core measurement discipline (this project's standing rule; see
 # benchmark/bench_driver.jl and benchmark/harness.jl).
 LinearAlgebra.BLAS.set_num_threads(1)
@@ -109,7 +113,7 @@ const MAX_CASE_BYTES = 2 * 2^30  # 2 GiB
 const BACKENDS = (
     StridedNative = StridedNative(),
     StridedBLAS = StridedBLAS(),
-    QuasiStrided = QuasiStridedComposite(),
+    QuasiStrided = QuasiStridedBackend(),
 )
 
 # ---------------------------------------------------------------------------
@@ -375,10 +379,10 @@ open(SUMMARY_PATH, "w") do io
     )
     println(
         io,
-        "NOTE: the QuasiStrided column is QuasiStridedComposite() -- ",
-        "tensorcontract! is QuasiStridedBackend(), and every case here IS a ",
-        "contraction, so no timing below measures the composite's ",
-        "StridedNative add/trace fallback."
+        "NOTE: the QuasiStrided column is QuasiStridedBackend() directly -- ",
+        "every case here IS a contraction, so no timing below measures its ",
+        "StridedNative tensoradd!/tensortrace! fallback (see docs/decisions.md, ",
+        "\"Amendment 7\")."
     )
     if !isempty(mismatches)
         println(io, "\n!! ", length(mismatches), " CORRECTNESS MISMATCH(ES) -- see mismatches_to_suite.txt")
@@ -535,8 +539,7 @@ open(PROVENANCE_PATH, "w") do io
         "(QuantumKitHub/TensorOperations.jl, branch \"benchmark\", subdir benchmark, PR #303)"
     )
     println(io, "backends = ", collect(keys(BACKENDS)))
-    println(io, "  QuasiStrided column = QuasiStridedComposite() (benchmark/composite_backend.jl);")
-    println(io, "  all cases are contractions, so it is QuasiStridedBackend() throughout.")
+    println(io, "  QuasiStrided column = QuasiStridedBackend() directly (docs/decisions.md, \"Amendment 7\").")
     println(io, "dtypes = ", collect(DTYPES))
     println(io, "reps = ", REPS, " (median, one discarded warm-up)")
     println(io, "case source = TensorOperationsBenchmarks._pairwise_cases / ._tccg_cases,")

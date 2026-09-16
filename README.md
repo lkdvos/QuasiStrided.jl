@@ -219,14 +219,14 @@ Gold 6244 / Cascade Lake):
 
 **Not implemented** (deliberately, this milestone):
 
-- **Contraction only.** `QuasiStridedBackend` implements
-  `TensorOperations.tensorcontract!` only: `tensoradd!` and `tensortrace!`
-  always throw `ArgumentError` when routed through this backend (there is no
-  QuasiStrided analog of either, and no diagonal/trace support at all in the
-  engine). A `@tensor` network that mixes a contraction with an add/permute
-  or trace step therefore cannot run entirely under
-  `backend=QuasiStridedBackend()`; use a different backend (e.g.
-  `StridedNative()`/`StridedBLAS()`) for those steps.
+- **Contraction only, engine-wise.** `QuasiStridedBackend` implements
+  `TensorOperations.tensorcontract!` itself; there is no QuasiStrided analog
+  of a standalone add/permute step or of diagonal/trace support at all in
+  the engine. `tensoradd!`/`tensortrace!` fall back to `StridedNative()` so
+  a `@tensor` network mixing a contraction with an add/permute or trace step
+  can still run wholesale under `backend=QuasiStridedBackend()` -- a timing
+  taken on those two specific operations under this backend measures
+  `StridedNative`, not this engine.
 - **One shared element type, out of four.** `tensorcontract!` accepts inputs
   that share a single element type out of
   `Float32`/`Float64`/`ComplexF32`/`ComplexF64` and are all strided; anything
