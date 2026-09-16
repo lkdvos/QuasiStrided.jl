@@ -49,13 +49,11 @@
 # docs/decisions.md, "Amendment 7" -- is never exercised here.)
 
 using Profile
-using Printf
-using Random
-using Dates
 using TensorOperations
 using TensorOperations: StridedBLAS
 using QuasiStrided: QuasiStridedBackend
 
+include(joinpath(@__DIR__, "harness.jl"))  # results_dir (Printf/Random/Dates already `using`d there too)
 include(joinpath(@__DIR__, "profile_buckets.jl"))
 
 # ---------------------------------------------------------------------------
@@ -125,9 +123,7 @@ const BACKENDS = [
 # Output location
 # ---------------------------------------------------------------------------
 
-const RESULTS_ROOT = joinpath(
-    @__DIR__, "results", "$(gethostname())-$(Dates.format(Dates.today(), "yyyy-mm-dd"))"
-)
+const RESULTS_ROOT = results_dir()
 const PROFILE_DIR = joinpath(RESULTS_ROOT, "profiles")
 mkpath(PROFILE_DIR)
 

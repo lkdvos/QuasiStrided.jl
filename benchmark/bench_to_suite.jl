@@ -23,18 +23,10 @@
 # own literal shape grid (see the comment there). This script keeps that
 # script's measurement conventions verbatim -- warm-up-then-median timing,
 # reps >= 15, a StridedBLAS 64^3 Float64 canary at start/middle/end, CSV +
-# summary + PROVENANCE -- while taking its CASES from upstream.
-#
-# Why benchmark/harness.jl is NOT `include`d even though it holds
-# `median_time_s`/`results_dir`/`git_commit`/`print_env_header`/
-# `relative_spread`: harness.jl does `using StridedViews`, and StridedViews is
-# not a direct dependency of benchmark/Project.toml (only an indirect one, via
-# QuasiStrided), so `include`ing it under `--project=benchmark` fails outright.
-# Adding it to benchmark/Project.toml is outside this task's edit scope, so
-# this script follows bench_tensoroperations.jl's existing precedent of
-# carrying its own copy of the timing/provenance plumbing. The copies are
-# deliberately identical in behaviour; if harness.jl's `median_time_s` ever
-# changes, change it here too.
+# summary + PROVENANCE -- while taking its CASES from upstream, reusing
+# benchmark/harness.jl's shared `median_time_s`/`results_dir`/`git_commit`/
+# `print_env_header`/`relative_spread` rather than a local copy (StridedViews
+# was added to benchmark/Project.toml so harness.jl can be `include`d here).
 #
 # TRIMMING APPLIED: none beyond upstream's own filter. The design contract
 # allowed dropping Float32 and/or reducing `:tccg` if a dry run projected more
@@ -56,42 +48,13 @@ using TensorOperationsBenchmarks: BenchmarkCase, ContractSpec, flops, bytes,
     ArrayProvider, randtensor
 using QuasiStrided
 using QuasiStrided: QuasiStridedBackend
-using LinearAlgebra
-using Statistics: median
-using Random
-using Dates
-using Printf
 import Pkg
 
+include(joinpath(@__DIR__, "harness.jl"))  # median_time_s, results_dir, git_commit,
+# print_env_header, relative_spread, and the single-core measurement pinning
+# (LinearAlgebra/Random/Printf/Dates already `using`d there too).
+
 const TOB = TensorOperationsBenchmarks
-
-# Single-core measurement discipline (this project's standing rule; see
-# benchmark/bench_driver.jl and benchmark/harness.jl).
-LinearAlgebra.BLAS.set_num_threads(1)
-const NTHREADS = Threads.nthreads()
-const BLAS_THREADS = LinearAlgebra.BLAS.get_num_threads()
-if NTHREADS != 1
-    @warn "Threads.nthreads() = $NTHREADS != 1 -- this is NOT the pinned " *
-        "single-core measurement this project's rules require. Results " *
-        "below should not be trusted as the reference-machine numbers."
-end
-
-# Warm up once (discarded), then `reps` timed calls; median, not mean.
-# Identical convention to benchmark/harness.jl's and
-# benchmark/bench_tensoroperations.jl's `median_time_s`.
-function median_time_s(f!::Function; reps::Int = 15)
-    f!()  # warm-up, discarded
-    ts = Vector{Float64}(undef, reps)
-    for r in 1:reps
-        t0 = time_ns()
-        f!()
-        t1 = time_ns()
-        ts[r] = (t1 - t0) / 1.0e9
-    end
-    return median(ts)
-end
-
-relative_spread(ts) = isempty(ts) ? 0.0 : (maximum(ts) - minimum(ts)) / minimum(ts)
 
 # 21 reps, not the 15-rep floor: STATUS.md "Measurement hygiene" records that
 # an 11-rep comparison once invented two regressions that 21 reps erased, and
@@ -181,9 +144,7 @@ end
 # Output
 # ---------------------------------------------------------------------------
 
-const OUTDIR = joinpath(
-    @__DIR__, "results", "$(gethostname())-$(Dates.format(now(), "yyyy-mm-dd"))"
-)
+const OUTDIR = results_dir()
 mkpath(OUTDIR)
 const CSV_PATH = joinpath(OUTDIR, "bench_to_suite.csv")
 const CANARY_PATH = joinpath(OUTDIR, "canary_to_suite.csv")
@@ -206,11 +167,7 @@ function log_row(backend_name, T, case::BenchmarkCase, reps, t, gf, gb)
     return flush(csv_io)
 end
 
-println("# QuasiStrided.jl benchmark/bench_to_suite.jl")
-println("cpu = ", Sys.CPU_NAME)
-println("julia = ", VERSION)
-println("nthreads = ", NTHREADS, "  blas_threads = ", BLAS_THREADS)
-println("date = ", now())
+print_env_header(stdout, "bench_to_suite.jl")
 println("cases = ", length(CASES), " per dtype (before per-dtype byte skips)")
 
 # ---------------------------------------------------------------------------
@@ -366,9 +323,7 @@ const NOISE_FLOOR = max(0.1, canary_spread)
 
 open(SUMMARY_PATH, "w") do io
     println(io, "# TensorOperations upstream-suite backend benchmark summary")
-    println(io, "# benchmark/bench_to_suite.jl -- ", gethostname(), " ", now())
-    println(io, "cpu = ", Sys.CPU_NAME, "  julia = ", VERSION)
-    println(io, "nthreads = ", NTHREADS, "  blas_threads = ", BLAS_THREADS)
+    print_env_header(io, "bench_to_suite.jl")
     println(io, "reps = ", REPS, " (median of ", REPS, ", one discarded warm-up)")
     println(io, "canary median times (s): ", canary_results)
     println(io, "canary relative spread (max-min)/min: ", @sprintf("%.4f", canary_spread))
@@ -487,11 +442,7 @@ println(read(MISMATCH_PATH, String))
 # Provenance -- format matched to benchmark/bench_tensoroperations.jl's.
 # ---------------------------------------------------------------------------
 
-commit = try
-    strip(read(`git -C $(joinpath(@__DIR__, "..")) rev-parse HEAD`, String))
-catch
-    "unknown (git rev-parse failed)"
-end
+commit = git_commit()
 
 to_version, tob_rev = try
     deps = Pkg.dependencies()
@@ -525,12 +476,9 @@ end
 open(PROVENANCE_PATH, "w") do io
     println(io, "git_commit = ", commit)
     println(io, "command = julia --project=benchmark benchmark/bench_to_suite.jl")
-    println(io, "hostname = ", gethostname())
-    println(io, "cpu = ", Sys.CPU_NAME, " (", Sys.CPU_THREADS, " logical CPUs)")
-    println(io, "julia = ", VERSION)
-    println(io, "nthreads = ", NTHREADS, " blas_threads = ", BLAS_THREADS)
+    print_env_header(io, "bench_to_suite.jl")
+    println(io, "logical_cpus = ", Sys.CPU_THREADS)
     println(io, "blas_config = ", LinearAlgebra.BLAS.get_config())
-    println(io, "date = ", now())
     println(io, "TensorOperations = ", to_version)
     println(io, "TensorOperationsBenchmarks = ", tob_rev)
     println(
