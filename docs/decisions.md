@@ -3685,6 +3685,21 @@ response to this finding.** Closing THIS milestone does not mean the
 (Cause A, the store fast-path) this milestone was built to test has been
 fully resolved.
 
+**Correction (2026-09-19, label-order milestone, T3).** The phrase
+"currently pinned by an existing test", used twice above for
+`_classify_labels`'s label ordering, was inaccurate: no test pinned the
+order of labels inside the M/N composites before this date. The only tests
+touching `_classify_labels` were its error paths (`test/test_driver.jl`,
+"driver: label validation errors") and an unrelated `ContractPlan`
+field-passthrough test; neither asserts anything about composite order. The
+first test that does is the label-order milestone's pinning testset,
+`test/test_driver.jl`, "label order: pinning test on the ccsd_t shapes
+(composite order and swap)", which asserts the post-sort `mgroup`/`ngroup` C
+maps and the orientation-swap decision on all four `ccsd_t_*` shapes. That
+milestone changed the ordering rule itself (see `plan_contract`'s docstring:
+free labels sorted by `|stride|` in `C`, guarded M/N orientation swap);
+`_classify_labels`'s own body and return order are unchanged.
+
 **Follow-ups, explicitly out of scope for this milestone:**
 
 - Repointing the `TensorOperationsBenchmarks` dependency (still blocked, PR
