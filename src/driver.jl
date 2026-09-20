@@ -163,6 +163,14 @@ end
 # that bar and the swapped one clears it. The two `mr` arguments are the widths
 # of the kernel each orientation would actually run (they differ only when the
 # default kernel's small-Qm demotion applies to one side).
+#
+# Callers must additionally restrict this to real dtypes -- `PlanarKernel`/
+# `OneMKernel` (complex) ship the scattered/scalar store unconditionally
+# (`src/kernels/planar.jl`, `src/kernels/onem.jl`), so this function's whole
+# rationale is moot for them; measured directly (`ccsd_t_3`, dim=16, both
+# complex dtypes): the swap is a ~2-4% regression there (loses the as-is
+# orientation's N-side locality for no store-side gain). See the `T <: Real`
+# guard at the call site.
 function _prefer_swap(
         morder::Vector{Int}, norder::Vector{Int}, indC::NTuple{NC, Int}, C::StridedView,
         mr_asis::Int, mr_swapped::Int = mr_asis
@@ -841,7 +849,13 @@ function plan_contract(
     kernel_asis = kernel === nothing ? _default_kernel(T, Qm, Qn) : kernel
     kernel_swapped = kernel === nothing ? _default_kernel(T, Qn, Qm) : kernel
 
-    if _prefer_swap(morder, norder, indC, C, mr(kernel_asis), mr(kernel_swapped))
+    # Complex kernels (`PlanarKernel`/`OneMKernel`) always scatter-store --
+    # `_vector_store_eligible` only exists on the real path -- so there is
+    # nothing for the swap to win there, and it measurably loses the as-is
+    # orientation's N-side locality instead (~2-4%, `ccsd_t_3`, ComplexF64/32).
+    # Real kernels (`SIMDKernel` and, for this run-length rule, `ScalarKernel`
+    # too) keep the swap.
+    if T <: Real && _prefer_swap(morder, norder, indC, C, mr(kernel_asis), mr(kernel_swapped))
         # B takes the M role and A the N role. Everything operand-bound moves
         # together: the groups (each already carries its own C map), the K
         # group's two maps, the storage/base pair `_plan_contract` reads off

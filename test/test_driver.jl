@@ -1280,18 +1280,20 @@ end
     end
 end
 
-@testset "label order: the swap is exercised with conjugation on both operands" begin
-    # A shape whose swap fires under a NAMED complex kernel (the menu's MV = 1
-    # planar tile: mr = 8 for ComplexF64, 16 for ComplexF32) with the flags
-    # set and an `op`-carrying A, checked against the loop reference. Proves
-    # the transforms travel with the operands: a swap that kept `atransform`
-    # on the M slot would conjugate the wrong data.
+@testset "label order: the swap never fires for complex kernels (no vector store to win)" begin
+    # Same shape/kernel that would trigger the swap for a real dtype at this
+    # mr (ccsd_t_3, d=4: sorted N run 16 >= mr, sorted M run 1) -- but
+    # PlanarKernel/OneMKernel (complex) always scatter-store, so there is
+    # nothing for the swap to win and it measurably costs the as-is
+    # orientation's N-side locality (~2-4%, see driver.jl's `T <: Real`
+    # guard). Also re-confirms conjugation is still correct on the
+    # (now guaranteed unswapped) complex path -- an `op`-carrying A, both
+    # flags exercised, checked against the loop reference.
     d = 4
     for T in (ComplexF64, ComplexF32)
         W = QuasiStrided._default_lanewidth(real(T))
         kernel = QuasiStrided.PlanarKernel(Val(W), Val(8), T, Val(W))
         @test mr(kernel) <= 16
-        # ccsd_t_3 at d = 4: sorted N run is 16 >= mr, sorted M run is 1.
         (indA, indB, indC), _ = _lo_labels(_LO_CASES[3][2], _LO_CASES[3][3])
         A = randn(T, d, d, d, d)
         B = randn(T, d, d, d, d)
@@ -1304,10 +1306,11 @@ end
             Cstart = copy(C)
             Cref = _lo_reference(Cstart, Av, indA, Bv, indB, indC; conjA, conjB, alpha, beta)
             plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel, conjA = conjA, conjB = conjB)
-            @test plan.Astorage === parent(Bv)   # the swap really fired
-            # A's effective transform is conj (view op) XOR flag; B's is the flag.
-            @test plan.btransform === (conjA ? identity : conj)
-            @test plan.atransform === (conjB ? conj : identity)
+            @test plan.Astorage === parent(Av)   # the swap did NOT fire (complex)
+            # A's view already carries `op = conj`; its effective transform is
+            # conj XOR the flag, i.e. conj only when the flag is NOT set.
+            @test plan.atransform === (conjA ? identity : conj)
+            @test plan.btransform === (conjB ? conj : identity)
             execute!(plan, alpha, beta)
             @test isapprox(C, Cref; rtol = 200 * d * eps(real(T)))
             copyto!(C, Cstart)
@@ -1315,6 +1318,31 @@ end
             @test isapprox(C, Cref; rtol = 200 * d * eps(real(T)))
         end
     end
+end
+
+@testset "label order: the swap threads conj/transforms correctly when forced (real kernel proxy)" begin
+    # The swap branch in `plan_contract` is dtype-agnostic -- only the `T <:
+    # Real` guard at the call site prevents it from firing for complex. To
+    # keep direct test coverage of "transforms travel with the operands
+    # under a swap" without relying solely on the code-reading argument,
+    # exercise the swap on a REAL shape (conj is `identity` there, so this
+    # checks storage/base/strides swap correctness, not conj folding -- the
+    # conj-folding logic itself is dtype-independent and was covered by the
+    # complex swap tests before this guard landed; see docs/decisions.md).
+    d = 5
+    (name, IA, IB) = _LO_CASES[3]  # ccsd_t_3: swaps at mr=8 (SIMDKernel(8,6))
+    (indA, indB, indC), _ = _lo_labels(IA, IB)
+    A, B = randn(d, d, d, d), randn(d, d, d, d)
+    C = randn(d, d, d, d, d, d)
+    Av, Bv, Cv = StridedView(A), StridedView(B), StridedView(C)
+    kernel = SIMDKernel(Val(8), Val(6), Float64)
+    alpha, beta = 0.5, -1.0
+    Cref = _lo_reference(copy(C), Av, indA, Bv, indB, indC; alpha, beta)
+    plan = plan_contract(Cv, Av, indA, Bv, indB, indC; kernel = kernel)
+    @test plan.Astorage === parent(Bv)  # the swap fired
+    @test plan.atransform === identity && plan.btransform === identity
+    execute!(plan, alpha, beta)
+    @test isapprox(C, Cref; rtol = 1.0e-10)
 end
 
 @testset "label order: the adapter path reaches the reordered plan" begin
