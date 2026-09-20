@@ -1349,6 +1349,13 @@ nothing in it; it exists so the list can be read in one place at close.
 - **K padding, orientation swap, einsum string parsing, batch axes,
   diagonals, isolated reductions, a separate beta-addend tensor.** All
   unchanged and still out of scope.
+
+  **Correction (2026-09-19, Label-order milestone).** "Orientation swap" in
+  this bullet is discharged: `plan_contract` now performs a guarded M/N
+  operand-role swap (`_prefer_swap`, `T <: Real`) as part of ordinary
+  planning. See "Label-order milestone" below. K padding, einsum string
+  parsing, batch axes, diagonals, isolated reductions and a separate
+  beta-addend tensor remain out of scope, untouched by this milestone.
 - **Registration, merge, publication.** Nothing in the plan file or in this
   record specifies a merge or release step for this branch; `STATUS.md`'s
   "Published" section still describes `main` only and was deliberately left
@@ -2393,6 +2400,13 @@ is a **blocking finding for the review phase**, not a result to publish.
   `atransform`/`btransform` **and** the packed formats along with the operands.
   That is correct precisely because the kernel contract is about row and column
   panels, not about which user tensor they came from (their `driver.rs:332-347`).
+
+  **Correction (2026-09-19, Label-order milestone): landed, see "Label-order
+  milestone" below.** The swap that landed does exactly what this note
+  required -- `atransform`/`btransform` (and the storage/base fields and K
+  maps) move with the operands, not with the M/N role labels -- and is
+  additionally guarded to real dtypes only (`T <: Real`), since complex
+  kernels have no packed-format seam for this swap to help.
 - **Octavian-style no-pack tiers**, this project's standing "Next task": a
   no-pack tier has **no pack-time seam**, so it would have to absorb conjugation
   some other way -- at load, inside the kernel, or by excluding conjugated
@@ -3727,3 +3741,180 @@ free labels sorted by `|stride|` in `C`, guarded M/N orientation swap);
   routed to `_store_tile_vector!` and is exercised for allocation by
   `test/test_target.jl`'s sliced-C fixture, but that test only asserts zero
   allocation, not numerical correctness, for this specific combination.
+
+## Label-order milestone
+
+Closes the follow-up flagged (and deliberately not acted on) above: "the
+label-ordering lever surfaced by Arm 3". Branch `label-order`, base `main`
+(`e2b5e5c`), three commits: `e7c4787` (the fix), `f06fde0` (a benchmark
+prototype, additive, no `src/` change), `a650af7` (a review-driven narrowing
+of the fix's dtype guard).
+
+### The mechanism
+
+`_classify_labels` (`src/driver.jl:19`) splits free labels into the M list
+(A's free labels) and N list (B's free labels) in A's/B's own incidental
+physical axis order -- an accident of how the caller happened to lay out its
+operands, not a property of the contraction. `fill_offsets!` then walks
+whichever composite is built from that list with its *first* label fastest,
+so that incidental order was silently deciding the memory-access pattern of
+the store into `C`, which is the tensor whose layout actually matters for the
+store.
+
+`plan_contract` (`src/driver.jl:795`) now inserts two planning-time,
+allocation-free steps between `_classify_labels` and building the
+`AxisGroup`s:
+
+1. `_order_free_labels` (`src/driver.jl:127-133`) stable-sorts each of the M
+   and N label lists by `abs(stride(C))` of that label's own axis, ascending,
+   ties keeping the operand's incidental order. This runs unconditionally,
+   for every dtype and every kernel -- there is no guard, because there is no
+   plausible downside to walking `C` with its own fastest axis fastest.
+2. `_prefer_swap` (`src/driver.jl:174-180`), built on `_leading_unit_run`
+   (`src/driver.jl:142-156`), decides whether to additionally swap which
+   operand plays the M role and which plays the N role (B feeds M, A feeds N,
+   with the K maps, storage/base fields and `atransform`/`btransform` moving
+   together -- `src/driver.jl:858-870`). `_leading_unit_run` measures, for an
+   already-sorted label list, how many leading elements form a unit-stride
+   run in `C`; the swap fires only when the as-is orientation's M list falls
+   short of a full `mr(kernel)`-wide register sliver while the swapped
+   orientation would clear it. This is guarded to real dtypes only (`T <:
+   Real`, `src/driver.jl:858`): `PlanarKernel`/`OneMKernel` (complex) always
+   ship the scattered/scalar store regardless of layout (`_vector_store_eligible`
+   only exists on the real/`SIMDKernel` path), so the swap has nothing to win
+   for them and was measured to cost the as-is orientation's N-side locality
+   for no gain (~2-4% regression, `ccsd_t_3`, both complex dtypes, dim=16 --
+   this is why `a650af7` narrowed the original unconditional-swap guard down
+   to `T <: Real` after `e7c4787` first landed it unconditionally).
+
+### The four regression cases, measured before/after
+
+The regression this discharges was first found in "Store fast-path
+investigation: Phase A" above: four TCCG quantum-chemistry contractions
+(`ccsd_t_1..4`, six-index output, one contracted index, dim=16),
+6.6-14.2x slower than `StridedBLAS` through the adapter path, confirmed
+*not* moved by that milestone's own fix (the vectorized-store guard) because
+their M/N composites had zero unit-stride register slivers under the
+adapter's own (unsorted) label order -- exactly the mechanism this milestone
+now sorts away.
+
+Freshly regenerated for this record (not reused from the implementation
+commits), `benchmark/results/ccqlin038.flatironinstitute.org-2026-09-19/`
+(`bench_ccsd_t_store.csv`/`summary_ccsd_t_store.txt`/
+`PROVENANCE_ccsd_t_store.txt`), provenance confirms `git_commit =
+a650af768b7b1f6aa4b76ef77bcd67bb30a1a527` (this milestone's tip), Cascade
+Lake, Julia 1.13.0, single core, `--dims 8,16 --dtypes Float64,Float32`. Arm
+1 is `QuasiStridedBackend` through the real `TensorOperations.tensorcontract!`
+adapter path -- the actual production code, not a hand-permuted diagnostic
+arm. Reading the ratio table's "Arm-1-StridedBLAS" column (StridedBLAS time /
+QuasiStrided time; >1 means QuasiStrided is faster) at `dim=16`, the case
+QuasiStrided now used to be slower on:
+
+| case | Float64 | Float32 |
+|---|---|---|
+| ccsd_t_1 | 6.91x | 2.61x |
+| ccsd_t_2 | 4.00x | 1.99x |
+| ccsd_t_3 | 4.56x | 4.71x |
+| ccsd_t_4 | 3.99x | 1.96x |
+
+So at `dim=16` specifically, QuasiStrided now beats `StridedBLAS` by
+**1.96x-6.91x** across these eight case/dtype cells, not the "~1.2x-6.9x"
+figure this milestone's own opening brief estimated -- the actual floor is
+higher (1.96x, `ccsd_t_4`/Float32) than that estimate. (At `dim=8`, two of
+the eight Float32 cells -- `ccsd_t_2` and `ccsd_t_4` -- are instead 0.90x and
+0.81x, i.e. slightly *slower* than `StridedBLAS`; `dim=8` is small enough
+that both the fixed and swap-guard code paths are already close to
+`StridedBLAS`'s own floor and the comparison is noisier. The swap itself
+fires for `ccsd_t_2/3/4` at Float64/`dim=16` and `ccsd_t_3` at Float32 (the
+16-wide N run there is at least `mr=8`... actually the specific per-case
+fire/no-fire pattern is unpacked in `e7c4787`'s own commit message and in the
+CSV's `swapped` column) and correctly does not fire where the swapped run
+would still be short of `mr`. `bench_ccsd_t_store.jl`'s own Arms 2-5 (the
+hand-permuted diagnostic controls that motivated the fix) still show near-
+zero mismatches and near-identical timings to Arm 1 post-fix, because the
+engine now does internally, for every contraction, what those arms used to
+do by hand for these four cases only -- see the clarifying note added to that
+script's header this milestone.
+
+### Broader regression sweep
+
+A separate, already-completed sweep (`benchmark/bench_to_suite.jl`, ~150
+synthetic + TCCG shapes, two dtypes, base commit `e2b5e5c` vs fixed commit
+`a650af7`, two independent rounds per tree) was re-derived from its own CSVs
+for this record rather than only quoted:
+
+- Overall QuasiStrided geomean(fix/base) across all 156 measured cases =
+  **0.7418** (net faster). By source/dtype: `tccg` Float64 0.527, `tccg`
+  ComplexF64 0.653 (the four `ccsd_t_*` cases above are inside this group and
+  dominate it), `synthetic` Float64 1.093, `synthetic` ComplexF64 1.067 (the
+  synthetic shapes are mostly unaffected either way, as expected -- most were
+  already close to their best achievable order).
+- Checking each case's ratio independently in *both* rounds against a 12.7%
+  noise floor (the worst single-run canary spread across the four runs):
+  **zero cases with base median > 100us regress reproducibly in both
+  rounds** -- two `dim32_2_1_2_*` (synthetic, Float64, base ~1.8ms) and one
+  `ccsd_6_dim16` (tccg, ComplexF64, base ~203us) cross the noise floor in the
+  *combined*-median check but do not reproduce independently round-by-round,
+  so they read as noise, not as regressions.
+- **18 cases do reproduce independently in both rounds**, all at
+  microsecond scale: measured absolute times (base or fixed) span
+  4.1-38.5us, and ratios span **1.15x-2.48x** (this milestone's opening
+  estimate said "1.13-2.48x, 3.8-35us"; the re-derived floor is slightly
+  different -- 1.15x not 1.13x, and the absolute range extends to 38.5us not
+  35us -- close enough to not change the conclusion, but the exact figures
+  above are what is actually on disk, not the opening estimate). All 18 are
+  `dim<=16`-scale TCCG cases or small synthetic shapes; none is a shape this
+  project would recommend anyone run at that size in isolation for
+  performance reasons.
+- `benchmark/bench_real_path_guard.jl` (18 shape/dtype combos, one run per
+  tree side): geomean(fix/base) = **0.9335**. Per this project's own standing
+  convention for this script (see "The real-path regression guard: no
+  regression, and the resolution is ~5%" above), **read this as "no
+  regression detectable at the guard's own ~5-6% resolution," not as a
+  proven per-shape win** -- one cell (`smallMN_16x256x16`, Float64) measured
+  +11.7% in this single comparison, which is inside plausible single-run
+  noise at this instrument's stated resolution, not evidence of a real
+  regression on that shape.
+
+### Test count
+
+Chain: `34856/34856` (this branch's base, `e2b5e5c`, per `STATUS.md`'s own
+"T10" line) -> `35165/35165` after `e7c4787` (+309, per that commit's own
+message) -> `35168/35168` after `a650af7` (net +3: one existing swap/complex
+test was rewritten in place to pin "does not fire" instead of "fires", and a
+new "real-kernel proxy" testset was added to keep direct coverage of the
+swap's storage/transform bookkeeping now that no production complex path
+reaches that branch). `f06fde0` (the benchmark-only commit) does not touch
+`test/`. `Pkg.test()` was re-run for this record on the final tree (doc-only
+changes on top of `a650af7` do not touch any test file, so the count is
+expected to be unchanged at `35168/35168`, 0 failed/errored).
+
+### Known open items
+
+- **The 18 microsecond-scale regressions' mechanism is unconfirmed.** A
+  plausible, but *unverified*, candidate: `plan_contract` now resolves
+  `_default_kernel` twice unconditionally (`kernel_asis` and
+  `kernel_swapped`, `src/driver.jl:849-850`) before the `T <: Real` guard
+  even runs, so when the M/N composite ranks differ between the two
+  candidate orientations, `execute!`/`_plan_contract` can end up with two
+  distinct `ContractPlan` specializations reachable across a program's
+  lifetime instead of one -- extra compile/dispatch surface that would show
+  up disproportionately at microsecond scale and wash out at millisecond
+  scale, consistent with what was measured. Nobody has confirmed this by
+  disassembly or by patching out the double resolution and re-measuring; it
+  is recorded here as a hypothesis for whoever picks this up next, not as a
+  finding.
+- **`ContractPlan`'s own docstring did not warn that `Astorage` may be
+  `parent(B)` after a swap** (a future maintainer relying on
+  `plan.Astorage === parent(A)` would be misled by the field name alone).
+  Fixed this milestone with one added sentence on the struct's docstring
+  (`src/driver.jl`) -- a doc-only change, not a logic change.
+- **`benchmark/bench_ccsd_t_store.jl`'s Arms 3/4-*/5 comments described
+  pre-fix semantics** -- they read as if permuting an operand's axes by hand
+  still changes what the engine does, but `plan_contract` now performs that
+  same sort (and, for Arm 5's swap, the same orientation decision)
+  internally and unconditionally, so those arms no longer change engine
+  behaviour on current `src/driver.jl`; they remain useful only as the
+  working record of what motivated the fix. One clarifying paragraph was
+  added near the top of that script's Arms list this milestone, without
+  rewriting the arms themselves.

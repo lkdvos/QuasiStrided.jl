@@ -24,6 +24,15 @@
 #              composite for every case. For ccsd_t_1 no swap is needed and
 #              Arm 5 is a repeat of Arm 4both.
 #
+# NOTE (post label-order milestone, docs/decisions.md "Label-order
+# milestone"): `plan_contract` now performs the label sort and orientation
+# swap that Arms 3/4-*/5 emulate by hand INTERNALLY, unconditionally, on
+# every call -- so on current `src/driver.jl`, Arm 2's own label order is
+# already re-sorted by `_order_free_labels` before these arms' extra operand
+# permutations are even applied. These arms describe PRE-FIX semantics; they
+# are kept as a working prototype/regression record of what motivated the
+# fix, not as arms that still change engine behaviour today.
+#
 # All operand permutations (Arms 3, 4-*, 5) are `permutedims` on a
 # `StridedView`, i.e. lazy views with permuted strides -- no data is copied.
 # They emulate a planning-time label-order change with zero extra data

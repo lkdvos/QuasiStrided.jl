@@ -700,6 +700,12 @@ vector type (`Vector{real(T)}` on the default allocator path, so `Vector{T}`
 on the real path), a `where`-bound parameter resolved at construction, so
 every plan instance is concretely typed. Field layout is an implementation
 detail, not part of the frozen interface.
+
+Note the M/N orientation swap (docs/decisions.md, "Label-order milestone"):
+after a swap, `Astorage`/`Abase`/`atransform` describe the ORIGINAL `B`
+operand and `Bstorage`/`Bbase`/`btransform` describe the original `A`, so
+`plan.Astorage === parent(A)` does not hold in general -- do not assume the
+field name still tracks the user-facing argument it is named after.
 """
 struct ContractPlan{
         T, Kern, GM <: AxisGroup, GN <: AxisGroup, GK <: AxisGroup, SA, SB, SC,

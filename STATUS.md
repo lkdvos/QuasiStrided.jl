@@ -758,3 +758,12 @@ upstream benchmark-suite categories.
 > built to test (Cause A, the store fast-path) is now fully resolved. See
 > `docs/decisions.md`'s "T4-T5: the fix and its measured effect" for the
 > exact per-case numbers.
+
+**Correction (2026-09-19, Label-order milestone).** "Currently pinned by an
+existing test", above, was inaccurate at the time it was written -- no test
+pinned the composite label order before that milestone. It is accurate now
+only because the Label-order milestone's own new pinning test does so. That
+milestone also fixed the underlying lever itself (`_order_free_labels`, plus
+a guarded M/N orientation swap); see `docs/decisions.md`, "Label-order
+milestone", for the mechanism and the measured before/after on these same
+four cases.
