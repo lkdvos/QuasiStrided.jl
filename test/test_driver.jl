@@ -1206,11 +1206,18 @@ end
     Ma, Ka, Na = 9, 4, 12
     Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
     kernel = SIMDKernel(Val(8), Val(6), Float64)
+    # Reuse ONE StridedView per operand for both `plan_contract` and the
+    # `===` check below -- `parent(StridedView(x))` is not guaranteed
+    # object-identical across two independently-constructed StridedViews of
+    # the same `x` on Julia 1.10 (unlike 1.11+, where it resolves to the
+    # Array's own `Memory{T}`), so comparing against a *fresh* StridedView
+    # is a 1.10-only false failure, not a real behavior difference.
+    Av, Bv = StridedView(Amat), StridedView(Bmat)
 
     # C[m,n] column-major: M is already C's unit axis, so nothing moves.
     Cmat = zeros(Ma, Na)
-    p = _mm_plan(Cmat, Amat, Bmat; kernel = kernel)
-    @test p.Astorage === parent(StridedView(Amat))
+    p = plan_contract(StridedView(Cmat), Av, (1, 2), Bv, (2, 3), (1, 3); kernel = kernel)
+    @test p.Astorage === parent(Av)
     @test p.mgroup.strides == ((1,), (1,))
     @test p.ngroup.strides == ((Ka,), (Ma,))
     execute!(p, 1.0, 0.0)
@@ -1219,11 +1226,8 @@ end
     # The same contraction written into C's transpose (C stored as (n, m)):
     # N carries the unit axis with a 12-wide run >= mr = 8, so B feeds M.
     Ct = zeros(Na, Ma)
-    pt = plan_contract(
-        StridedView(Ct), StridedView(Amat), (1, 2), StridedView(Bmat), (2, 3), (3, 1);
-        kernel = kernel
-    )
-    @test pt.Astorage === parent(StridedView(Bmat))
+    pt = plan_contract(StridedView(Ct), Av, (1, 2), Bv, (2, 3), (3, 1); kernel = kernel)
+    @test pt.Astorage === parent(Bv)
     @test pt.mgroup.strides == ((Ka,), (1,))      # (B, C) maps over label 3
     @test pt.ngroup.strides == ((1,), (Na,))      # (A, C) maps over label 1
     @test pt.kgroup.strides == ((1,), (Ma,))      # (B, A) maps over label 2
@@ -1231,11 +1235,9 @@ end
     @test Ct ≈ transpose(Amat * Bmat)
     # ... but not when the run is too short for the kernel.
     Ct2 = zeros(6, Ma)
-    pt2 = plan_contract(
-        StridedView(Ct2), StridedView(Amat), (1, 2), StridedView(Bmat[:, 1:6]), (2, 3), (3, 1);
-        kernel = kernel
-    )
-    @test pt2.Astorage === parent(StridedView(Amat))
+    Bv6 = StridedView(Bmat[:, 1:6])
+    pt2 = plan_contract(StridedView(Ct2), Av, (1, 2), Bv6, (2, 3), (3, 1); kernel = kernel)
+    @test pt2.Astorage === parent(Av)
 end
 
 @testset "label order: correctness on ccsd_t shapes, permuted/sliced C, alpha/beta, conj" begin
