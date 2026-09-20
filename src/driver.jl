@@ -112,6 +112,73 @@ function _build_pair_group(
     return AxisGroup(lens, (s1, s2))
 end
 
+# ----------------------------------------------------------------------------
+# Free-label order and M/N orientation (docs/decisions.md, "Label-order
+# milestone"). `_classify_labels` lists free labels in A's/B's own axis order,
+# which is incidental to C: `fill_offsets!` enumerates a composite with its
+# FIRST label fastest, so that order fixes the store loop's walk through C.
+# Both helpers below are pure planning-time functions of (labels, indC, C).
+# ----------------------------------------------------------------------------
+
+# Stable sort of `labels` by `abs(stride)` of each label's axis in C,
+# ascending; ties keep input order, so a single label or an already-sorted list
+# comes back unchanged. Every label must occur in `indC` (the M/N lists from
+# `_classify_labels` do by construction; K labels never come here).
+function _order_free_labels(
+        labels::Vector{Int}, indC::NTuple{NC, Int}, C::StridedView
+    ) where {NC}
+    st = Base.strides(C)
+    ks = [abs(st[findfirst(==(l), indC)::Int]) for l in labels]
+    return labels[sortperm(ks; alg = Base.Sort.DEFAULT_STABLE)]
+end
+
+# Element count of the leading unit-stride run when `labels` (already ordered
+# by `_order_free_labels`) is enumerated first-label-fastest into C: the first
+# non-singleton label must have C-stride exactly +1 (`_unit_stride_rows` is
+# `stride == 1`, a descending run does not qualify), and each following label
+# extends the run only if its stride equals the run so far. Singleton axes are
+# skipped (their coordinate never advances, whatever their stride says).
+# Returns 1 when no run starts, 0 if an empty axis is met first.
+function _leading_unit_run(
+        labels::Vector{Int}, indC::NTuple{NC, Int}, C::StridedView
+    ) where {NC}
+    st = Base.strides(C)
+    run = 1
+    for l in labels
+        p = findfirst(==(l), indC)::Int
+        L = size(C, p)
+        L == 1 && continue
+        L == 0 && return 0
+        st[p] == run || break
+        run *= L
+    end
+    return run
+end
+
+# Whether to swap the operand roles (B feeds M, A feeds N). The vectorized
+# store (`_vector_store_eligible`) needs a register sliver -- `mr(kernel)`
+# consecutive M coordinates -- to be unit-stride in C, so a leading run shorter
+# than `mr` buys nothing (measured: swapping onto a 16-wide run under a 32-wide
+# kernel is a ~1.2x REGRESSION). Swap only when the as-is orientation misses
+# that bar and the swapped one clears it. The two `mr` arguments are the widths
+# of the kernel each orientation would actually run (they differ only when the
+# default kernel's small-Qm demotion applies to one side).
+#
+# Callers must additionally restrict this to real dtypes -- `PlanarKernel`/
+# `OneMKernel` (complex) ship the scattered/scalar store unconditionally
+# (`src/kernels/planar.jl`, `src/kernels/onem.jl`), so this function's whole
+# rationale is moot for them; measured directly (`ccsd_t_3`, dim=16, both
+# complex dtypes): the swap is a ~2-4% regression there (loses the as-is
+# orientation's N-side locality for no store-side gain). See the `T <: Real`
+# guard at the call site.
+function _prefer_swap(
+        morder::Vector{Int}, norder::Vector{Int}, indC::NTuple{NC, Int}, C::StridedView,
+        mr_asis::Int, mr_swapped::Int = mr_asis
+    ) where {NC}
+    return _leading_unit_run(morder, indC, C) < mr_asis &&
+        _leading_unit_run(norder, indC, C) >= mr_swapped
+end
+
 # Engine-wide default kernel: shape from ONE detected capability, the vector
 # register width -- `W = vector_bytes/sizeof(T)`, `MR = 2W`, `NR = NR_DEFAULT`,
 # so `NV = 12`. Reproduces the swept optimum for both dtypes on AVX-512 and
@@ -633,6 +700,12 @@ vector type (`Vector{real(T)}` on the default allocator path, so `Vector{T}`
 on the real path), a `where`-bound parameter resolved at construction, so
 every plan instance is concretely typed. Field layout is an implementation
 detail, not part of the frozen interface.
+
+Note the M/N orientation swap (docs/decisions.md, "Label-order milestone"):
+after a swap, `Astorage`/`Abase`/`atransform` describe the ORIGINAL `B`
+operand and `Bstorage`/`Bbase`/`btransform` describe the original `A`, so
+`plan.Astorage === parent(A)` does not hold in general -- do not assume the
+field name still tracks the user-facing argument it is named after.
 """
 struct ContractPlan{
         T, Kern, GM <: AxisGroup, GN <: AxisGroup, GK <: AxisGroup, SA, SB, SC,
@@ -683,7 +756,19 @@ naming it is the only way to use 1m.
 
 Planning phase of [`contract!`](@ref): resolves labels into M/N/K
 `AxisGroup`s, validates matched axis lengths and eltypes, and preallocates
-every buffer [`execute!`](@ref) needs. `mc`/`kc`/`nc` are the macro-blocking
+every buffer [`execute!`](@ref) needs.
+
+Label order and orientation (docs/decisions.md, "Label-order milestone"): the
+labels inside the M composite (A's free labels) and the N composite (B's free
+labels) are each stable-sorted by `abs(stride)` of the label's axis *in `C`*,
+ascending, ties keeping the operand's own axis order -- so each composite is
+enumerated with `C`'s fastest axis fastest, whatever A's or B's layout is. The
+K composite keeps `indA` order. Then, if the sorted M list does *not* begin
+with a unit-stride run of at least `mr(kernel)` elements in `C` while the sorted
+N list does, the operand roles are swapped: `B` feeds M and `A` feeds N, and
+the K maps, the storage/base fields and the conjugation transforms move with
+them (so `plan.Astorage` may be `parent(B)`). The result is unchanged either
+way; only the walk through `C` is. `mc`/`kc`/`nc` are the macro-blocking
 factors (see [`Blocking`](@ref)); a `nothing` keyword takes the corresponding
 field of `default_blocking(kernel)`. Each must be `>= 1`, and is then rounded
 and clamped into the *effective* blocking stored on the plan: `mc`/`nc` round
@@ -752,20 +837,46 @@ function plan_contract(
 
     mlabels, nlabels, klabels = _classify_labels(indA, indB, indC)
 
-    mgroup = _build_pair_group(mlabels, indA, A, indC, C)  # maps: (A, C)
-    ngroup = _build_pair_group(nlabels, indB, B, indC, C)  # maps: (B, C)
+    # C's layout, not A's/B's, decides the order within each composite.
+    morder = _order_free_labels(mlabels, indC, C)
+    norder = _order_free_labels(nlabels, indC, C)
+
+    mgroup = _build_pair_group(morder, indA, A, indC, C)  # maps: (A, C)
+    ngroup = _build_pair_group(norder, indB, B, indC, C)  # maps: (B, C)
     kgroup = _build_pair_group(klabels, indA, A, indB, B)  # maps: (A, B)
 
     Qm = axis_length(mgroup)
     Qn = axis_length(ngroup)
     Qk = axis_length(kgroup)
 
-    # Resolved here, not in the signature default: the demotion needs Qm.
+    # Resolved here, not in the signature default: the demotion needs Qm, and
+    # Qm depends on the orientation, so both candidates are resolved.
     # Nothing between the eltype checks and here reads `kernel`.
-    resolved = kernel === nothing ? _default_kernel(T, Qm, Qn) : kernel
+    kernel_asis = kernel === nothing ? _default_kernel(T, Qm, Qn) : kernel
+    kernel_swapped = kernel === nothing ? _default_kernel(T, Qn, Qm) : kernel
+
+    # Complex kernels (`PlanarKernel`/`OneMKernel`) always scatter-store --
+    # `_vector_store_eligible` only exists on the real path -- so there is
+    # nothing for the swap to win there, and it measurably loses the as-is
+    # orientation's N-side locality instead (~2-4%, `ccsd_t_3`, ComplexF64/32).
+    # Real kernels (`SIMDKernel` and, for this run-length rule, `ScalarKernel`
+    # too) keep the swap.
+    if T <: Real && _prefer_swap(morder, norder, indC, C, mr(kernel_asis), mr(kernel_swapped))
+        # B takes the M role and A the N role. Everything operand-bound moves
+        # together: the groups (each already carries its own C map), the K
+        # group's two maps, the storage/base pair `_plan_contract` reads off
+        # its A/B arguments, and the packing transforms. The contraction is
+        # unchanged: `*` commutes on `T` and `conj` is elementwise, so
+        # `sum_k conj?(B[n,k]) * conj?(A[m,k])` is the same sum.
+        kgroup_swapped = _build_pair_group(klabels, indB, B, indA, A)  # maps: (B, A)
+        return _plan_contract(
+            C, B, A, indC, ngroup, mgroup, kgroup_swapped, Qn, Qm, Qk,
+            kernel_swapped, btransform, atransform, mc, kc, nc, workspace, allocator, oracle
+        )
+    end
     return _plan_contract(
         C, A, B, indC, mgroup, ngroup, kgroup, Qm, Qn, Qk,
-        resolved, atransform, btransform, mc, kc, nc, workspace, allocator, oracle
+        kernel_asis, atransform, btransform, mc, kc, nc, workspace, allocator, oracle
     )
 end
 
