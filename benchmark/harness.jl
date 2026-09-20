@@ -262,3 +262,30 @@ function run_canary(rng, label::String)
 end
 
 relative_spread(ts) = isempty(ts) ? 0.0 : (maximum(ts) - minimum(ts)) / minimum(ts)
+
+# ---------------------------------------------------------------------------
+# Minimal CLI arg parsing: `--name value` or `--name=value`.
+# ---------------------------------------------------------------------------
+
+function argval(name::String)
+    for (i, a) in enumerate(ARGS)
+        if a == "--$name" && i < length(ARGS)
+            return ARGS[i + 1]
+        elseif startswith(a, "--$name=")
+            return split(a, '='; limit = 2)[2]
+        end
+    end
+    return nothing
+end
+
+hasflag(name::String) = "--$name" in ARGS
+
+argopt(name::String, default::AbstractString) = something(argval(name), default)
+argopt(name::String, default::Integer) = something(tryparse(Int, something(argval(name), "")), default)
+
+const DTYPE_BY_NAME = Dict(
+    "Float64" => Float64, "Float32" => Float32,
+    "ComplexF64" => ComplexF64, "ComplexF32" => ComplexF32,
+)
+parse_dtypes(s::AbstractString) = Tuple(DTYPE_BY_NAME[strip(t)] for t in split(s, ','))
+parse_ints(s::AbstractString) = Tuple(parse(Int, strip(t)) for t in split(s, ','))

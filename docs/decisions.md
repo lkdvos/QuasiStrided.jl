@@ -3398,3 +3398,317 @@ alongside. A test verifies every resolved shape constructs at the shape asked
 for, which is the invariant that matters -- `_complex_kernel_from_shape` falls
 through to the menu tail on no match, so a row absent from the menu would
 silently build a different kernel.
+
+## Store fast-path investigation: Phase A
+
+Opened 2026-09-15 on branch `store-fastpath-investigation`, base `main`
+(`71c1536`). Follow-up to the (unmerged) upstream TensorOperations.jl
+benchmark-suite comparison milestone
+(`https://github.com/lkdvos/QuasiStrided.jl/pull/5`, branch `upstream-bench`),
+whose profiling triage found the `ccsd_t_*_dim16` regression class (six-index
+output, 6.6-14.2x slower than `StridedBLAS`) traced to two separable,
+**unverified** causes: (A) the vectorized store fast-path guard in
+`src/kernels/simd.jl:217` (`_unit_stride_rows(destination.rows) &&
+destination.storage isa Vector{T}`) appearing unsatisfiable for any
+`Array`-backed destination; (B) that specific case class's output exceeding
+L3 with a cache/TLB-unfriendly stride pattern. This milestone resolves Cause
+A with evidence before touching anything, per this project's standing
+"scout/measure before committing" convention (macro-blocking Phase A,
+register-shape milestone).
+
+### Non-goals (frozen for this milestone)
+
+`QuasiStridedBackend`'s hard-reject/no-fallback invariant; the macro-blocking
+five-loop structure in `src/driver.jl`; the register-shape/blocking constant
+derivation in `src/target.jl`; a general fix for Cause B (output-side
+blocking or an accepted temp, like `StridedBLAS`'s own strategy); a wider
+profiling sweep across more upstream-suite cases (the prior triage explicitly
+recommended against this); repointing the `TensorOperationsBenchmarks`
+dependency (PR #303 upstream confirmed still unmerged, 2026-09-15, via `gh pr
+view 303 --repo QuantumKitHub/TensorOperations.jl`).
+
+### Planning-time evidence (E1-E7), to be confirmed or refuted by T1-T3
+
+- **E1.** The guard is analytically dead on every real driver path on Julia
+  >= 1.11, and live on Julia 1.10. The only destination-tile constructor on
+  the real path is `src/driver.jl:815` (`Cstorage = parent(C)`, inside
+  `_plan_contract(C::StridedView, ...)` at `:776`). StridedViews v0.5.2
+  (`~/.julia/packages/StridedViews/MHBDj/src/auxiliary.jl:50-55`) resolves
+  `parent` of an `Array`-backed `StridedView` to `Memory{T}` under `@static
+  if isdefined(Core, :Memory)` (true on 1.11+), and to a `Vector{T}` sharing
+  memory otherwise (1.10). The reference machine (`ccqlin038`) has run Julia
+  1.12.6 for this whole project, so **no driver-level real-path number ever
+  recorded here used the vectorized store**.
+- **E2.** `SIMD.jl` v3.7.2's `vload`/`vstore` array methods are defined on
+  `FastContiguousArray{T,1}` (`~/.julia/packages/SIMD/UiGbs/src/arrayops.jl`),
+  and `Memory{T} <: DenseVector{T}` -- no API gap is expected, but must be
+  confirmed by direct call (T1), not assumed.
+- **E3 (analytical prediction, T1/T3 confirm empirically).** In all four
+  `ccsd_t_*` equations the destination's M-composite's first label has a
+  large C-stride (e.g. `i`'s stride is 16^3 = 4096 for `dim=16`) and the
+  N-composite's first label likewise (`k` or `j`, stride 16^5 or 65536) --
+  every micro-tile's rows are a *regular but non-unit-stride* `AffineAxis`.
+  **`_unit_stride_rows` is predicted false for every tile in these four
+  cases regardless of storage type** -- so even a fully-restored fast path
+  would change nothing for the actual regression. If T1/T3 instead find a
+  unit-stride sliver in any of the four cases, that refutes E3 and the
+  attribution below must be redone before any fix decision.
+- **E4.** The `ccsd_t_1` flat profile (prior milestone,
+  `benchmark/results/ccqlin038.flatironinstitute.org-2026-09-15/profiles/ccsd_t_1_dim16-QuasiStridedComposite.flat.txt`)
+  shows `_store_tile_scattered!` dominating (19014 of 25182 `execute_tile!`
+  samples), confirming the store, not the FMA, is where time goes on this
+  case -- but the prior milestone's own `*.buckets.txt` files classify
+  88-96% of *all* samples as `other` because they also count the idle
+  profile-listener thread; do not cite those bucket percentages as if they
+  were the store's true share.
+- **E5.** The "SIMDKernel reaches 101-103 GFLOP/s, ~88% of peak" claim
+  (this file, "Attributed 2026-09-11 (Phase G...)" blockquote above) was an
+  **accumulate-only** isolated microkernel measurement (Float64, `kc=256`),
+  never through `store_tile!` at all, and is not reproduced by any script
+  currently committed to the tree (`benchmark/bench_kernel_shape.jl` times
+  `execute!` through the full driver, not a standalone tile). So that number
+  is unrelated to Cause A in either direction -- it neither used nor was
+  degraded by the scattered-store path. `benchmark/bench_kernel_shape.jl`'s
+  own driver-level numbers, and every other driver-level number in this
+  project's history, **were** taken on the scattered-store path, since the
+  driver has always gone through `Cstorage = parent(C)` on this project's
+  one measurement machine.
+- **E6.** Restoring the fast path is not a one-line change: its tail loop
+  (`simd.jl:234-238`) indexes the accumulator tuple dynamically, which is
+  exactly the allocation-cliff pattern the GUARDRAIL comment at
+  `simd.jl:158-166` forbids above `NV = 16` -- currently harmless only
+  because the branch is dead on 1.11+. A restored fast path needs a
+  statically-indexed tail (mirroring `_store_tile_scattered!`'s own
+  generated-code style), and the guard must stay rank-1
+  (`DenseVector{T}`, not `DenseArray{T}`) since SIMD's array methods only
+  exist for rank-1 arrays.
+- **E7.** `benchmark/bench_to_suite.jl`/`profile_to_suite.jl`/
+  `composite_backend.jl`/`benchmark/Project.toml` exist only on the unmerged
+  `upstream-bench` branch (PR #5). This milestone does not merge or rebase
+  onto that branch (two open PRs would become entangled); it recreates a
+  minimal, self-contained control script instead (`benchmark/bench_ccsd_t_store.jl`),
+  and its docs section cross-references PR #5's section by title rather than
+  duplicating it. Expect a trivial append-conflict between the two PRs at
+  merge time.
+
+### Decision boundaries (fixed now, before any `src/` edit)
+
+Choose **(a) fix** the guard only if: T1 confirms `vload`/`vstore` on
+`Memory{T}` is correct and allocation-free; T1/T3 confirm E3 (so the fix is
+not motivated by a false belief that it closes the regression); and T2's
+tile-level measurement shows a real, above-noise gain at the shipped
+register shapes from a genuine `Vector`/`Memory` destination taking the fast
+path. Choose **(b) docs-only correction** if T2 shows no tile-level gain at
+any shipped shape, or if a fix cannot reach zero steady-state allocation at
+the shipped register shapes (`NV` up to 28) with tail rows without touching
+`src/driver.jl`/`src/target.jl`/`src/blocking.jl` (frozen, non-goals above) --
+in that case the code is left as-is, the guard gets a comment stating its
+per-Julia-version reachability, and the deferral is recorded here. Choose
+**(c) escalate to the user** if T1 finds `SIMD.jl` misbehaves on
+`Memory{T}` (wrong results or allocation) -- a pointer-based store would then
+be a new design question, not a bug fix.
+
+**Replanning triggers**: T1/T3 finds a unit-stride C row in any of the four
+regression cases (E3 refuted -- redo the attribution before deciding
+anything); a fix would require touching `src/driver.jl`/`src/target.jl`/
+`src/blocking.jl`; the re-measurement shows a one-sided regression across
+shapes after a fix; the C-local label-order control (Arm 3) in
+`bench_ccsd_t_store.jl` runs materially faster than the adapter's own label
+order (Arm 1) on the `dim=16` cases -- that would point at a different,
+product-level lever (`_classify_labels`'s label ordering, currently pinned
+by an existing test) requiring the user's decision as a separate follow-up,
+not something this milestone acts on unilaterally.
+
+Review budget: one gated pass (independent review, after docs are written),
+`fable_review_storefastpath_used: true` -- spent, do not relaunch for this milestone. Disposition: no blocking findings; several should-fix findings addressed (see "T4-T5" subsection and this milestone's T9 commit).
+
+### T1-T3 results and the decision gate
+
+**T1** (`benchmark/probes/`): E1 confirmed empirically -- `parent(StridedView(::Array{T}))`
+is `Memory{T}` (never `Vector{T}`) on this Julia 1.12.6 install, for every
+tested rank/dtype. E2 confirmed -- `SIMD.vload`/`vstore` on `Memory{T}` are
+correct and allocation-free (0 B, measured inside a compiled wrapper function
+to avoid top-level-scope measurement artifacts). **E3 confirmed empirically,
+not just analytically**: zero unit-stride C-side M/N slivers across all four
+`ccsd_t_*` equations x both dtypes at `dim=16` -- the row stride is always
+4096 (`i`'s stride), never 1. Julia 1.10 LTS is installed locally via
+`juliaup` but requires its own `Pkg.instantiate()` to test directly (deferred
+to CI's `lts` matrix entry, per this milestone's own decision boundaries);
+Julia 1.10's behavior is otherwise established by direct reading of
+`StridedViews.jl`'s source (E1), not merely inferred.
+
+**T2** (`benchmark/bench_store_path.jl`): the core deliverable for the gate.
+`Memory{T}` (D-mem, today's real path) costs **more per element to store
+than `Vector{T}`** (D-vec, today's fast path) when rows ARE unit-stride --
+a consistent 1.69-2.26 ns/element gap across all 4 kernel shapes x 2 `kc`
+values x both beta regimes (a **3.9x-9.9x ratio**, not a flat "4-5x" -- the
+ratio varies by shape since the D-vec baseline itself varies; re-derived
+from `summary_store_path.txt` at review, T8), far above the 3.7% canary
+noise floor. Zero unexpected allocation in any of the 144 measured cells.
+Separately, D-strided-hot/cold (non-unit-stride rows, approximating the
+actual `ccsd_t_*` addressing pattern) cost 8-25 ns/element **regardless of
+storage type** -- confirming the storage-type gap and the regression are
+orthogonal, exactly as E3 predicts.
+
+**T3** (`benchmark/bench_ccsd_t_store.jl`, smoke-tested at `dim=8` only):
+zero correctness mismatches across all three arms. Arm 3 (a label-order
+control, out of this milestone's scope to act on) showed a notable speedup
+at `dim=8` on 3 of 4 cases, but the script's own on-the-record analysis
+shows the effect's sign is `dim`-vs-`MR`/`NR`-dependent, not a clean win --
+flagged for the coordinator to check again at `dim=16` if a future milestone
+picks up the label-order lever; **not** investigated further here per the
+frozen non-goal.
+
+**Gate decision: (a) fix.** All three conditions from the decision
+boundaries above are met: (1) `SIMD` is correct and allocation-free on
+`Memory{T}` (T1); (2) E3 is confirmed, so the fix is not motivated by a
+false belief that it closes the `ccsd_t_*` regression -- it does not, and
+the docs must say so plainly (T1/T3); (3) T2 shows a real, consistent,
+above-noise gain at every shipped/swept register shape from a genuine
+`Vector`/`Memory` destination taking the fast path. Proceeding to **T4**:
+widen `src/kernels/simd.jl:217`'s guard from `destination.storage isa
+Vector{T}` to a `DenseVector{T}` check (covering `Memory{T}` too, per D2),
+with a statically-indexed tail body (per E6) verified allocation-free at
+`NV` up to 28 with tail rows, on Julia >= 1.11. This will speed up ordinary
+(unit-stride-destination) contractions on Julia 1.12; it will not move the
+`ccsd_t_*_dim16` regression at all, and the docs close-out (T7) must state
+that explicitly so nobody reads a future `Pkg.test()`-adjacent benchmark
+re-run as evidence either way for that specific case class.
+
+### T4-T5: the fix and its measured effect
+
+**T4 (the fix, already committed on this branch, `f467b45`).**
+`src/kernels/simd.jl`'s store fast-path guard (`_vector_store_eligible`,
+formerly an inline `isa Vector{T}` check) was widened to accept any concrete
+`DenseVector{T}` (covering `Memory{T}`, which is what the real driver always
+hands the kernel on Julia >= 1.11), while continuing to exclude
+`Matrix`/`SubArray`/non-unit-stride destinations. The old fast path's tail
+handling used a runtime-indexed accumulator access (an allocation-cliff risk
+once the branch became reachable, per the GUARDRAIL convention already
+established elsewhere in this file for the scattered-store path) — replaced
+with a `@generated`, statically-indexed `_store_tile_vector!`, mirroring
+`_store_tile_scattered!`'s existing style. Verified: full test suite
+34853/34853 passing (was 34654 before this milestone; +199 new assertions, no
+regressions); zero steady-state allocation with tail rows at register widths
+up to `NV=28` on Julia >= 1.11 (skip-marked on 1.10, this project's existing
+convention); `@code_native` confirmed the vectorized path (direct `vmovupd`
+to the destination pointer) is genuinely reached for `Memory{Float64}`-backed
+tiles, with the scattered path (element-by-element, stack round-tripping)
+still reached for `SubArray`/`Matrix`/`ScatterAxis`-backed tiles.
+
+**T5 (the measurement campaign).** All results below are from
+`benchmark/results/ccqlin038.flatironinstitute.org-2026-09-15/T5_*` files, run
+on this machine, 2026-09-15.
+
+- Two-tree ABBA guard comparison (`benchmark/bench_real_path_guard.jl`, base
+  commit `d1127dd` vs fixed commit `f467b45`, 21 reps): no one-sided
+  regression on any of 18 measured shapes; ratios (fixed/base) ranged from
+  ~0.98 (near-parity, e.g. scattered-input shapes untouched by this fix) to
+  ~0.31-0.41 (shapes with unit-stride destinations, e.g.
+  `shallowK_256x24x256` at 0.407x/0.305x for F64/F32 — a ~2.5-3.3x speedup).
+  Canary bracket judged quiet by this project's own established convention
+  (middle-vs-end spread, not the full start/mid/end spread, since the
+  script's own documented caveat is that the start point reads faster from a
+  warm-up effect) — all middle/end spreads were small (0.21-5.58%).
+- Re-run of `benchmark/bench_store_path.jl` (unmodified script) on the fixed
+  tree: the D-mem vs D-vec per-element store-cost gap that T2 measured
+  before the fix (1.69-2.26 ns/element, 3.9x-9.9x, "far above noise") is now
+  eliminated — post-fix delta(mem-vec) ranges from -0.10 to +0.06 ns/element
+  across all 8 (shape,kc) x 2 beta-regime cells. **This run's own canary
+  spread was 9.19%** (worse than T2's original 3.7%, `T5_summary_store_path_after_fix.txt`)
+  -- the residual +/-0.10 ns/elem is below this run's own resolution, so read
+  "eliminated" as "below this run's resolution", not as a bitwise-proven zero;
+  the conclusion still holds because the gap closed by 3.1x-30x depending on
+  shape (e.g. shipped F64 kc=16: 2.56 -> 0.03 ns/elem), vastly larger than
+  either run's noise. Native-code stack-store instruction counts for D-vec and
+  D-mem are now identical (8 total vector stores, 4 stack, 4 other, at both
+  shipped shapes) — direct confirmation the two code paths are now genuinely
+  the same path. Zero allocation confirmed again (144 cells).
+- Full sweep of `benchmark/bench_ccsd_t_store.jl` (both dims, both dtypes,
+  all 3 arms, post-fix): Arm 1 (`QuasiStridedBackend` via the TensorOperations
+  adapter) at `dim=16` (ratios: `ccsd_t_1` 10.1x/12.1x, `ccsd_t_2` 14.5x/12.9x,
+  `ccsd_t_3` 9.5x/8.1x, `ccsd_t_4` 14.4x/11.6x for F64/F32 respectively) is
+  close to, but not perfectly matching, this milestone's opening
+  characterization of the regression (6.6-14.2x, from
+  `benchmark/results/.../summary_to_suite.txt` on the pre-fix `upstream-bench`
+  harness, cited here at review time since the original comparison wasn't
+  otherwise traceable to an artifact): Float64 agrees to within +/-3%, but
+  **Float32 drifted +5% to +23%** (the pre-fix F32 range's own low end, 6.6x,
+  came from this same `ccsd_t_3` case). Some of that drift is run-to-run
+  noise, not a real change: at `dim=16` Arms 1 and 2 measure the identical
+  contraction with identical labels, and for `ccsd_t_3` F32 they differ by
+  27% from each other in this same run (1.270 s vs 0.999 s, reps=15) — so the
+  dim=16 F32 numbers carry roughly +/-25% run-to-run uncertainty on this
+  machine, and the observed F32 drift is inside that band. **Read this
+  regression class as "not moved by the fix, within this machine's
+  measurement precision" rather than as a precise "unchanged" claim** — the
+  mechanism-level evidence (below) is the stronger support, not the timing
+  comparison. **Confirming the fix does not move this regression class**
+  (E3: zero unit-stride M/N-slivers under the adapter's own label order,
+  reconfirmed at `dim=16` specifically, not just analytically inferred, in
+  every one of the 8 case x dtype cells).
+
+**Confirmed closing statement**: Cause A fixed for ordinary
+(unit-stride-destination) contractions on Julia >= 1.11; Cause B (the
+`ccsd_t_*_dim16` regression) confirmed untouched by this fix, exactly as this
+milestone predicted from the start.
+
+**A new, unplanned finding, flagged prominently — not folded quietly into the
+close-out.** T5's full sweep also ran Arm 3 (a label-order diagnostic control
+T3 built, NOT part of this milestone's own goals — it exists only to check
+whether the store fast-path or something else was the real lever). At
+`dim=16`, permuting the operand carrying label `a` (the destination's
+stride-1 axis) to be that operand's own first physical axis gives a **3.3x
+to 20x speedup** over Arm 1 on the SAME four regression cases, consistently
+across all 8 case x dtype combinations (`ccsd_t_1`: 20.0x F64 / 13.6x F32;
+`ccsd_t_2`: 4.1x / 3.7x; `ccsd_t_3`: 4.1x / 4.2x; `ccsd_t_4`: 4.0x / 3.3x —
+derived from the medians in `T5_summary_ccsd_t_full.txt`, already committed). This is
+**far larger** than anything this milestone's own scope (the store fast-path)
+could ever deliver for this case class. Per this milestone's own frozen
+"replanning trigger" language (above, "Decision boundaries"/"Replanning
+triggers"):
+
+> the C-local label-order control (Arm 3) in `bench_ccsd_t_store.jl` runs
+> materially faster than the adapter's own label order (Arm 1) on the
+> `dim=16` cases — that would point at a different, product-level lever
+> (`_classify_labels`'s label ordering, currently pinned by an existing test)
+> requiring the user's decision as a separate follow-up, not something this
+> milestone acts on unilaterally.
+
+This is being **reported, NOT acted on**: it points at a different,
+product-level lever (`_classify_labels`'s label ordering, currently pinned by
+an existing test per that same frozen text) that needs the user's/
+coordinator's decision as a SEPARATE follow-up milestone, not something this
+milestone's own task graph authorized touching. **No code was changed in
+response to this finding.** Closing THIS milestone does not mean the
+`ccsd_t_*` regression's story is finished — only that the specific hypothesis
+(Cause A, the store fast-path) this milestone was built to test has been
+fully resolved.
+
+**Follow-ups, explicitly out of scope for this milestone:**
+
+- Repointing the `TensorOperationsBenchmarks` dependency (still blocked, PR
+  #303 upstream unmerged).
+- The label-ordering lever surfaced by Arm 3 — a candidate NEW milestone,
+  not started, needs a decision from the user.
+- Any remaining upstream benchmark-suite categories (this milestone's own
+  frozen non-goals already excluded a wider profiling sweep).
+- **Stale `_acc_lane` cross-references** (found at T8 review; not fixed here
+  since the affected files are this milestone's own frozen non-goals):
+  `_acc_lane` is now unused by any store path (both `_store_tile_scattered!`
+  and the new `_store_tile_vector!` are `@generated` with literal indices),
+  but `src/kernels/planar.jl` and `src/kernels/onem.jl` each have a comment
+  stating the real path *uses* `_acc_lane`, and `test/test_quality.jl`'s Aqua
+  `unbound_args = false` justification cites it as the reason -- all three
+  are now stale (the justification is not wrong, `_acc_lane` still exists
+  and is still unbound-arg-shaped, but its "still in use" premise no longer
+  holds). A future task touching those files should update the three
+  comments (or delete `_acc_lane` and re-enable `unbound_args = true`, which
+  T8 notes would be a net Aqua-coverage gain) -- out of scope here since none
+  of the three files were in this milestone's edit scope.
+- A tile-level numerical-agreement test for the new vectorized store path
+  with unit-stride rows but scattered/irregular *columns* (`ScatterAxis`
+  cols) -- found at T8 review as a coverage gap: this combination is newly
+  routed to `_store_tile_vector!` and is exercised for allocation by
+  `test/test_target.jl`'s sliced-C fixture, but that test only asserts zero
+  allocation, not numerical correctness, for this specific combination.

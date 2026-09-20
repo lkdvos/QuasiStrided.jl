@@ -1,8 +1,14 @@
 # Exercises src/kernels/simd.jl: SIMDKernel vs. ScalarKernel on identical
 # inputs (numerical tolerance, never bitwise equality).
-using QuasiStrided: SIMDKernel, ScalarKernel, lanewidth, avecs_per_column
+using QuasiStrided: SIMDKernel, ScalarKernel, lanewidth, avecs_per_column,
+    _vector_store_eligible
 using Random
 using SIMD: Vec
+# `parent(::StridedView)` is how the driver obtains a destination's storage
+# (src/driver.jl, `Cstorage = parent(C)`): `Memory{T}` on Julia >= 1.11, a
+# `Vector{T}` sharing memory on 1.10. The store-path testsets below build
+# their destinations the same way rather than assuming either one.
+using StridedViews: StridedView
 
 @testset "kernels/simd.jl (SIMD candidate)" begin
 
@@ -41,6 +47,17 @@ using SIMD: Vec
     end
 
     # --- helpers ---
+
+    # The storage the driver actually hands `store_tile!`, holding a copy of
+    # `v`: `Memory{T}` on Julia >= 1.11, `Vector{T}` on 1.10. Both are
+    # `DenseVector{T}`, so the vectorized store path must take either.
+    function dense_storage(v::AbstractVector{T}) where {T}
+        storage = parent(StridedView(zeros(T, length(v))))
+        for i in eachindex(v)
+            storage[i] = v[i]
+        end
+        return storage
+    end
 
     function packed_from_matrices(k, Amat, Bmat, kc)
         pa = zeros(eltype(Amat), packed_a_length(k, kc))
@@ -336,6 +353,198 @@ using SIMD: Vec
         end
         bytes_exec = @allocated run_execute(k, dst, pa, pb, kc)
         @test bytes_exec == 0 skip = (VERSION < v"1.11")
+    end
+
+    # ------------------------------------------------------------------------
+    # Vectorized store path (docs/decisions.md, "Store fast-path
+    # investigation: Phase A"). Its guard used to demand `Vector{T}` exactly,
+    # which no real driver destination satisfies on Julia >= 1.11 (`parent` of
+    # an Array-backed StridedView is `Memory{T}` there); it now admits any
+    # concrete `DenseVector{T}`, which is exactly what SIMD.jl's array
+    # `vload`/`vstore` methods accept.
+    # ------------------------------------------------------------------------
+
+    @testset "_vector_store_eligible: any 1-D dense storage, unit-stride rows only" begin
+        for T in (Float64, Float32)
+            m, n = 8, 8
+            unit_rows = AffineAxis(0, 1, m)
+            cols = AffineAxis(0, m, n)
+
+            # What the driver hands `store_tile!`: `Memory{T}` on Julia
+            # >= 1.11, `Vector{T}` on 1.10. Either way, eligible.
+            mem = parent(StridedView(zeros(T, m, n)))
+            @test _vector_store_eligible(DestinationTile(mem, 0, unit_rows, cols), T)
+            # A plain `Vector{T}` -- the only storage the old guard accepted.
+            @test _vector_store_eligible(DestinationTile(zeros(T, m * n), 0, unit_rows, cols), T)
+
+            # Excluded, and so still on the scalar fallback: a `SubArray` (a
+            # contiguous view is contiguous but is not a `DenseArray`), and
+            # rank-2 storage (SIMD.jl's array methods are rank-1 only).
+            buf = zeros(T, m * n + 4)
+            @test !_vector_store_eligible(
+                DestinationTile(view(buf, 3:(2 + m * n)), 0, unit_rows, cols), T
+            )
+            @test !_vector_store_eligible(DestinationTile(zeros(T, m, n), 0, unit_rows, cols), T)
+
+            # Unit-stride rows are required independently of the storage type:
+            # a stride-2 affine axis or a scatter axis is never eligible, even
+            # over dense rank-1 storage.
+            stride2 = AffineAxis(0, 2, m)
+            wide_cols = AffineAxis(0, 2m, n)
+            @test !_vector_store_eligible(
+                DestinationTile(zeros(T, 2m * n), 0, stride2, wide_cols), T
+            )
+            @test !_vector_store_eligible(
+                DestinationTile(parent(StridedView(zeros(T, 2m * n))), 0, stride2, wide_cols), T
+            )
+            @test !_vector_store_eligible(
+                DestinationTile(mem, 0, ScatterAxis(collect(0:(m - 1)), m), cols), T
+            )
+
+            # The element type must be the kernel's own.
+            other = (T === Float64) ? Float32 : Float64
+            @test !_vector_store_eligible(DestinationTile(mem, 0, unit_rows, cols), other)
+        end
+    end
+
+    @testset "vectorized store path and scalar fallback agree (dense 1-D vs view storage)" begin
+        MR, NR, kc = 8, 6, 5
+        k = SIMDKernel(Val(MR), Val(NR), Float64)
+        W = lanewidth(k)
+        rng = MersenneTwister(2026)
+        Amat = rand(rng, MR, kc)
+        Bmat = rand(rng, kc, NR)
+        pa, pb = packed_from_matrices(k, Amat, Bmat, kc)
+
+        for (m, n) in ((MR, NR), (MR - 3, NR - 1), (W - 1, 1), (1, 1)),
+                alpha in (1.0, 1.5), beta in (0.0, 1.0, -0.4)
+
+            Cold = rand(rng, m * n)
+            rows, cols = AffineAxis(0, 1, m), AffineAxis(0, m, n)
+
+            # Vectorized path: dense rank-1 storage, unit-stride rows.
+            fast = dense_storage(Cold)
+            dst_fast = DestinationTile(fast, 0, rows, cols)
+            @test _vector_store_eligible(dst_fast, Float64)
+            execute_tile!(k, dst_fast, pa, pb, kc, alpha, beta)
+
+            # Scalar fallback, forced by `SubArray` storage over the same
+            # logical layout (padded, so an over-wide store would be caught).
+            pad = 3
+            slow_parent = fill(-77.0, m * n + 2pad)
+            slow = view(slow_parent, 1:(m * n + 2pad))
+            for i in eachindex(Cold)
+                slow[pad + i] = Cold[i]
+            end
+            dst_slow = DestinationTile(slow, pad, rows, cols)
+            @test !_vector_store_eligible(dst_slow, Float64)
+            execute_tile!(k, dst_slow, pa, pb, kc, alpha, beta)
+
+            @test collect(fast) ≈ slow[(pad + 1):(pad + m * n)] atol = 1.0e-10 rtol = 1.0e-10
+            @test all(==(-77.0), slow_parent[1:pad])
+            @test all(==(-77.0), slow_parent[(end - pad + 1):end])
+        end
+
+        @testset "beta=0 on dense 1-D storage never reads old C (NaN old C, tail rows)" begin
+            m, n = MR - 3, NR - 1
+            storage = dense_storage(fill(NaN, m * n))
+            dst = DestinationTile(storage, 0, AffineAxis(0, 1, m), AffineAxis(0, m, n))
+            @test _vector_store_eligible(dst, Float64)
+            execute_tile!(k, dst, pa, pb, kc, 1.5, 0.0)
+            @test all(isfinite, collect(storage))
+        end
+
+        @testset "padded-lane isolation on the vectorized path (nonfinite acc lanes)" begin
+            # Same fixture as the fallback's own padded-lane testset above:
+            # rows m..MR-1 and columns n..NR-1 of the accumulator are
+            # nonfinite, and must neither be stored nor read.
+            m, n = 3, 2
+            packed_a = zeros(Float64, MR)
+            packed_b = zeros(Float64, NR)
+            packed_a[1:m] .= [2.0, 3.0, 5.0]
+            packed_a[(m + 1):MR] .= Inf
+            packed_b[1:n] .= [7.0, 11.0]
+            packed_b[(n + 1):NR] .= Inf
+
+            pad = 5
+            storage = dense_storage(fill(-999.0, m * n + 2pad))
+            dst = DestinationTile(storage, pad, AffineAxis(0, 1, m), AffineAxis(0, m, n))
+            @test _vector_store_eligible(dst, Float64)
+            execute_tile!(k, dst, packed_a, packed_b, 1, 1.0, 0.0)
+
+            expected = [2.0, 3.0, 5.0] * [7.0 11.0]
+            for i in 0:(m - 1), j in 0:(n - 1)
+                addr = pad + i + j * m
+                @test isfinite(storage[addr + 1])
+                @test storage[addr + 1] ≈ expected[i + 1, j + 1]
+            end
+            @test all(==(-999.0), collect(storage)[1:pad])
+            @test all(==(-999.0), collect(storage)[(end - pad + 1):end])
+        end
+
+        @testset "vectorized store path with unit-stride rows but SCATTERED columns" begin
+            # _vector_store_eligible only inspects `tile.rows`/`tile.storage`
+            # -- a ScatterAxis on the COLUMN side is untouched by the guard
+            # and still takes the vectorized path (axis_offset dispatches on
+            # the axis type generically). Found as an untested combination at
+            # milestone review (T8): this is the case QuasiStrided exists
+            # for (irregular/permuted output axes), and it depends on
+            # `colbase` being computed from `axis_offset(cols, j)` only
+            # inside the `j < n` guard (src/kernels/simd.jl).
+            m, n = MR - 3, NR - 1
+            col_offsets = collect(0:2:(2 * (n - 1)))  # a non-affine (but here regular) permutation-style column map
+            rows = AffineAxis(0, 1, m)
+            cols = ScatterAxis(col_offsets, n)
+            span = m * (maximum(col_offsets) + 1)
+
+            Cold = rand(rng, span)
+            fast = dense_storage(copy(Cold))
+            dst_fast = DestinationTile(fast, 0, rows, cols)
+            @test _vector_store_eligible(dst_fast, Float64)  # rows are unit-stride and dense; cols type is irrelevant to the guard
+            execute_tile!(k, dst_fast, pa, pb, kc, 1.5, 0.5)
+
+            slow = copy(Cold)
+            dst_slow = DestinationTile(view(slow, 1:span), 0, rows, cols)
+            @test !_vector_store_eligible(dst_slow, Float64)  # SubArray storage forces the fallback
+            execute_tile!(k, dst_slow, pa, pb, kc, 1.5, 0.5)
+
+            @test collect(fast) ≈ slow atol = 1.0e-10 rtol = 1.0e-10
+        end
+    end
+
+    @testset "allocation: execute_tile! on dense 1-D storage WITH TAIL ROWS is allocation-free" begin
+        # The reason the vectorized store's tail had to become statically
+        # indexed: a dynamically indexed accumulator tuple heap-allocates
+        # above NV = 16 (GUARDRAIL, src/kernels/simd.jl), and widening the
+        # guard made that branch reachable on Julia >= 1.11. Covers every
+        # shipped register shape plus NV = 24 and NV = 28, i.e. past the
+        # cliff and up to the register budget test_target.jl allows.
+        function run_execute(k, dst, pa, pb, kc)
+            execute_tile!(k, dst, pa, pb, kc, 1.0, 0.5)
+            return nothing
+        end
+
+        shapes = Any[]
+        for T in (Float64, Float32), shape in QuasiStrided.kernel_shapes(T)
+            push!(shapes, (T, shape))
+        end
+        push!(shapes, (Float64, (16, 6, 4)), (Float64, (16, 7, 4)))  # NV = 24, 28
+
+        for (T, (MR, NR, W)) in shapes
+            k = SIMDKernel(Val(MR), Val(NR), T, Val(W))
+            kc = 4
+            rng = MersenneTwister(77)
+            pa, pb = packed_from_matrices(k, rand(rng, T, MR, kc), rand(rng, T, kc, NR), kc)
+            # (MR - 1, NR) and (W - 1, 1) both leave a partial W-row block.
+            for (m, n) in ((MR, NR), (MR - 1, NR), (max(W - 1, 1), 1))
+                storage = parent(StridedView(zeros(T, m * n)))
+                dst = DestinationTile(storage, 0, AffineAxis(0, 1, m), AffineAxis(0, m, n))
+                @test _vector_store_eligible(dst, T)
+                run_execute(k, dst, pa, pb, kc)  # warm up (compile) before measuring
+                bytes = @allocated run_execute(k, dst, pa, pb, kc)
+                @test bytes == 0 skip = (VERSION < v"1.11")
+            end
+        end
     end
 
 end

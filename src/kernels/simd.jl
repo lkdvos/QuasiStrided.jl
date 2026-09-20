@@ -146,12 +146,39 @@ _unit_stride_rows(ax::AffineAxis) = ax.stride == 1
 _unit_stride_rows(::ScatterAxis) = false
 _unit_stride_rows(::PtrScatterAxis) = false
 
+# Runtime-indexed accumulator access. NOT used by either store path any more:
+# both `_store_tile_scattered!` and `_store_tile_vector!` below are `@generated`
+# with literal tuple indices (see the GUARDRAIL comment). Kept as the named
+# example of the access pattern that planar/onem's own guardrail comments
+# forbid, and as the subject of `test/test_quality.jl`'s Aqua `unbound_args`
+# justification.
 @inline function _acc_lane(
         acc::NTuple{NV, Vec{W, T}}, v::Int, j::Int, lane1::Int,
         ::Val{NVECA}
     ) where {NV, W, T, NVECA}
     return acc[v + NVECA * j + 1][lane1]
 end
+
+"""
+    _vector_store_eligible(tile::QSTile, ::Type{T}) -> Bool
+
+Whether `tile` can take [`store_tile!`](@ref)'s vectorized path: unit-stride
+`AffineAxis` rows into *any concrete rank-1 dense* storage of `T`
+(`Vector{T}`, `Memory{T}`, ...), which is exactly the set `SIMD.jl`'s
+`vload`/`vstore` array methods are defined on
+(`FastContiguousArray{T,1} ⊇ DenseVector{T}`). The storage half is a
+compile-time constant (it only inspects `typeof(tile.storage)`), so the whole
+predicate folds to `_unit_stride_rows` or to `false` at each specialization.
+
+Rank-2 storage (`Matrix`) and non-`DenseArray` storage (`SubArray`, even a
+contiguous one) are excluded and keep taking the scalar fallback, as do
+non-unit-stride affine rows and scattered rows. Widened from the original
+`isa Vector{T}` check, which was unsatisfiable on the real driver path on
+Julia >= 1.11 (`parent` of an `Array`-backed `StridedView` is `Memory{T}`
+there; docs/decisions.md, "Store fast-path investigation: Phase A").
+"""
+@inline _vector_store_eligible(tile::QSTile, ::Type{T}) where {T} =
+    _unit_stride_rows(tile.rows) && tile.storage isa DenseVector{T}
 
 # Scalar/scattered store path.
 #
@@ -194,15 +221,95 @@ end
     end
 end
 
+# Vectorized store path: unit-stride `AffineAxis` rows into rank-1 dense
+# storage, i.e. exactly the tiles `_vector_store_eligible` admits (the caller
+# checks; `rows::AffineAxis` is pinned in the signature so a violation is a
+# MethodError rather than a wrong answer).
+#
+# GUARDRAIL (Cliff B): same rule as `_store_tile_scattered!` above, and the
+# reason this is `@generated` too. Both the whole-block stores and the lane
+# tail must index `acc` with a *literal* tuple position, so the unrolling over
+# `(v, j)` happens here at compile time rather than in a runtime loop; only the
+# lane index inside a single `Vec` may be a runtime value. Before this was
+# generated the body looped over `v`/`j` with `acc[v + NVECA * j + 1]` and an
+# `_acc_lane(acc, i ÷ W, j, ...)` tail, which is precisely the dynamic-index
+# pattern that heap-allocates the accumulator above NV = 16 -- harmless only
+# while the branch was dead (unreachable on Julia >= 1.11, where the driver's
+# storage is `Memory{T}`), and a live allocation cliff the moment the guard was
+# widened (docs/decisions.md, Phase A, E6).
+#
+# `m`/`n` stay runtime values, compared against literal row/column positions:
+# nothing outside the valid rectangle is loaded or stored, so a partial tile
+# never over-reads a padding lane or a neighbouring tile's element.
+@generated function _store_tile_vector!(
+        destination::QSTile{S, <:AffineAxis}, acc::NTuple{NV, Vec{W, T}},
+        alpha::T, beta::T, kernel::SIMDKernel{MR, NR, T, W},
+        m::Int, n::Int
+    ) where {S, MR, NR, T, W, NV}
+    NVECA = MR ÷ W
+    blocks = Any[]
+    for j in 0:(NR - 1)
+        vblocks = Any[]
+        for v in 0:(NVECA - 1)
+            idx = v + NVECA * j + 1
+            push!(
+                vblocks, quote
+                    vec = acc[$idx]
+                    if $((v + 1) * W) <= m
+                        # Rows v*W .. v*W+W-1 are all inside [0, m): one
+                        # W-wide load/store at that one-based storage index.
+                        at = colbase + $(v * W) + 1
+                        vstore(
+                            iszero(beta) ? alpha * vec :
+                                isone(beta) ? muladd(alpha, vec, vload(Vec{$W, $T}, storage, at)) :
+                                muladd(alpha, vec, beta * vload(Vec{$W, $T}, storage, at)),
+                            storage, at
+                        )
+                    elseif $(v * W) < m
+                        # Row tail: this vector straddles m, so store the
+                        # valid lanes one at a time (runtime lane index into a
+                        # literally indexed `Vec` is allowed).
+                        for lane in 1:$W
+                            i = $(v * W) + lane - 1
+                            i < m || break
+                            _axpby_at!(storage, colbase + i + 1, alpha, vec[lane], beta)
+                        end
+                    end
+                end
+            )
+        end
+        push!(
+            blocks, quote
+                if $j < n
+                    colbase = rowbase0 + axis_offset(cols, $j)  # zero-based address of (i=0, j)
+                    $(vblocks...)
+                end
+            end
+        )
+    end
+    return quote
+        storage = destination.storage
+        cols = destination.cols
+        # zero-based address at (i=0, j=0)'s row contribution; rows are
+        # unit-stride, so row `i` is `rowbase0 + i`.
+        rowbase0 = destination.base + destination.rows.base
+        @inbounds begin
+            $(blocks...)
+        end
+        return destination
+    end
+end
+
 """
     store_tile!(destination::QSTile, acc::NTuple{NV,SIMD.Vec{W,T}}, alpha::T, beta::T, kernel::SIMDKernel) -> destination
 
 SIMD counterpart of `ScalarKernel`'s `store_tile!`; same contract and
-alpha/beta shortcuts. Fast path: unit-stride `AffineAxis` rows into a plain
-`Vector{T}` get vector load/store for whole `W`-row blocks (scalar tail for
-the remainder, never over-reading past the valid rectangle). Otherwise
-falls back to the scalar path, one lane at a time. Empty destination is a
-no-op.
+alpha/beta shortcuts. Fast path: unit-stride `AffineAxis` rows into any 1-D
+dense storage (`Vector`, `Memory`, ...) get vector load/store for whole
+`W`-row blocks (scalar tail for the remainder, never over-reading past the
+valid rectangle); see [`_vector_store_eligible`](@ref) for exactly which
+storage qualifies. Otherwise falls back to the scalar path, one lane at a
+time. Empty destination is a no-op.
 """
 function store_tile!(
         destination::QSTile, acc::NTuple{NV, Vec{W, T}},
@@ -211,34 +318,8 @@ function store_tile!(
     m, n = _store_prologue!(destination, alpha, beta)
     (m == 0 || n == 0) && return destination
 
-    NVECA = MR ÷ W
-    nfull = m ÷ W  # whole W-row blocks entirely inside [0, m)
-
-    if _unit_stride_rows(destination.rows) && destination.storage isa Vector{T}
-        storage = destination.storage
-        rows = destination.rows
-        cols = destination.cols
-        rowbase0 = destination.base + rows.base  # zero-based address at (i=0, j=0)'s row contribution
-        @inbounds for j in 0:(n - 1)
-            colbase = rowbase0 + axis_offset(cols, j)  # zero-based address of (i=0, j)
-            for v in 0:(nfull - 1)
-                idx = colbase + v * W + 1  # one-based storage index of row v*W
-                rvec = acc[v + NVECA * j + 1]
-                vstore(
-                    iszero(beta) ? alpha * rvec :
-                        isone(beta) ? muladd(alpha, rvec, vload(Vec{W, T}, storage, idx)) :
-                        muladd(alpha, rvec, beta * vload(Vec{W, T}, storage, idx)),
-                    storage, idx
-                )
-            end
-            for i in (nfull * W):(m - 1)
-                _axpby_at!(
-                    storage, colbase + i + 1, alpha,
-                    _acc_lane(acc, i ÷ W, j, (i % W) + 1, Val(NVECA)), beta
-                )
-            end
-        end
-        return destination
+    if _vector_store_eligible(destination, T)
+        return _store_tile_vector!(destination, acc, alpha, beta, kernel, m, n)
     end
 
     return _store_tile_scattered!(destination, acc, alpha, beta, kernel, m, n)
