@@ -42,7 +42,19 @@ end
 # REALS for a complex one, at the logical `kc` in both cases, so the same check
 # serves both without knowing which it has.
 
-@inline function _check_pack_a(packed::V, source::QSTile, kernel::K) where {V, K}
+# `BOUNDS` is a compile-time flag, not a runtime one: at `Val(true)` the body
+# below is the code this function has always generated, and at `Val(false)`
+# the `checked_tile_storage_bounds` call is folded away entirely. Only
+# `unsafe_pack_a!`/`unsafe_pack_b!` ever pass `Val(false)`, and only from a
+# caller that has already validated the WHOLE macro block this sliver belongs
+# to (src/driver.jl, `_execute_nest!`). Every other check -- extents, the
+# packed-buffer capacity, the `kc == 0` no-op -- is kept in both modes.
+@inline _check_pack_a(packed::V, source::QSTile, kernel::K) where {V, K} =
+    _check_pack_a(packed, source, kernel, Val(true))
+
+@inline function _check_pack_a(
+        packed::V, source::QSTile, kernel::K, ::Val{BOUNDS}
+    ) where {V, K, BOUNDS}
     MR = mr(kernel)
     m = nrows(source)
     kc = ncols(source)
@@ -58,11 +70,16 @@ end
         )
     )
     kc == 0 && return (m, 0)
-    checked_tile_storage_bounds(source)
+    BOUNDS && checked_tile_storage_bounds(source)
     return (m, kc)
 end
 
-@inline function _check_pack_b(packed::V, source::QSTile, kernel::K) where {V, K}
+@inline _check_pack_b(packed::V, source::QSTile, kernel::K) where {V, K} =
+    _check_pack_b(packed, source, kernel, Val(true))
+
+@inline function _check_pack_b(
+        packed::V, source::QSTile, kernel::K, ::Val{BOUNDS}
+    ) where {V, K, BOUNDS}
     NR = nr(kernel)
     kc = nrows(source)
     n = ncols(source)
@@ -78,7 +95,7 @@ end
         )
     )
     kc == 0 && return (n, 0)
-    checked_tile_storage_bounds(source)
+    BOUNDS && checked_tile_storage_bounds(source)
     return (n, kc)
 end
 
@@ -184,13 +201,52 @@ ncols(source)` columns; `packed` needs `length >= packed_a_length(kernel,
 kc)`. Row `i < m` writes `convert(T, transform(A[i,p]))`; padding rows (`i >=
 m`) write `zero(T)` without reading `source` or calling `transform`. `kc ==
 0` is a no-op. All validation happens before any write. Never allocates.
+
+See [`unsafe_pack_a!`](@ref) for the sibling entry point that skips the
+storage-bounds half of that validation.
 """
 function pack_a!(
         packed::V, source::QSTile, kernel::KernelDescriptor{MR, NR, T2},
         transform::F
     ) where {V, MR, NR, T2, F}
+    return _pack_a!(packed, source, kernel, transform, Val(true))
+end
+
+"""
+    unsafe_pack_a!(packed, source::QSTile, kernel, transform) -> packed
+
+[`pack_a!`](@ref) **without** the `checked_tile_storage_bounds(source)` call.
+
+PRECONDITION, which the caller must have established: every address `source`
+can read -- `source.base + row_offset(i) + col_offset(p)` for `0 <= i <
+nrows(source)`, `0 <= p < ncols(source)` -- lies in
+`0:length(source.storage)-1`. Violating it is an out-of-bounds read through an
+`@inbounds`/pointer path, not an exception.
+
+Every other check `pack_a!` makes is still made here: the row-extent bound,
+`kc >= 0`, the packed-buffer capacity, and the packed eltype. Only the
+address-range check moves, and it moves to the caller.
+
+The one caller in this package is `_execute_nest!` (src/driver.jl), which
+validates the union of an entire macro block's slivers in a single
+[`checked_span_bounds`](@ref) call before packing any of them -- an exactly
+equivalent test, because the block's slivers partition its offset buffer and
+all of them share the same K axis, so the block's offset range is the union of
+the slivers' and the check only ever looks at range extremes.
+"""
+function unsafe_pack_a!(
+        packed::V, source::QSTile, kernel::KernelDescriptor{MR, NR, T2},
+        transform::F
+    ) where {V, MR, NR, T2, F}
+    return _pack_a!(packed, source, kernel, transform, Val(false))
+end
+
+@inline function _pack_a!(
+        packed::V, source::QSTile, kernel::KernelDescriptor{MR, NR, T2},
+        transform::F, bounds::Val{BOUNDS}
+    ) where {V, MR, NR, T2, F, BOUNDS}
     _check_packed_eltype(packed, kernel)
-    m, kc = _check_pack_a(packed, source, kernel)
+    m, kc = _check_pack_a(packed, source, kernel, bounds)
     kc == 0 && return packed
 
     if _pack_a_contiguous_eligible(packed, source, transform, m, Val(MR), T2)
@@ -219,8 +275,30 @@ function pack_b!(
         packed::V, source::QSTile, kernel::KernelDescriptor{MR, NR, T2},
         transform::F
     ) where {V, MR, NR, T2, F}
+    return _pack_b!(packed, source, kernel, transform, Val(true))
+end
+
+"""
+    unsafe_pack_b!(packed, source::QSTile, kernel, transform) -> packed
+
+[`pack_b!`](@ref) without the `checked_tile_storage_bounds(source)` call; the
+B-side counterpart of [`unsafe_pack_a!`](@ref), with the same precondition
+(the caller has validated every address `source` can read) and the same single
+caller in this package.
+"""
+function unsafe_pack_b!(
+        packed::V, source::QSTile, kernel::KernelDescriptor{MR, NR, T2},
+        transform::F
+    ) where {V, MR, NR, T2, F}
+    return _pack_b!(packed, source, kernel, transform, Val(false))
+end
+
+@inline function _pack_b!(
+        packed::V, source::QSTile, kernel::KernelDescriptor{MR, NR, T2},
+        transform::F, bounds::Val{BOUNDS}
+    ) where {V, MR, NR, T2, F, BOUNDS}
     _check_packed_eltype(packed, kernel)
-    n, kc = _check_pack_b(packed, source, kernel)
+    n, kc = _check_pack_b(packed, source, kernel, bounds)
     kc == 0 && return packed
 
     load = (j, p) -> tile_load(source, p, j)  # source.rows=K, source.cols=N
@@ -358,8 +436,27 @@ function pack_a!(
         packed::V, source::QSTile, kernel::ComplexKernelDescriptor{MR, NR, T2, FA, FB},
         transform::F
     ) where {V, MR, NR, T2, FA, FB, F}
+    return _pack_a!(packed, source, kernel, transform, Val(true))
+end
+
+"""
+    unsafe_pack_a!(packed, source::QSTile, kernel::ComplexKernelDescriptor, transform) -> packed
+
+Complex-descriptor counterpart of [`unsafe_pack_a!`](@ref); same precondition.
+"""
+function unsafe_pack_a!(
+        packed::V, source::QSTile, kernel::ComplexKernelDescriptor{MR, NR, T2, FA, FB},
+        transform::F
+    ) where {V, MR, NR, T2, FA, FB, F}
+    return _pack_a!(packed, source, kernel, transform, Val(false))
+end
+
+@inline function _pack_a!(
+        packed::V, source::QSTile, kernel::ComplexKernelDescriptor{MR, NR, T2, FA, FB},
+        transform::F, bounds::Val{BOUNDS}
+    ) where {V, MR, NR, T2, FA, FB, F, BOUNDS}
     _check_packed_eltype(packed, kernel)
-    m, kc = _check_pack_a(packed, source, kernel)
+    m, kc = _check_pack_a(packed, source, kernel, bounds)
     kc == 0 && return packed
 
     load = (i, p) -> tile_load(source, i, p)
@@ -381,8 +478,27 @@ function pack_b!(
         packed::V, source::QSTile, kernel::ComplexKernelDescriptor{MR, NR, T2, FA, FB},
         transform::F
     ) where {V, MR, NR, T2, FA, FB, F}
+    return _pack_b!(packed, source, kernel, transform, Val(true))
+end
+
+"""
+    unsafe_pack_b!(packed, source::QSTile, kernel::ComplexKernelDescriptor, transform) -> packed
+
+Complex-descriptor counterpart of [`unsafe_pack_b!`](@ref); same precondition.
+"""
+function unsafe_pack_b!(
+        packed::V, source::QSTile, kernel::ComplexKernelDescriptor{MR, NR, T2, FA, FB},
+        transform::F
+    ) where {V, MR, NR, T2, FA, FB, F}
+    return _pack_b!(packed, source, kernel, transform, Val(false))
+end
+
+@inline function _pack_b!(
+        packed::V, source::QSTile, kernel::ComplexKernelDescriptor{MR, NR, T2, FA, FB},
+        transform::F, bounds::Val{BOUNDS}
+    ) where {V, MR, NR, T2, FA, FB, F, BOUNDS}
     _check_packed_eltype(packed, kernel)
-    n, kc = _check_pack_b(packed, source, kernel)
+    n, kc = _check_pack_b(packed, source, kernel, bounds)
     kc == 0 && return packed
 
     load = (j, p) -> tile_load(source, p, j)  # source.rows=K, source.cols=N

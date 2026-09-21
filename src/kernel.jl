@@ -43,6 +43,17 @@ pack_b!(
 ) where {V, MR, NR, T, K <: DescriptorKernel{MR, NR, T}, F} =
     pack_b!(packed, source, kernel.descriptor, transform)
 
+# Same forwarding for the bounds-check-skipping siblings (src/packing.jl), with
+# the same per-argument type parameters for the same reason.
+unsafe_pack_a!(
+    packed::V, source::QSTile, kernel::K, transform::F
+) where {V, MR, NR, T, K <: DescriptorKernel{MR, NR, T}, F} =
+    unsafe_pack_a!(packed, source, kernel.descriptor, transform)
+unsafe_pack_b!(
+    packed::V, source::QSTile, kernel::K, transform::F
+) where {V, MR, NR, T, K <: DescriptorKernel{MR, NR, T}, F} =
+    unsafe_pack_b!(packed, source, kernel.descriptor, transform)
+
 # Lane-width checks shared by SIMDKernel/PlanarKernel/OneMKernel. `name` only
 # names the type in the message; construction-time only, never hot.
 @inline function _check_lanewidth(name, W)
@@ -170,10 +181,22 @@ end
 #
 # GUARDRAIL: `@inline`, and one bound type parameter per argument, for the
 # reason spelled out at `pack_a!` above. This is on the hot path.
+@inline _execute_tile_prologue!(
+    kernel::K, destination::QSTile, packed_a::PA, packed_b::PB,
+    kc::Int, alpha, beta
+) where {MR, NR, T, K <: DescriptorKernel{MR, NR, T}, PA, PB} =
+    _execute_tile_prologue!(
+    kernel, destination, packed_a, packed_b, kc, alpha, beta, Val(true)
+)
+
+# `BOUNDS` is a compile-time flag: at `Val(true)` this generates exactly the
+# code the six-argument form always did, and at `Val(false)` the
+# `checked_tile_storage_bounds` call folds away. Only `unsafe_execute_tile!`
+# passes `Val(false)`.
 @inline function _execute_tile_prologue!(
         kernel::K, destination::QSTile, packed_a::PA, packed_b::PB,
-        kc::Int, alpha, beta
-    ) where {MR, NR, T, K <: DescriptorKernel{MR, NR, T}, PA, PB}
+        kc::Int, alpha, beta, ::Val{BOUNDS}
+    ) where {MR, NR, T, K <: DescriptorKernel{MR, NR, T}, PA, PB, BOUNDS}
     m = nrows(destination)
     n = ncols(destination)
     m <= MR || throw(ArgumentError("destination valid row extent $m exceeds mr(kernel) = $MR"))
@@ -185,7 +208,7 @@ end
 
     (m == 0 || n == 0) && return (false, alphaT, betaT)
 
-    checked_tile_storage_bounds(destination)
+    BOUNDS && checked_tile_storage_bounds(destination)
 
     if kc == 0 || iszero(alphaT)
         scale_tile!(destination, betaT)
@@ -198,6 +221,47 @@ end
     length(packed_b) >= need_b || _throw_packed_short(:b, length(packed_b), need_b, kc)
 
     return (true, alphaT, betaT)
+end
+
+"""
+    unsafe_execute_tile!(kernel, destination::QSTile, packed_a, packed_b, kc::Int, alpha, beta) -> destination
+
+`execute_tile!` **without** the `checked_tile_storage_bounds(destination)`
+call, for every kernel that composes `zero_accumulator`/`accumulate`/
+`store_tile!` -- i.e. all four of them, whose `execute_tile!` bodies are
+otherwise identical to this one and are left untouched as the checked
+reference path.
+
+PRECONDITION, which the caller must have established: every address
+`destination` can write -- `destination.base + row_offset(i) + col_offset(j)`
+for `0 <= i < nrows(destination)`, `0 <= j < ncols(destination)` -- lies in
+`0:length(destination.storage)-1`. Violating it is an out-of-bounds WRITE
+through an `@inbounds`/pointer path, not an exception; this is the sharpest
+edge in the package, because the checked path is what stands between a bad
+`AxisGroup` and silent memory corruption.
+
+Everything else `_execute_tile_prologue!` validates is still validated: the
+destination extent against the kernel's `(MR, NR)`, `kc >= 0`, both packed
+capacities, and the empty / `kc == 0` / `alpha == 0` short-circuits.
+
+The one caller in this package is `_execute_nest!` (src/driver.jl), which
+validates the union of an entire (ic, jc) macro block's micro-tiles in one
+[`checked_span_bounds`](@ref) call before running any of them. That is an
+exactly equivalent test: the block's micro-tiles are the full cross product of
+its M-sliver row sets and N-sliver column sets, those sets partition the
+block's two offset buffers, and the check only compares range extremes -- so
+the block check passes iff every per-tile check would have.
+"""
+@inline function unsafe_execute_tile!(
+        kernel::K, destination::QSTile, packed_a::PA, packed_b::PB,
+        kc::Int, alpha, beta
+    ) where {K, PA, PB}
+    run, alphaT, betaT = _execute_tile_prologue!(
+        kernel, destination, packed_a, packed_b, kc, alpha, beta, Val(false)
+    )
+    run || return destination
+    acc = accumulate(kernel, zero_accumulator(kernel), packed_a, packed_b, kc)
+    return store_tile!(destination, acc, alphaT, betaT, kernel)
 end
 
 """

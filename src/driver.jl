@@ -12,6 +12,17 @@
 # qualified; a bare `using TensorOperations` would collide on `scalartype`.
 import TensorOperations as TO
 
+# Membership test against a statically-sized label tuple. Replaces the three
+# `Set`s `_classify_labels` used to build: the label tuples have a
+# compile-time-known LENGTH (the `NA`/`NB`/`NC` parameters, one specialization
+# per arity), so this unrolls into a chain of integer compares and allocates
+# nothing, where each `Set` cost a `Dict`'s slot/key arrays. Measured on
+# ccqlin038 / Julia 1.13: `_classify_labels` 1232 -> 224 B and 0.73 -> 0.25 us
+# on a 2-label plain GEMM (docs/decisions.md, "Per-call floor"). The tuples are
+# `allunique` by the checks at the top of `_classify_labels`, so a linear scan
+# is also the whole of the membership question.
+@inline _label_in(lbl::Int, t::NTuple{N, Int}) where {N} = any(==(lbl), t)
+
 # Classify every label in indA ∪ indB ∪ indC into M/N/K. Returns
 # (mlabels, nlabels, klabels) in indA/indB appearance order. Per (inA,inB,inC):
 #   (T,F,T)->M  (F,T,T)->N  (T,T,F)->K  everything else -> ArgumentError
@@ -27,15 +38,15 @@ function _classify_labels(
     allunique(indC) ||
         throw(ArgumentError("indC has a repeated label (diagonal), not supported: $indC"))
 
-    setA = Set(indA)
-    setB = Set(indB)
-    setC = Set(indC)
-
-    mlabels = Int[]
-    klabels = Int[]
+    # Sized once to their worst case and trimmed at the end, rather than grown
+    # by `push!`: `NA`/`NB` are compile-time bounds on the M+K and N counts.
+    mlabels = Vector{Int}(undef, NA)
+    klabels = Vector{Int}(undef, NA)
+    nm = 0
+    nk = 0
     for lbl in indA
-        inB = lbl in setB
-        inC = lbl in setC
+        inB = _label_in(lbl, indB)
+        inC = _label_in(lbl, indC)
         if inB && inC
             throw(
                 ArgumentError(
@@ -44,9 +55,11 @@ function _classify_labels(
                 )
             )
         elseif inB && !inC
-            push!(klabels, lbl)
+            nk += 1
+            @inbounds klabels[nk] = lbl
         elseif !inB && inC
-            push!(mlabels, lbl)
+            nm += 1
+            @inbounds mlabels[nm] = lbl
         else
             throw(
                 ArgumentError(
@@ -57,16 +70,18 @@ function _classify_labels(
         end
     end
 
-    nlabels = Int[]
+    nlabels = Vector{Int}(undef, NB)
+    nn = 0
     for lbl in indB
-        inA = lbl in setA
-        inC = lbl in setC
+        inA = _label_in(lbl, indA)
+        inC = _label_in(lbl, indC)
         if inA && inC
             continue  # already rejected while scanning indA, above.
         elseif inA && !inC
             continue  # already classified as K, above.
         elseif !inA && inC
-            push!(nlabels, lbl)
+            nn += 1
+            @inbounds nlabels[nn] = lbl
         else
             throw(
                 ArgumentError(
@@ -78,37 +93,76 @@ function _classify_labels(
     end
 
     for lbl in indC
-        inA = lbl in setA
-        inB = lbl in setB
+        inA = _label_in(lbl, indA)
+        inB = _label_in(lbl, indB)
         (inA || inB) ||
             throw(ArgumentError("label $lbl appears in indC but not in indA or indB"))
     end
 
+    resize!(mlabels, nm)
+    resize!(nlabels, nn)
+    resize!(klabels, nk)
     return mlabels, nlabels, klabels
 end
 
+@noinline _throw_label_length(lbl::Int, l1::Int, l2::Int) = throw(
+    DimensionMismatch("label $lbl has mismatched axis length: $l1 vs $l2")
+)
+
 # Build the two-map AxisGroup for one of M/N/K: (v1,v2) is (A,C)/(B,C)/(A,B).
 # Raises DimensionMismatch on a matched-label length mismatch.
+#
+# `D = length(labels)` is a RUNTIME value (which labels are shared is a
+# property of the label values, not of their tuple types), so the three
+# `ntuple`s this used to build were runtime-length -- inferred as
+# `Tuple{Vararg{Int}}`, heap-boxed, and each element read back through a
+# dynamic `getindex`. That cost 656 B and 0.75 us per group even at `D == 1`
+# (measured, ccqlin038 / Julia 1.13). `D` is bounded above by `N1` (every
+# label here occurs in `ind1`), which IS compile-time known, so the rank is
+# resolved once through the unrolled `_pair_group_rank` ladder below and the
+# body then runs at a literal `Val{D}` with statically sized tuples
+# throughout. Same groups, same errors, same order of checks.
 function _build_pair_group(
         labels::Vector{Int},
-        ind1::NTuple, v1::StridedView,
-        ind2::NTuple, v2::StridedView
-    )
-    D = length(labels)
-    pos1 = ntuple(d -> findfirst(==(labels[d]), ind1)::Int, D)
-    pos2 = ntuple(d -> findfirst(==(labels[d]), ind2)::Int, D)
-    lens = ntuple(D) do d
+        ind1::NTuple{N1, Int}, v1::StridedView,
+        ind2::NTuple{N2, Int}, v2::StridedView
+    ) where {N1, N2}
+    return _pair_group_rank(Val(N1), labels, ind1, v1, ind2, v2)
+end
+
+# Unrolled rank ladder: `length(labels) <= N1` always, so descending from
+# `Val(N1)` reaches the matching literal in at most `N1 + 1` compares, each arm
+# calling a concretely-typed `_pair_group_static`. A plain `Val(D)` on a
+# runtime `D` would be a dynamic dispatch instead.
+@inline function _pair_group_rank(
+        ::Val{K}, labels::Vector{Int}, ind1, v1, ind2, v2
+    ) where {K}
+    length(labels) == K && return _pair_group_static(Val(K), labels, ind1, v1, ind2, v2)
+    return _pair_group_rank(Val(K - 1), labels, ind1, v1, ind2, v2)
+end
+
+@inline _pair_group_rank(::Val{0}, labels::Vector{Int}, ind1, v1, ind2, v2) =
+    _pair_group_static(Val(0), labels, ind1, v1, ind2, v2)
+
+@inline function _pair_group_static(
+        ::Val{D}, labels::Vector{Int},
+        ind1::NTuple{N1, Int}, v1::StridedView,
+        ind2::NTuple{N2, Int}, v2::StridedView
+    ) where {D, N1, N2}
+    # Hoisted out of the per-dimension closures: `Base.strides` on a
+    # `StridedView` rebuilds a tuple, and the old body called it once per `d`.
+    st1 = Base.strides(v1)
+    st2 = Base.strides(v2)
+    pos1 = ntuple(d -> findfirst(==(@inbounds labels[d]), ind1)::Int, Val(D))
+    pos2 = ntuple(d -> findfirst(==(@inbounds labels[d]), ind2)::Int, Val(D))
+    lens = ntuple(Val(D)) do d
         l1 = size(v1, pos1[d])
         l2 = size(v2, pos2[d])
-        l1 == l2 || throw(
-            DimensionMismatch(
-                "label $(labels[d]) has mismatched axis length: $l1 vs $l2"
-            )
-        )
+        l1 == l2 || _throw_label_length((@inbounds labels[d]), l1, l2)
         l1
     end
-    s1 = ntuple(d -> Base.strides(v1)[pos1[d]], D)
-    s2 = ntuple(d -> Base.strides(v2)[pos2[d]], D)
+    s1 = ntuple(d -> st1[pos1[d]], Val(D))
+    s2 = ntuple(d -> st2[pos2[d]], Val(D))
     return AxisGroup(lens, (s1, s2))
 end
 
@@ -124,12 +178,31 @@ end
 # ascending; ties keep input order, so a single label or an already-sorted list
 # comes back unchanged. Every label must occur in `indC` (the M/N lists from
 # `_classify_labels` do by construction; K labels never come here).
+# Insertion sort rather than `sortperm` + permuted copy: the old body
+# allocated the key vector, the permutation and the result (three `Vector`s
+# where one is needed), and these lists have at most `ndims(C)` entries, so an
+# O(n^2) sort with n <= 6 is not a cost. Strict `>` in the shift test keeps it
+# STABLE, which is the contract (ties keep input order) that
+# `alg = DEFAULT_STABLE` supplied before. A fresh vector is still returned:
+# sorting `labels` in place would mutate `_classify_labels`'s output, which
+# callers (and test/test_driver.jl's label-order pinning) read afterwards.
 function _order_free_labels(
         labels::Vector{Int}, indC::NTuple{NC, Int}, C::StridedView
     ) where {NC}
     st = Base.strides(C)
-    ks = [abs(st[findfirst(==(l), indC)::Int]) for l in labels]
-    return labels[sortperm(ks; alg = Base.Sort.DEFAULT_STABLE)]
+    key(l::Int) = abs(st[findfirst(==(l), indC)::Int])
+    out = copy(labels)
+    @inbounds for i in 2:length(out)
+        x = out[i]
+        kx = key(x)
+        j = i - 1
+        while j >= 1 && key(out[j]) > kx
+            out[j + 1] = out[j]
+            j -= 1
+        end
+        out[j + 1] = x
+    end
+    return out
 end
 
 # Element count of the leading unit-stride run when `labels` (already ordered
@@ -575,10 +648,15 @@ end
         PtrScatterAxis(pointer(buffer, first + 1), d.count)
 end
 
-# `pack!` is pack_a! or pack_b! (a plain function, specialized on, never a
-# closure); A and B differ only in which of rows/cols is the k axis, which the
+# `pack!` is pack_a!/pack_b! -- or their `unsafe_pack_a!`/`unsafe_pack_b!`
+# siblings (src/packing.jl) -- as a plain function, specialized on, never a
+# closure; A and B differ only in which of rows/cols is the k axis, which the
 # caller has already resolved. `transform` is the plan's per-operand
 # `identity`/`conj` singleton.
+#
+# This helper is only as safe as the `pack!` it is handed: with an `unsafe_*`
+# packer it performs no storage-bounds check, which is why the call sites spell
+# that name out rather than hiding it behind a flag.
 #
 # GUARDRAIL: every argument here has its OWN bound type parameter, `transform`
 # included. Leaving `TF` unbound reintroduces the Phase 2b finding-5 ~80 B/call
@@ -600,6 +678,20 @@ end
     ) where {PA, PB, S, R <: Axis, C <: Axis}
     destination = DestinationTile(storage, base, rows, cols)
     execute_tile!(kernel, destination, packed_a, packed_b, kc_len, alpha, beta)
+    return nothing
+end
+
+# Same guardrail barrier as `_execute_micro_tile!`, over `unsafe_execute_tile!`
+# (src/kernel.jl) instead of `execute_tile!`: the destination's storage-bounds
+# check has already been made ONCE for the whole (ic, jc) macro block this tile
+# belongs to. `unsafe_` is in the name at every call site precisely because the
+# precondition now lives at the caller.
+@inline function unsafe_execute_micro_tile!(
+        kernel, storage::S, base::Int, rows::R, cols::C,
+        packed_a::PA, packed_b::PB, kc_len::Int, alpha, beta
+    ) where {PA, PB, S, R <: Axis, C <: Axis}
+    destination = DestinationTile(storage, base, rows, cols)
+    unsafe_execute_tile!(kernel, destination, packed_a, packed_b, kc_len, alpha, beta)
     return nothing
 end
 
@@ -635,18 +727,87 @@ end
 
 # Classify each register sliver of a just-filled macro block. Shared by the
 # N side (jc: B/C) and the M side (ic: A/C), which are structurally identical.
+#
+# Also returns the two maps' BLOCK offset ranges, `((lo1, hi1), (lo2, hi2))`,
+# accumulated from the sliver descriptors as they are produced rather than in a
+# second pass -- `O(1)` per regular sliver, and for an irregular one exactly
+# the scan the per-sliver `checked_tile_storage_bounds` used to do anyway.
+# Because the slivers partition `buf[1:blocklen]`, this union IS the range of
+# the whole block, which is what `_execute_nest!`'s hoisted
+# `checked_span_bounds` calls need.
 @inline function _classify_slivers!(
         desc1::Vector{BlockDescriptor}, desc2::Vector{BlockDescriptor},
         buf1::Vector{Int}, buf2::Vector{Int},
         blocklen::Int, reg_tile::Int, nslivers::Int
     )
+    lo1 = typemax(Int); hi1 = typemin(Int)
+    lo2 = typemax(Int); hi2 = typemin(Int)
     for s in 0:(nslivers - 1)
         sfirst = s * reg_tile
         scount = min(reg_tile, blocklen - sfirst)
-        desc1[s + 1] = describe_block(buf1, sfirst, scount)
-        desc2[s + 1] = describe_block(buf2, sfirst, scount)
+        d1 = describe_block(buf1, sfirst, scount)
+        d2 = describe_block(buf2, sfirst, scount)
+        desc1[s + 1] = d1
+        desc2[s + 1] = d2
+        (l1, h1) = descriptor_offset_range(d1, buf1, sfirst)
+        if h1 >= l1
+            lo1 = min(lo1, l1); hi1 = max(hi1, h1)
+        end
+        (l2, h2) = descriptor_offset_range(d2, buf2, sfirst)
+        if h2 >= l2
+            lo2 = min(lo2, l2); hi2 = max(hi2, h2)
+        end
     end
-    return nothing
+    # `hi < lo` is `checked_span_bounds`'s "empty, always passes" convention,
+    # which is what these initial values mean when no sliver contributed.
+    return ((lo1, hi1), (lo2, hi2))
+end
+
+# ----------------------------------------------------------------------------
+# Closed-form block description for an affine-ramp composite
+# (docs/decisions.md, "Per-call floor"). When `affine_ramp(g)` holds, logical
+# coordinate `q` maps to offset `q * step[p]` for every map `p`, so a block's
+# whole sliver structure follows from arithmetic and neither the offset buffer
+# nor `describe_block`'s scan is needed. `fill_offsets!` + `_classify_slivers!`
+# stay as the fallback for every composite that is not provably a ramp.
+# ----------------------------------------------------------------------------
+
+# Exactly what `describe_block` classifies a materialized ramp interval as,
+# INCLUDING its `stride == 0` convention for a count-1 block (which is
+# behaviourally irrelevant -- an `AffineAxis` of count 1 never multiplies by
+# its stride -- but keeping it identical means the descriptors these two paths
+# produce are `==`, not merely equivalent, which a test can assert).
+@inline _ramp_descriptor(step::Int, first::Int, count::Int) =
+    count == 0 ? BlockDescriptor(0, 0, 0, true) :
+    count == 1 ? BlockDescriptor(first * step, 0, 1, true) :
+    BlockDescriptor(first * step, step, count, true)
+
+# Offset range of `[first, first+count)` under a ramp, in `axis_offset_range`'s
+# `(lo, hi)` / `(0, -1)`-if-empty convention. `first * step` and
+# `(first+count-1) * step` are offsets of coordinates inside the group's
+# domain, so they are covered by `AxisGroup`'s construction-time excursion
+# validation and cannot overflow.
+@inline _ramp_offset_range(step::Int, first::Int, count::Int) =
+    count == 0 ? (0, -1) : minmax(first * step, (first + count - 1) * step)
+
+# `_classify_slivers!`'s closed-form twin: same descriptors, same returned
+# block ranges, no buffer touched.
+@inline function _ramp_slivers!(
+        desc1::Vector{BlockDescriptor}, desc2::Vector{BlockDescriptor},
+        step1::Int, step2::Int, first::Int,
+        blocklen::Int, reg_tile::Int, nslivers::Int
+    )
+    for s in 0:(nslivers - 1)
+        sfirst = s * reg_tile
+        scount = min(reg_tile, blocklen - sfirst)
+        q0 = first + sfirst
+        desc1[s + 1] = _ramp_descriptor(step1, q0, scount)
+        desc2[s + 1] = _ramp_descriptor(step2, q0, scount)
+    end
+    return (
+        _ramp_offset_range(step1, first, blocklen),
+        _ramp_offset_range(step2, first, blocklen),
+    )
 end
 
 # Apply beta once to every element of C at MR x NR granularity, without
@@ -1050,6 +1211,17 @@ later ones accumulate with `beta = one(T)`). Empty output is a no-op; empty K
 or `alpha == 0` applies `beta` once without reading `A`/`B`. Allocation-free.
 Returns `plan.Cstorage`. See [`execute_tilewise!`](@ref) for the independent
 tile-by-tile oracle this is checked against.
+
+Storage-bounds validation is done **once per macro block**, not once per
+sliver or per micro-tile: each of the three operand regions a `(jc, pc, ic)`
+iteration touches is validated with one [`checked_span_bounds`](@ref) call
+before anything is packed or written, and the packing/micro-kernel calls
+inside it then go through `unsafe_pack_a!`/`unsafe_pack_b!`/
+`unsafe_execute_tile!`. The test performed is exactly the conjunction of the
+per-sliver tests it replaces (see `checked_span_bounds`), so no address this
+driver can reach is unvalidated and no previously accepted contraction is now
+rejected; `execute_tilewise!` keeps the per-tile checked path as an
+independent oracle for both the values and the rejections.
 """
 function execute!(plan::ContractPlan{T}, alpha::Number, beta::Number) where {T}
     alphaT = convert(T, alpha)
@@ -1108,27 +1280,69 @@ function _execute_nest!(
     atransform = plan.atransform
     btransform = plan.btransform
 
+    # Resolved once per `execute!`, not per block: each composite's type is
+    # concrete here, so `affine_ramp` unrolls to a few integer compares and the
+    # `if`s below are cheap, predictable branches outside every inner loop.
+    (m_ramp, m_step) = affine_ramp(plan.mgroup)
+    (n_ramp, n_step) = affine_ramp(plan.ngroup)
+    (k_ramp, k_step) = affine_ramp(plan.kgroup)
+
+    # Hoisted storage-bounds validation (docs/decisions.md, "Per-call floor"):
+    # read once here rather than per sliver / per micro-tile.
+    lenA = length(plan.Astorage)
+    lenB = length(plan.Bstorage)
+    lenC = length(plan.Cstorage)
+
     # --- loop 5: jc over N in steps of nc_eff ---
     jc = 0
     while jc < Qn
         nblock = min(nc_eff, Qn - jc)
         n_slivers = cld(nblock, NRk)
-        fill_offsets!((ws.n_buf_B, ws.n_buf_C), plan.ngroup, jc, nblock)
-        _classify_slivers!(
-            ws.n_desc_B, ws.n_desc_C, ws.n_buf_B, ws.n_buf_C,
-            nblock, NRk, n_slivers
-        )
+        (rng_nB, rng_nC) = if n_ramp
+            _ramp_slivers!(
+                ws.n_desc_B, ws.n_desc_C, n_step[1], n_step[2], jc,
+                nblock, NRk, n_slivers
+            )
+        else
+            fill_offsets!((ws.n_buf_B, ws.n_buf_C), plan.ngroup, jc, nblock)
+            _classify_slivers!(
+                ws.n_desc_B, ws.n_desc_C, ws.n_buf_B, ws.n_buf_C,
+                nblock, NRk, n_slivers
+            )
+        end
 
         # --- loop 4: pc over K in steps of kc_eff ---
         pc = 0
         firstpanel = true
         while pc < Qk
             kblock = min(kc_eff, Qk - pc)
-            fill_offsets!((ws.k_buf_A, ws.k_buf_B), plan.kgroup, pc, kblock)
-            dK_A = describe_block(ws.k_buf_A, 0, kblock)
-            dK_B = describe_block(ws.k_buf_B, 0, kblock)
+            dK_A, dK_B, rng_kA, rng_kB = if k_ramp
+                (
+                    _ramp_descriptor(k_step[1], pc, kblock),
+                    _ramp_descriptor(k_step[2], pc, kblock),
+                    _ramp_offset_range(k_step[1], pc, kblock),
+                    _ramp_offset_range(k_step[2], pc, kblock),
+                )
+            else
+                fill_offsets!((ws.k_buf_A, ws.k_buf_B), plan.kgroup, pc, kblock)
+                dA = describe_block(ws.k_buf_A, 0, kblock)
+                dB = describe_block(ws.k_buf_B, 0, kblock)
+                (
+                    dA, dB,
+                    descriptor_offset_range(dA, ws.k_buf_A, 0),
+                    descriptor_offset_range(dB, ws.k_buf_B, 0),
+                )
+            end
             colsA_k = _axis_of(dK_A, ws.k_buf_A, 0)
             rowsB_k = _axis_of(dK_B, ws.k_buf_B, 0)
+
+            # HOISTED CHECK 1 of 3 -- the whole B panel of this (jc, pc).
+            # `rowsB_k` is shared by every N-sliver and `rng_nB` is the union
+            # of the slivers' own column ranges, so this rectangle is exactly
+            # the union of the addresses the `unsafe_pack_b!` calls below read;
+            # see `checked_span_bounds` for why checking the union is
+            # equivalent to checking each sliver, not weaker.
+            checked_span_bounds(plan.Bbase, rng_kB, rng_nB, lenB)
 
             beta_eff = firstpanel ? betaT : one(T)
 
@@ -1138,7 +1352,7 @@ function _execute_nest!(
                 colsB = _axis_of(ws.n_desc_B[s + 1], ws.n_buf_B, sfirst)
                 bpanel = _sliver_panel(ws.packed_b, NRp, kblock, s)
                 _pack_sliver!(
-                    pack_b!, bpanel, plan.Bstorage, plan.Bbase, rowsB_k, colsB,
+                    unsafe_pack_b!, bpanel, plan.Bstorage, plan.Bbase, rowsB_k, colsB,
                     kernel, btransform
                 )
             end
@@ -1148,11 +1362,32 @@ function _execute_nest!(
             while ic < Qm
                 mblock = min(mc_eff, Qm - ic)
                 m_slivers = cld(mblock, MRk)
-                fill_offsets!((ws.m_buf_A, ws.m_buf_C), plan.mgroup, ic, mblock)
-                _classify_slivers!(
-                    ws.m_desc_A, ws.m_desc_C, ws.m_buf_A, ws.m_buf_C,
-                    mblock, MRk, m_slivers
-                )
+                (rng_mA, rng_mC) = if m_ramp
+                    _ramp_slivers!(
+                        ws.m_desc_A, ws.m_desc_C, m_step[1], m_step[2], ic,
+                        mblock, MRk, m_slivers
+                    )
+                else
+                    fill_offsets!((ws.m_buf_A, ws.m_buf_C), plan.mgroup, ic, mblock)
+                    _classify_slivers!(
+                        ws.m_desc_A, ws.m_desc_C, ws.m_buf_A, ws.m_buf_C,
+                        mblock, MRk, m_slivers
+                    )
+                end
+
+                # HOISTED CHECK 2 of 3 -- the whole A panel of this
+                # (jc, pc, ic): every M-sliver's rows against the shared K
+                # columns.
+                checked_span_bounds(plan.Abase, rng_mA, rng_kA, lenA)
+
+                # HOISTED CHECK 3 of 3 -- every micro-tile of this (ic, jc)
+                # block at once. The micro-tile loop below is the full cross
+                # product of the M-sliver rows and the N-sliver columns, and
+                # those two families partition the block's row and column
+                # offset sets, so this rectangle is exactly their union. It
+                # precedes every write to C, as the per-tile check it replaces
+                # did.
+                checked_span_bounds(plan.Cbase, rng_mC, rng_nC, lenC)
 
                 # Pack the whole A panel for this (jc, pc, ic): every M-sliver.
                 for r in 0:(m_slivers - 1)
@@ -1160,7 +1395,7 @@ function _execute_nest!(
                     rowsA = _axis_of(ws.m_desc_A[r + 1], ws.m_buf_A, rfirst)
                     apanel = _sliver_panel(ws.packed_a, MRp, kblock, r)
                     _pack_sliver!(
-                        pack_a!, apanel, plan.Astorage, plan.Abase, rowsA, colsA_k,
+                        unsafe_pack_a!, apanel, plan.Astorage, plan.Abase, rowsA, colsA_k,
                         kernel, atransform
                     )
                 end
@@ -1174,7 +1409,7 @@ function _execute_nest!(
                         rfirst = r * MRk
                         rowsC = _axis_of(ws.m_desc_C[r + 1], ws.m_buf_C, rfirst)
                         apanel = _sliver_panel(ws.packed_a, MRp, kblock, r)
-                        _execute_micro_tile!(
+                        unsafe_execute_micro_tile!(
                             kernel, plan.Cstorage, plan.Cbase, rowsC, colsC,
                             apanel, bpanel, kblock, alphaT, beta_eff
                         )
