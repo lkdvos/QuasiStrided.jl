@@ -370,6 +370,23 @@ throughput at the shipped shape.
 
 Test suite: 13299/13299 on Julia 1.12.6.
 
+## `ccsd-t-stall` branch: kernel-stalled/store-dominated fix, complete (2026-09-21)
+
+On the `ccsd-t-stall` worktree/branch (based on `main` @ `f318eb9`, before
+`8dd01dd`'s packing fast-path landed on `main` -- rebase before merging):
+both mechanisms found by the profiling pass below (F2, run-length-aware
+kernel-shape demotion; F1, `@inline` on `SIMDKernel`'s `Base.accumulate`)
+are now implemented in `src/driver.jl`/`src/kernels/simd.jl`, each with a
+measured before/after (~2x on `ccsd_t_1_dim16_f32`; ~9% on the isolated
+small-`kc` case), full suite green, and an ABBA guard showing no regression.
+Post-review: a blocking ISA-specific test hardcoding was fixed and verified
+portable via `test/forced_isa_runner.jl` (avx2/unknown), the F2 test fixture
+was shrunk, and **F2 was found to regress large-K compute-bound cases by
+~18-25%** (no cost model gates the demotion on `Qk`) -- documented as a known
+limitation, not fixed this pass. See `docs/decisions.md`, "Kernel-stalled/
+store-dominated fix: run-length-aware demotion (F2) and inlined `accumulate`
+(F1)" and its "Post-review fixes" subsection.
+
 ## Next task
 
 **Packing and per-call overhead is now the whole gap.** Benchmarked

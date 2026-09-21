@@ -227,8 +227,11 @@ results_dir() = joinpath(
 )
 
 function git_commit()
+    root = joinpath(@__DIR__, "..")
     return try
-        strip(read(`git -C $(joinpath(@__DIR__, "..")) rev-parse HEAD`, String))
+        sha = strip(read(`git -C $root rev-parse HEAD`, String))
+        dirty = !isempty(strip(read(`git -C $root status --porcelain`, String)))
+        dirty ? sha * "-dirty" : sha
     catch
         "unknown (git rev-parse failed)"
     end

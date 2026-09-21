@@ -179,6 +179,35 @@ function _prefer_swap(
         _leading_unit_run(norder, indC, C) >= mr_swapped
 end
 
+# Run-length-aware kernel-shape demotion (docs/decisions.md, "F2"). Applied
+# DOWNSTREAM of `_default_kernel`/the M-N swap decision, on whichever
+# orientation was actually chosen to feed M: `_store_tile_vector!` needs EVERY
+# register sliver unit-stride in C, and given a leading unit-stride run of
+# length `run`, that holds iff `Qm == run || run % mr(kernel) == 0` -- not the
+# weaker `mr <= run` (verified by direct counterexample sweep,
+# `benchmark/probes/probe_ccsd_t_stall_f2rule.jl`: e.g. run=20, mr=16 satisfies
+# `mr <= run` but only 40% of slivers are actually contiguous). When the
+# shipped default kernel's `mr` fails this predicate, every sliver falls to
+# the slow scattered store; demoting to the LARGEST menu shape whose `mr`
+# satisfies it (not the smallest -- measured: at run=16 for Float32, `(16,6,8)`
+# beats `(8,6,8)`) reuses an already-compiled specialization from
+# `kernel_shapes(T)`. Real dtypes only: complex kernels scatter-store
+# unconditionally, so the predicate is moot for them (the generic fallback
+# method below is a no-op).
+function _demote_for_run(::Type{T}, kernel, run::Int, Qm::Int) where {T <: Real}
+    Qm == run && return kernel
+    run % mr(kernel) == 0 && return kernel
+    best = nothing
+    for shape in kernel_shapes(T)
+        m = shape[1]
+        if run % m == 0 && (best === nothing || m > best[1])
+            best = shape
+        end
+    end
+    return best === nothing ? kernel : _kernel_from_shape(best, T)
+end
+_demote_for_run(::Type{T}, kernel, run::Int, Qm::Int) where {T} = kernel
+
 # Engine-wide default kernel: shape from ONE detected capability, the vector
 # register width -- `W = vector_bytes/sizeof(T)`, `MR = 2W`, `NR = NR_DEFAULT`,
 # so `NV = 12`. Reproduces the swept optimum for both dtypes on AVX-512 and
@@ -869,14 +898,23 @@ function plan_contract(
         # unchanged: `*` commutes on `T` and `conj` is elementwise, so
         # `sum_k conj?(B[n,k]) * conj?(A[m,k])` is the same sum.
         kgroup_swapped = _build_pair_group(klabels, indB, B, indA, A)  # maps: (B, A)
+        # F2 demotion (see `_demote_for_run`): only for an auto-selected
+        # kernel, keyed on the CHOSEN (post-swap) M orientation, i.e. N's own
+        # run against the kernel it would actually run.
+        kernel_final = kernel === nothing ?
+            _demote_for_run(T, kernel_swapped, _leading_unit_run(norder, indC, C), Qn) :
+            kernel_swapped
         return _plan_contract(
             C, B, A, indC, ngroup, mgroup, kgroup_swapped, Qn, Qm, Qk,
-            kernel_swapped, btransform, atransform, mc, kc, nc, workspace, allocator, oracle
+            kernel_final, btransform, atransform, mc, kc, nc, workspace, allocator, oracle
         )
     end
+    kernel_final = kernel === nothing ?
+        _demote_for_run(T, kernel_asis, _leading_unit_run(morder, indC, C), Qm) :
+        kernel_asis
     return _plan_contract(
         C, A, B, indC, mgroup, ngroup, kgroup, Qm, Qn, Qk,
-        kernel_asis, atransform, btransform, mc, kc, nc, workspace, allocator, oracle
+        kernel_final, atransform, btransform, mc, kc, nc, workspace, allocator, oracle
     )
 end
 
