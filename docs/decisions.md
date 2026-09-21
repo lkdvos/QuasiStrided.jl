@@ -4709,3 +4709,122 @@ Both fixes are small (F2 ~30 lines in one file, F1 one line in one file),
 each has a measured before/after matching or exceeding its prediction, the
 full suite is green including both named pinning tests, and the ABBA guard
 shows no regression. Committed to the `ccsd-t-stall` branch.
+
+### Post-review fixes (2026-09-21, same day)
+
+An independent review of the first commit (`a0b337a`) found one blocking
+issue and three should-fix items, addressed as follows.
+
+**Blocking, fixed: the F2 correctness test was ISA-specific.** The original
+`test/test_driver.jl` F2 testset hardcoded `expect_mr = 16` for BOTH
+Float64 and Float32 on the `ccsd_t_1` dim=16 fixture -- true only on this
+machine's `:avx512` profile. On `:avx2` (`_derived_shape` gives Float64
+`(8,6,4)`, and `16 % 8 == 0` so F2 correctly no-ops there, leaving `mr = 8`,
+not 16) and on an unrecognized/NEON-like ISA (`_legacy_shape` gives `(8,6,4)`
+for both dtypes, `mr = 8` for both), the hardcoded `16` is wrong -- exactly
+the pattern this file's own header comment on `"plan_contract: SIMDKernel is
+the engine-wide default kernel"` already warns against ("held here only
+because it happens to trigger on x86, and broke on aarch64"), and exactly
+what `test/forced_isa_runner.jl` exists to catch. Confirmed by running it
+before the fix:
+
+```
+QS_FAKE_ISA=avx2 QS_FAKE_VB=32 QS_FAKE_NREG=16 julia --project=. test/forced_isa_runner.jl
+```
+
+failed 2 in the F2 testset (beyond the harness's own documented 1-failure
+residue in `test_target.jl`). **Fix**: the testset no longer asserts a
+literal `mr`. It computes the expected outcome from `_default_kernel`/
+`kernel_shapes(T)` themselves: if the shipped default's own `mr` already
+satisfies `Qm == run || run % mr == 0`, `plan.kernel` must equal the
+default, unchanged, on every ISA; otherwise it asserts `run % mr(plan.kernel)
+== 0` and that `mr(plan.kernel)` is the LARGEST entry in `kernel_shapes(T)`
+satisfying that (or, if no entry does, that the kernel is left unchanged,
+mirroring the `d=5` pinning fixture's own finding). Re-run after the fix:
+`QS_FAKE_ISA=avx2 QS_FAKE_VB=32 QS_FAKE_NREG=16` and
+`QS_FAKE_ISA=unknown QS_FAKE_VB=0 QS_FAKE_NREG=0`, both give exactly the
+harness's documented 1-failure/1-error residue (`test_target.jl`'s "runs on
+this host without throwing", which compares a fresh `_detect_target()`
+against the forced profile and fails by construction under
+`forced_isa_runner.jl`) and the F2 testset itself passes 12/12 on both. Full
+suite on the real (`:avx512`) host: 35183/35183.
+
+**S3, fixed: the test fixture was needlessly large.** `_leading_unit_run`
+only reads the run-forming label's (`a`'s) own extent and that the NEXT M
+label's C-stride differs from the running total -- it does not depend on any
+other axis's size. The fixture now keeps `a`'s extent at 16 (the register-
+tile-sized run under test) and shrinks the other six axes (`i,j,m,k,b,c`) to
+4, reproducing the identical `run`/`Qm`/predicate outcome (verified: `run =
+16` and the swap-avoidance argument both hold independent of the other axes'
+sizes, since `nrun = 1` there regardless) at roughly `(4/16)^6 ~ 1/4000` the
+array/reference-loop cost. Testset wall time dropped from ~52s to ~4s in the
+full-suite run.
+
+**S1, investigated, found to be a REAL regression, documented as a known
+limitation, not fixed.** F2 has no cost model: every demotion in the real
+menus (`KERNEL_SHAPES_F64`/`KERNEL_SHAPES_F32`) also narrows the SIMD lane
+width `W` (e.g. Float64 `(16,6,8) -> (8,6,4)` halves `W` from 8 to 4), and
+that cost is paid on every K-step regardless of how large `kc`/`Qk` is, while
+the store-path saving F2 is chasing is a fixed per-macro-block cost that
+`kc` does NOT amortize away. None of this pass's own verification exercised
+a case where F2 fires AND K is large -- the ABBA guard is plain-GEMM shapes
+only (`Qm == run` always there, so F2 never fires), and the "+3.4% on
+512^3" datapoint is F1-only (F2 does not fire on that shape either, for the
+same reason).
+
+Measured directly, per the review's request: `C[a,b,c,i,j,k] = A[i,j,m,a] *
+B[m,k,b,c]`, Float64, `a = 8` (a divisor of the default `mr = 16` but not
+equal to it -- `run = 8`, `Qm = 8*6*6 != 8`, so F2 fires and demotes to
+`(8,6,4)`), `i=j=k=b=c=6`, `m = 512` (the contracted extent, made large so
+this is compute-bound-ish). Comparing the auto-resolved (F2-demoted) plan
+against the SAME contraction with an explicitly named, non-demoted
+`SIMDKernel(Val(16),Val(6),Float64,Val(8))` (naming a kernel bypasses F2
+entirely, per its own "only for an auto-selected kernel" guard):
+
+| | kernel (mr,nr,W) | median (15 reps) |
+|---|---|---|
+| auto (F2 fires) | (8,6,4) | 1.735e-3 s, 1.750e-3 s (2 runs) |
+| forced (no demotion) | (16,6,8) | 1.415e-3 s, 1.402e-3 s (2 runs) |
+
+F2's demotion is **~18-25% SLOWER** here than not demoting would have been
+-- the narrower-lane compute cost over `m = 512` K-steps outweighs the
+scattered-store saving on this shape's much smaller M/N extents. This is a
+genuine, reproducible (two back-to-back runs, same ratio within 2%)
+regression risk for F2 as shipped: it is a pure store-path-share heuristic
+with no awareness of `Qk`/`kc`, and can make the wrong call whenever a
+shape's contracted extent is large relative to its M/N extents. **Not fixed
+in this pass** -- a correct fix needs a K-aware (or straight cost-model)
+check before demoting, which is a real design change to `_demote_for_run`,
+out of scope for a same-day post-review patch. Documented here as the
+known limitation; any future work on F2 should gate the demotion on `Qk`
+being small relative to `Qm*Qn`, or on a direct cost estimate, before
+trusting it unconditionally on a new case class.
+
+**S2, investigated, confirmed not currently wrong, documented as a known
+limitation, not fixed.** The M/N orientation swap (`_prefer_swap`) and F2
+are sequenced, not jointly optimized: the swap decision is made first,
+using each orientation's PRE-demotion `mr`, and only the chosen orientation
+is then offered to F2. This means a theoretical case exists -- e.g. as-is
+run = 4, swapped run = 16, Float32 default `mr = 32` -- where swapping
+first (to the run-16 orientation) would let F2 achieve full vectorization
+at a large `mr`, but the current order never tries that combination if the
+as-is orientation's own run already loses the swap comparison for an
+unrelated reason. Verified this is a missed-optimization, not a
+correctness bug: every `execute!`/`execute_tilewise!` agreement check in
+this pass's own tests and the pre-existing suite passes, so whichever
+orientation+kernel combination is chosen still produces the right answer,
+just not necessarily the fastest available one. Not fixed -- jointly
+optimizing the swap and the demotion is a larger design change (the swap
+decision would need to be re-run per candidate kernel shape, not just per
+orientation) than this pass's scope.
+
+**Cheap improvement applied: `benchmark/harness.jl`'s `git_commit()` now
+flags a dirty working tree** (appends `-dirty` to the SHA when `git status
+--porcelain` is non-empty), so a profile/benchmark artefact's provenance
+header no longer silently shows a clean commit hash while measuring
+uncommitted changes -- exactly what happened to this pass's own `A2-post-f2`/
+`A2-post-f1` profile artefacts (both were taken before commit `a0b337a`
+existed).
+
+Second commit: see this file's own git history / `STATUS.md` for the SHA
+this section's own changes landed under.

@@ -1203,31 +1203,70 @@ end
 end
 
 @testset "F2: run-length-aware kernel demotion (docs/decisions.md, \"F2\")" begin
-    # The `ccsd_t_1` fixture at dim 16 (benchmark/profile_to_suite.jl's
-    # `ccsd_t_1_dim16`/`ccsd_t_1_dim16_f32`): C's leading unit-stride run
-    # (labels a,i,j -- a is C-adjacent, i breaks it) is exactly 16, while
-    # Qm = 16^3 = 4096, so `Qm == run` never saves this case; only
-    # `run % mr(kernel) == 0` can.
+    # The `ccsd_t_1` fixture (benchmark/profile_to_suite.jl's
+    # `ccsd_t_1_dim16`/`ccsd_t_1_dim16_f32`, shrunk here to the minimum that
+    # reproduces the identical demotion decision): C's leading unit-stride run
+    # (labels a,i,j -- a is C-adjacent, i breaks it, whatever i/j/m/k/b/c's own
+    # extent is) is exactly `d`, while Qm = d*extra^2 != d, so `Qm == run`
+    # never saves this case; only `run % mr(kernel) == 0` can. `d` stays 16 (a
+    # register-tile-sized run is the whole point); the other six axes shrink
+    # to 4 -- `_leading_unit_run` only reads `a`'s own extent plus that the
+    # NEXT M label's stride differs from it, so this reproduces the exact same
+    # `run`/predicate outcome as the full dim=16 fixture at a small fraction of
+    # the array/reference-loop cost.
+    #
+    # NOT hardware-derived: `mr(plan.kernel)`'s expected value below is
+    # computed from `_default_kernel`/`kernel_shapes(T)` themselves, never a
+    # literal -- a literal `mr` (or lack of demotion) is exactly the
+    # ISA-specific hardcoding this file's own header note (`plan_contract:
+    # SIMDKernel is the engine-wide default kernel`, above) warns against, and
+    # is portable across avx512/avx2/neon/unknown-ISA hosts, checked via
+    # `test/forced_isa_runner.jl` for avx2 and unknown/neon.
     d = 16
+    extra = 4
     IA = (:i, :j, :m, :a)
     IB = (:m, :k, :b, :c)
     IC = (:a, :b, :c, :i, :j, :k)
     (indA, indB, indC), _ = _lo_labels(IA, IB)
 
-    for (T, expect_mr) in ((Float64, 16), (Float32, 16))
-        # Float64's default (16,6,8) already has `run % mr == 0` (16 % 16 ==
-        # 0): F2 must NOT fire, so `expect_mr` is the UNCHANGED default.
-        # Float32's default is (32,6,16) -- `16 % 32 != 0` -- so F2 must
-        # demote to the LARGEST menu `mr` that still divides 16, which is
-        # `mr = 16` (the `(8,6,8)` shape also divides but is smaller and must
-        # lose), not the smallest.
-        A = randn(T, d, d, d, d)
-        B = randn(T, d, d, d, d)
-        C = zeros(T, d, d, d, d, d, d)
+    for T in (Float64, Float32)
+        A = randn(T, extra, extra, extra, d)  # (i, j, m, a)
+        B = randn(T, extra, extra, extra, extra)  # (m, k, b, c)
+        C = zeros(T, d, extra, extra, extra, extra, extra)  # (a, b, c, i, j, k)
         Av, Bv, Cv = StridedView(A), StridedView(B), StridedView(C)
 
+        mlab, nlab, klab = QuasiStrided._classify_labels(indA, indB, indC)
+        msorted = _lo_order(mlab, indC, Cv)
+        run = _lo_run(msorted, indC, Cv)
+        cpos(l) = findfirst(==(l), indC)::Int
+        Qm = prod(size(Cv, cpos(l)) for l in mlab)
+        Qn = prod(size(Cv, cpos(l)) for l in nlab)
+
         plan = plan_contract(Cv, Av, indA, Bv, indB, indC)
-        @test mr(plan.kernel) == expect_mr
+        # ccsd_t_1 never swaps (N's own leading run is 1, below every real
+        # `mr`; pinned above, "label order: pinning test..."), so `plan.kernel`
+        # is judged against A's own M composite computed here, on every ISA.
+        @test plan.Astorage === parent(Av)
+
+        default_kernel = QuasiStrided._default_kernel(T, Qm, Qn)
+        default_mr = mr(default_kernel)
+        if Qm == run || run % default_mr == 0
+            # The predicate already holds for the shipped default: F2 must be
+            # a no-op, on every ISA.
+            @test plan.kernel === default_kernel
+        else
+            candidates = [sh[1] for sh in QuasiStrided.kernel_shapes(T) if run % sh[1] == 0]
+            if isempty(candidates)
+                # No menu shape fits either (mirrors the d=5 pinning fixture,
+                # above): F2 falls back to leaving the kernel untouched.
+                @test plan.kernel === default_kernel
+            else
+                # Demoted: the predicate now holds, at the LARGEST menu `mr`
+                # that satisfies it -- not merely any satisfying entry.
+                @test run % mr(plan.kernel) == 0
+                @test mr(plan.kernel) == maximum(candidates)
+            end
+        end
 
         Cref = _lo_reference(C, Av, indA, Bv, indB, indC; alpha = 1.3, beta = -0.7)
         Ctw = copy(C)
