@@ -5586,3 +5586,69 @@ already in the same bucket, the addition cannot change any classification, and
 the post numbers above (taken before the addition) stand. `other` was
 0.18-0.60% in all three post profiles, which is the check that nothing
 escaped.
+
+### Adversarial review of the bounds-check hoist: two test gaps closed
+
+An independent adversarial review of item 2 found **no correctness defect** --
+the reviewer tried and failed to construct a counterexample to the equivalence
+argument above, for negative strides, zero strides, irregular/scattered
+slivers and all four kernel types -- but flagged one real hole in how it was
+*tested*, specifically in the silently-under-validated direction. Both gaps
+are now closed in `test/test_per_call_floor.jl`.
+
+**Gap 1: the equivalence property test supplied its own aggregate range.** It
+computed `blockrange = (minimum(rowoffs), maximum(rowoffs))` and fed that to
+`checked_span_bounds`, so it proved the check is equivalent *given a correct
+aggregate range* -- and would have passed unchanged if `_classify_slivers!`'s
+own accumulation tracked only the first or only the last sliver. That is the
+dangerous direction: a too-SMALL aggregate range throws nothing and still
+computes correct values on every in-bounds input, so no other test in the file
+would have noticed either. Added: a 500-case test that calls
+`_classify_slivers!` on hand-written (hence genuinely irregular; the
+ramp-vs-classify test can only reach regular blocks by construction) buffers
+and compares its returned range against `minimum`/`maximum` over the true
+buffer contents, plus a hand-built case with both extremes planted in an
+*interior* sliver -- one reached through `descriptor_offset_range`'s scan
+branch, one through its affine branch at a negative stride -- where the first
+and last slivers are deliberately unremarkable.
+
+**Gap 2: every rejection test used a dense column-major GEMM**, whose offsets
+increase monotonically, so its out-of-bounds address is necessarily in the
+LAST sliver -- which even a last-only accumulation would catch. Added a
+fixture whose binding address is strictly interior: `C[m,n1,n2] = A[m,k] *
+B[k,n1,n2]` with `C` a REVERSED view along `n2`, giving the N composite the C
+map `(+M, -M*N1)` over lengths `(13, 3)`. Offsets climb by `M` inside each
+`n1` run and fall by `13M` at every run boundary, so at `NR = 6` the slivers
+straddle those boundaries (irregular) and the block maximum lands at logical
+coordinate `q = 12`, sliver 2 of 7. One element off the destination then makes
+exactly that interior address overflow. The test derives where the extreme
+sits rather than asserting it by hand, checks the correctly sized plan still
+computes the right answer, and confirms `BoundsError` with **nothing written**.
+
+That fixture's discriminating power is asserted directly, by handing
+`checked_span_bounds` the true range (rejects) and the first-only and
+last-only ranges (both silently accept), rather than by mutating the driver.
+A mutation run was done once, out of tree, and is why: a driver with the
+first-sliver-only bug does not merely accept the plan, it performs the
+out-of-bounds write, corrupts the heap and hangs. Recording that here because
+it is the concrete demonstration that this hoist is the part of the change
+with real teeth, and that the accumulation -- not just `checked_span_bounds`
+-- has to be tested directly.
+
+**Incidental behaviour change, pinned rather than left implicit.** Hoisting
+made `execute!`'s rejection *stricter*: it now fails before any write for the
+whole block, where the old per-tile check wrote every tile preceding the
+offending one. `execute_tilewise!` still has the old behaviour, so the two
+differ, and the test asserts both sides of that (`all(iszero, C)` after
+`execute!`, `any(!iszero, C)` after `execute_tilewise!`). "Atomic" is a claim
+about one macro block only: with several blocks, earlier ones can still have
+been written before a later block's check throws.
+
+**One docstring narrowed.** `execute!`'s said "no address this driver can
+reach is unvalidated"; that is very slightly too strong, because the
+pre-existing `Qk == 0 || alpha == 0` beta-only short-circuit reaches
+`_scale_all_of_C!`, which has never had a storage-bounds check (it writes
+through `scale_tile!`'s `@inbounds` path on `AxisGroup`s validated at
+construction). Unchanged behaviour, not introduced here; the sentence is now
+scoped to the macro-blocking pack/execute path and the exception named
+explicitly.

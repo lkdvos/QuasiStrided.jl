@@ -14,7 +14,6 @@
 
 using Test
 using Random
-using LinearAlgebra: mul!
 using StridedViews: StridedView, offset
 
 const QS = QuasiStrided
@@ -206,6 +205,58 @@ end
     @test_throws BoundsError QS.checked_span_bounds(0, (0, 0), (0, 0), 0)
 end
 
+@testset "per-call floor: _classify_slivers! accumulates the TRUE block range" begin
+    # The test above proves `checked_span_bounds` is equivalent to the
+    # per-sliver checks GIVEN a correct aggregate range, because it computes
+    # that range itself. This one closes the other half: that
+    # `_classify_slivers!` -- the thing that actually produces the range the
+    # driver hands to `checked_span_bounds` -- accumulates the true min/max
+    # over the whole block and not, say, the first or the last sliver's.
+    #
+    # That failure mode is invisible everywhere else in this file: a too-SMALL
+    # aggregate range throws nothing and still computes the right values on
+    # every in-bounds input, so it is the silently-under-validated direction
+    # and needs a direct assertion. Buffers are written by hand rather than
+    # through `fill_offsets!`, so the irregular/scattered case -- which the
+    # ramp-vs-classify test below cannot reach, since ramps are regular by
+    # construction -- is exercised on purpose.
+    Random.seed!(20260922)
+    for trial in 1:500
+        blocklen = rand(1:24)
+        reg = rand(1:5)
+        nsliv = cld(blocklen, reg)
+        buf1 = [rand(-40:40) for _ in 1:blocklen]
+        buf2 = [rand(-40:40) for _ in 1:blocklen]
+        d1 = Vector{BlockDescriptor}(undef, nsliv)
+        d2 = Vector{BlockDescriptor}(undef, nsliv)
+        (r1, r2) = QS._classify_slivers!(d1, d2, buf1, buf2, blocklen, reg, nsliv)
+        @test r1 == (minimum(buf1), maximum(buf1))
+        @test r2 == (minimum(buf2), maximum(buf2))
+        # Sanity: with random contents and a wide enough sliver, at least some
+        # of these descriptors really are irregular, i.e. the scan branch of
+        # `descriptor_offset_range` is the one under test.
+        @test all(s -> d1[s].count == min(reg, blocklen - (s - 1) * reg), 1:nsliv)
+    end
+
+    # Both extremes planted in an INTERIOR sliver, with the first and last
+    # slivers deliberately unremarkable. A first-only or last-only
+    # accumulation passes every other assertion in this file and fails here.
+    blocklen, reg = 18, 6                      # slivers 1:6, 7:12, 13:18
+    buf1 = fill(1, blocklen); buf1[8] = 500; buf1[9] = -500   # sliver 2, irregular
+    buf2 = fill(2, blocklen)
+    buf2[7:12] .= [0, -7, -14, -21, -28, -35]                 # sliver 2, REGULAR, stride -7
+    d1 = Vector{BlockDescriptor}(undef, 3)
+    d2 = Vector{BlockDescriptor}(undef, 3)
+    (r1, r2) = QS._classify_slivers!(d1, d2, buf1, buf2, blocklen, reg, 3)
+    @test !d1[2].regular && d1[2].count == 6        # scan branch
+    @test d2[2].regular && d2[2].stride == -7       # affine branch, negative stride
+    @test r1 == (-500, 500)
+    @test r2 == (-35, 2)
+    # ... and the first/last slivers alone would have said something else.
+    @test QS.descriptor_offset_range(d1[1], buf1, 0) == (1, 1)
+    @test QS.descriptor_offset_range(d1[3], buf1, 12) == (1, 1)
+end
+
 @testset "per-call floor: descriptor_offset_range agrees with axis_offset_range" begin
     Random.seed!(7)
     for trial in 1:300
@@ -323,6 +374,122 @@ end
     exact = zeros(Ma * Na)
     _pcf_exec(replan(Cstorage = exact), 1.0, 0.0)
     @test reshape(exact, Ma, Na) ≈ Amat * Bmat
+end
+
+@testset "per-call floor: rejection when the binding address is in an INTERIOR sliver" begin
+    # The rejection test above uses a dense column-major GEMM, whose offsets
+    # increase monotonically, so its out-of-bounds address is necessarily in
+    # the LAST sliver of the block -- which a first-only or last-only range
+    # accumulation would still catch. This fixture puts the binding address
+    # strictly in the middle, and makes the slivers irregular while it is at
+    # it.
+    #
+    # C[m,n1,n2] = A[m,k] * B[k,n1,n2], with C a REVERSED view along n2, so
+    # the N composite's C map is (+M, -M*N1) over lengths (N1, N2): offsets
+    # climb by M inside each n1 run of 13 and then fall by 13M at every run
+    # boundary. At NR = 6 that makes slivers straddle the boundary (hence
+    # irregular), and it puts the block MAXIMUM at logical coordinate
+    # q = N1-1 = 12 -- sliver index 2 of 7, an interior one -- while the first
+    # and last slivers top out far below it.
+    M, K, N1, N2 = 20, 4, 13, 3
+    kernel = SIMDKernel(Val(8), Val(6), Float64)
+    Amat = randn(M, K)
+    Barr = randn(K, N1, N2)
+    Cfull = zeros(M, N1, N2)
+    Cr = view(Cfull, :, :, N2:-1:1)
+    Av, Bv, Cv = StridedView(Amat), StridedView(Barr), StridedView(Cr)
+
+    base = _pcf_plan(Cv, Av, (1, 2), Bv, (2, 3, 4), (1, 3, 4); kernel = kernel)
+    @test base.Astorage === parent(Av)                   # no M/N swap: M's run is 20 >= 8
+    @test !first(QS.affine_ramp(base.ngroup))            # the buffer path, not the ramp path
+    Qn = axis_length(base.ngroup)
+    @test Qn == N1 * N2
+    @test base.blocking.nc >= Qn                         # one jc block, so 7 slivers
+    nsliv = cld(Qn, nr(kernel))
+    @test nsliv == 7
+
+    # Where the extreme actually sits, derived rather than asserted by hand.
+    noffs = [offsets(base.ngroup, q)[2] for q in 0:(Qn - 1)]
+    binding = argmax(noffs) - 1                          # zero-based logical coordinate
+    @test binding == N1 - 1
+    @test 0 < binding ÷ nr(kernel) < nsliv - 1           # a strictly interior sliver
+    @test maximum(noffs[1:nr(kernel)]) < noffs[binding + 1]                 # not the first
+    @test maximum(noffs[(1 + (nsliv - 1) * nr(kernel)):end]) < noffs[binding + 1]  # not the last
+
+    # The whole, correctly sized destination is accepted and computes the
+    # right answer -- so the fixture is a legitimate contraction, not one the
+    # engine would reject anyway.
+    _pcf_exec(base, 1.0, 0.0)
+    ref = zeros(M, N1, N2)
+    for m in 1:M, n1 in 1:N1, n2 in 1:N2
+        ref[m, n1, n2] = sum(Amat[m, k] * Barr[k, n1, n2] for k in 1:K)
+    end
+    @test Cr ≈ ref
+
+    # Now one element short. The only address that overflows is the one
+    # attained at `binding`, inside sliver 2; a range accumulated from the
+    # first or the last sliver alone would accept this plan and write out of
+    # bounds.
+    short_C = zeros(M * N1 * N2 - 1)
+    pshort = _pcf_Plan(
+        base.kernel, base.mgroup, base.ngroup, base.kgroup, base.blocking,
+        base.Astorage, base.Abase, base.Bstorage, base.Bbase, short_C, base.Cbase,
+        base.atransform, base.btransform, base.workspace,
+    )
+    @test_throws BoundsError _pcf_exec(pshort, 1.0, 0.0)
+    @test all(iszero, short_C)                            # nothing written before the throw
+
+    # That this fixture DISCRIMINATES -- i.e. that a first-sliver-only or
+    # last-sliver-only aggregate range would have accepted the short
+    # destination and written out of bounds -- is asserted directly rather
+    # than by mutating the driver, because a driver with that bug really does
+    # perform the out-of-bounds write (verified once, out of tree: it
+    # corrupted the heap and hung). Feeding `checked_span_bounds` the three
+    # candidate ranges settles the same question deterministically and
+    # without executing anything.
+    moffs = [offsets(base.mgroup, q)[2] for q in 0:(axis_length(base.mgroup) - 1)]
+    mrange = (minimum(moffs), maximum(moffs))
+    NR = nr(kernel)
+    truerange = (minimum(noffs), maximum(noffs))
+    firstonly = (minimum(noffs[1:NR]), maximum(noffs[1:NR]))
+    lastonly = let tail = noffs[(1 + (nsliv - 1) * NR):end]
+        (minimum(tail), maximum(tail))
+    end
+    shortlen = length(short_C)
+    # The true range rejects ...
+    @test_throws BoundsError QS.checked_span_bounds(base.Cbase, mrange, truerange, shortlen)
+    # ... while either truncated range silently accepts. This is exactly the
+    # "too-small aggregate range throws nothing" failure mode, and it is what
+    # the test above (`_classify_slivers! accumulates the TRUE block range`)
+    # is there to make impossible.
+    @test QS.checked_span_bounds(base.Cbase, mrange, firstonly, shortlen) === nothing
+    @test QS.checked_span_bounds(base.Cbase, mrange, lastonly, shortlen) === nothing
+
+    # The fully checked oracle agrees that this plan must be rejected --
+    # independently, and via a different mechanism (its own per-tile check).
+    #
+    # It does NOT leave the destination untouched, and that difference is
+    # pinned here on purpose: `execute_tilewise!` validates each tile as it
+    # reaches it, so it writes every tile that precedes the offending one,
+    # whereas hoisting turned `execute!`'s rejection into a fail-before-write
+    # for the whole block. That is the hoist making the failure mode STRICTER,
+    # not weaker -- but only per block: with several macro blocks, earlier
+    # blocks can still have been written before a later block's check throws,
+    # so "atomic" is a claim about one block, not about `execute!`.
+    fill!(short_C, 0.0)
+    @test_throws BoundsError _pcf_exec_tw(pshort, 1.0, 0.0)
+    @test any(!iszero, short_C)
+
+    # The same shape with an interior-sliver MINIMUM: shifting the base down
+    # by one makes the smallest address -1, and that minimum is attained in
+    # the last n1 run, not the first sliver.
+    plow = _pcf_Plan(
+        base.kernel, base.mgroup, base.ngroup, base.kgroup, base.blocking,
+        base.Astorage, base.Abase, base.Bstorage, base.Bbase,
+        zeros(M * N1 * N2), base.Cbase - 1,
+        base.atransform, base.btransform, base.workspace,
+    )
+    @test_throws BoundsError _pcf_exec(plow, 1.0, 0.0)
 end
 
 @testset "per-call floor: the unsafe_* packers keep every non-bounds check" begin

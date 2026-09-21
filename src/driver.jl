@@ -1218,10 +1218,17 @@ iteration touches is validated with one [`checked_span_bounds`](@ref) call
 before anything is packed or written, and the packing/micro-kernel calls
 inside it then go through `unsafe_pack_a!`/`unsafe_pack_b!`/
 `unsafe_execute_tile!`. The test performed is exactly the conjunction of the
-per-sliver tests it replaces (see `checked_span_bounds`), so no address this
-driver can reach is unvalidated and no previously accepted contraction is now
-rejected; `execute_tilewise!` keeps the per-tile checked path as an
-independent oracle for both the values and the rejections.
+per-sliver tests it replaces (see `checked_span_bounds`), so no address the
+macro-blocking pack/execute path can reach is unvalidated and no previously
+accepted contraction is now rejected; `execute_tilewise!` keeps the per-tile
+checked path as an independent oracle for both the values and the rejections.
+
+Scoped to that path deliberately: the `Qk == 0 || alpha == 0` beta-only
+short-circuit above it goes to `_scale_all_of_C!`, which has never done a
+storage-bounds check at all (it writes through `scale_tile!`'s `@inbounds`
+path, relying on the `AxisGroup`s' own construction-time validation). That is
+pre-existing behaviour, unchanged by the hoist, and is named here only so this
+paragraph is not read as a claim about it.
 """
 function execute!(plan::ContractPlan{T}, alpha::Number, beta::Number) where {T}
     alphaT = convert(T, alpha)
