@@ -450,6 +450,22 @@ the actual target — QuasiStrided already matches or beats TBLIS, the C++ BSMTC
 reference, on 4 of 5 measured points, and beats `StridedBLAS` by 1.0x-2.4x.
 The plain-matmul gap is real but is not this package's workload.
 
+**Design review of the dispatch-tiers item above, 2026-09-21**
+(`docs/proposals/dispatch-tiers.md`, a sign-off document, no `src/` change).
+Re-read against three newer pieces of evidence -- the packing-speed fix now
+on `main` (`8dd01dd`), the `ccsd_t_*` mechanism findings (F1/F2, branch
+`ccsd-t-stall`), and the workload-representativeness feature table
+(`benchmark/results/dontpack-C0-feature-table.csv`) -- the proposal
+recommends **against** building Octavian-style `dontpack`/`maybeinline`
+tiers now: the translated triggers fire on none of the cases where
+QuasiStrided both loses and is packing-bound, packing is 1-11% of runtime on
+every genuine multi-index case profiled post-fix, and the one residual loss
+pattern is a per-call floor, not packing. It names an evidence gate (run the
+upstream `:mps`/`:ctmrg`/`:trg` categories) under which a narrow,
+real-dtype-only "A-direct" tier would be reconsidered, sketches that design
+conditionally, and ends with the decisions requested from the user. The
+paragraphs above are left as the record of the original framing.
+
 Two smaller follow-ons, both now unblocked rather than urgent: the register
 tile can be enlarged (`NV` up to 28 is allocation-free and spill-free — it
 just measured no faster), and `default_blocking`'s `mc`/`nc` were validated
