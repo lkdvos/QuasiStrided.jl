@@ -8,12 +8,19 @@ detail belongs in `docs/decisions.md`.
 ## Integrated revision
 
 Local git repo at `/mnt/home/ldevos/Projects/QuasiStrided.jl`. `main` is at
-`19dd25c` (merge of `upstream-bench`, PR #5, into `main` -- 2026-09-21),
-which follows the label-order milestone (PR #7, `49213bc`), the vectorized
-store fast-path fix (PR #6, `4ff065a`), and complex element-type support
-(PR #4, `71c1536`), on top of the original TensorOperations integration
-(PR #2, `3e712ea`, squash-merged 2026-09-10). All published, all on `main`;
-there is no separate long-lived work branch as of this entry. Note
+`a14e334`, following (in order) the merge of `upstream-bench` (PR #5,
+`19dd25c`), the profiling-pass benchmark tooling (`f318eb9`), the
+packing-speed vectorized fast path (`8dd01dd`), the extended profiling
+grid (`ebfbeb3`), the dispatch-tiers design proposal (`7f6a4cb`, docs
+only), and the `ccsd_t_*` kernel-shape-demotion/inline-accumulate fix
+(`a14e334`) -- all 2026-09-21, on top of the label-order milestone (PR #7,
+`49213bc`), the vectorized store fast-path fix (PR #6, `4ff065a`), and
+complex element-type support (PR #4, `71c1536`), on top of the original
+TensorOperations integration (PR #2, `3e712ea`, squash-merged 2026-09-10).
+All published, all on `main`; there is no separate long-lived work branch
+as of this entry (three local worktrees from the 2026-09-21 work --
+`ccsd-t-stall`, `profile-grid`, `packing-speed` -- are fully merged and can
+be removed on request). Note
 `Manifest.toml` and `benchmark/results/` are both gitignored, so the
 committed manifest is stale relative to `Project.toml` and a fresh clone
 needs `Pkg.resolve()`; benchmark result directories exist on disk but are not
@@ -389,104 +396,58 @@ store-dominated fix: run-length-aware demotion (F2) and inlined `accumulate`
 
 ## Next task
 
-**Packing and per-call overhead is now the whole gap.** Benchmarked
-single-threaded against Octavian.jl and OpenBLAS (`docs/decisions.md`,
-Phase H), QuasiStrided reaches 25-54 GFLOP/s on plain matmul where Octavian
-is essentially flat at 79-98 and beats OpenBLAS at most points. Since the
-microkernel measures 79-100 GFLOP/s in isolation, the deficit is entirely
-packing plus per-call cost. Octavian's answer is a three-tier dispatch this
-engine has no equivalent of:
+**Superseded 2026-09-21, by user decision: do not build Octavian-style
+`dontpack`/`maybeinline` dispatch tiers.** The paragraphs that used to stand
+here framed that as the highest-value next item, based on a plain-matmul
+comparison against Octavian.jl/OpenBLAS. A profiling pass, a packing-speed
+fix, a `ccsd_t_*` mechanism fix, and a workload-representativeness analysis
+(all 2026-09-21, full narrative in `docs/decisions.md`) together showed that
+framing doesn't hold on this project's actual workload: the one real,
+large, reproducible loss case (`ccsd_t_*_dim16`) had the *highest* packing-
+reuse numbers in the whole measured sweep and a packing cost near zero --
+its cause was a store-path/kernel-shape defect, now fixed, unrelated to
+packing amortization. On the 3 cases in the profiling passes that are
+genuine multi-index contractions (not plain matmul with a suggestive name),
+packing is now 1-11% of runtime, and QuasiStrided already matches or beats
+TBLIS and beats StridedBLAS by 1.0x-2.4x. `docs/proposals/dispatch-tiers.md`
+is the sign-off document; the user accepted its recommendation against
+building the tiers now. Do not restart this item without new evidence
+against that recommendation (see the proposal's evidence gate, below).
 
-1. `maybeinline` — statically small, fully inlined, no packing;
-2. `dontpack`/`nᵣ ≥ N` → `loopmul!` — **no packing at all**, straight over the
-   unpacked arrays;
-3. otherwise pack A only, or pack A and B.
+**Current next task, two tracks, both authorized 2026-09-21:**
 
-QuasiStrided always packs both. Adding tiers 1-2 is the highest-value next
-item, and it targets exactly the small and skewed shapes a tensor network
-produces (`256x256x12` measures 16 GFLOP/s here against Octavian's 87).
+1. **Evidence gate** (`docs/proposals/dispatch-tiers.md` section 5.1):
+   confirm the recommendation above holds on the upstream `:mps`/`:ctmrg`/
+   `:trg` categories, never before measured against this engine. An sbatch
+   script for this is prepared for the user to submit on Rusty/Popeye; not
+   run as part of this session (Slurm job submission is the user's own
+   action per this project's operating constraints). Wires those categories
+   into `benchmark/bench_to_suite.jl` first (previously only `:pairwise`/
+   `:tccg` were runnable).
+2. **Per-call floor** (`docs/proposals/dispatch-tiers.md` section 5.2): the
+   residual loss pattern found by the analyses above is per-call/per-block
+   overhead, not packing -- `plan_contract`'s ~3.8-4.4 KB/~4.4-6.7 us
+   allocation-heavy label bookkeeping, per-sliver validation
+   (`_check_pack_a`/`_check_pack_b` + `checked_tile_storage_bounds`, 7.4% of
+   `ao2mo_2_dim16`), and `driver_loop` bookkeeping (`fill_offsets!`/
+   `describe_block`/`_classify_slivers!`, 28.7% of `ao2mo_2_dim16`).
+   User has explicitly authorized hoisting the per-sliver validation to
+   once-per-macro-block even though this changes `pack_a!`/`pack_b!`'s
+   documented "all validation before any write" contract, on the condition
+   that the resulting now-unchecked internal entry points are named with an
+   `unsafe_` prefix so the shifted safety contract is visible at every call
+   site. See `docs/decisions.md` for this track's outcome once it lands.
 
-**Corroborated by a general-purpose profiler, 2026-09-21** (`docs/decisions.md`,
-"Profiling pass: where does QuasiStrided spend its time?"): profiling
-`256x256x12` directly puts 62.7% of its own time in `packing` and only 24.0%
-in the microkernel -- the missing time has a name now, not just a lower
-GFLOP/s number. Large square GEMM (512³) *is* compute-bound by this pass's
-own threshold (80.4% microkernel + 4.6% store, in-situ throughput ~88% of a
-same-day isolated reference); 256³ and the rank-4 `dim15_2_2_2` case are
-close but just under the threshold (75-76% combined share), so the
-microkernel-share gap narrows with size rather than vanishing at a clean
-cutoff. The six-index `ccsd_t_*` case is **not** compute-bound at either
-dtype, which corrects this pass's own first-draft finding: at Float64 its
-in-situ throughput is only ~26% of the isolated reference despite a
-near-80% sample share (kernel-stalled, not compute-bound), and at Float32
-it is decisively store-dominated (~75% of its own time in the scattered
-store path) -- both are new, narrower findings worth a follow-up look, not
-investigated further this pass. Tooling: `benchmark/profile_to_suite.jl` +
-`benchmark/profile_buckets.jl` (merged from the former `upstream-bench`
-branch, PR #5, then fixed twice in this pass -- first for leaf-only
-self-time misattributing inlined `SIMD.jl` FMA-intrinsic frames to "other",
-then, per an independent review before committing, because a bare
-file-path catch-all could still swallow a more specific ancestor frame
-first -- see `docs/decisions.md` for both corrections in detail).
+Two smaller follow-ons, both unblocked but not urgent: the register tile
+can be enlarged (`NV` up to 28 is allocation-free and spill-free -- it just
+measured no faster), and `default_blocking`'s `mc`/`nc` were validated at
+the previous register shape.
 
-**Follow-up, 2026-09-21**: the profiler above was then run over the *full*
-`MAIN_SHAPES`/`SMALL_SHAPES`/`EXTRA_SHAPES` grid at all four dtypes
-(`Float64`/`Float32`/`ComplexF64`/`ComplexF32`), plus the `1m`
-(`OneMKernel`) complex kernel directly (`docs/decisions.md`, "T4: extended
-the grid..."). **The first attempt at this sweep (`--tag r1`) was
-contaminated by concurrent execution on the shared workstation** (this
-pass's own smoke test ran, unnoticed, *inside* that sweep's execution
-window rather than before or after it) and has been superseded by a clean
-re-run (`--tag r2`, verified as the sole process on the machine, plus
-targeted `--tag r3` spot-checks on cases that still looked noisy) -- see
-`docs/decisions.md`'s "T4" section for the full contamination story and the
-corrected numbers. Headline, on the clean data: the packing-dominance
-finding generalizes cleanly -- every `smallM`/`smallMN`/`smallN` case is
-packing-dominated at all four dtypes, **except one**
-(`smallMN_16x256x16_c64`, the `ComplexF64` case, which is
-planning-dominated; its `ComplexF32` sibling `smallMN_16x256x16_c32` is
-packing-dominated like the rest -- correcting an earlier miscount of "two"
-`smallMN` cases as planning-dominated), not just the one
-`smallN_256x256x12`/`Float64` case already cited above, and the
-microkernel-share gap narrows with size at every dtype (though `Float32`
-is the one dtype where even `plain_512` stays just under this pass's 80%
-share threshold, confirmed on two independent clean runs). New wrinkle: two
-`ComplexF64`/`ComplexF32` `shallowK_256x24x256` cases turned out to be
-store-dominated, not microkernel-dominated, inside their own >=80% combined
-share -- the same "looks compute-bound by share alone, isn't" trap T3
-already caught for `ccsd_t_1_dim16_f32`, now also seen on complex dtypes.
-This pass still uses a share-only verdict rule (no fresh isolated
-complex-kernel throughput reference existed to run T3's full two-legged
-rule) and two cases (`smallM_12x256x256`/`Float64` and
-`smallN_256x256x12_f32`) remain genuinely noisy on their packing-share
-figure even after three repeats -- both flagged as follow-ups in
-`docs/decisions.md`, not done.
-
-Keep the priority honest, though: on **genuine multi-index contractions** —
-the actual target — QuasiStrided already matches or beats TBLIS, the C++ BSMTC
-reference, on 4 of 5 measured points, and beats `StridedBLAS` by 1.0x-2.4x.
-The plain-matmul gap is real but is not this package's workload.
-
-**Design review of the dispatch-tiers item above, 2026-09-21**
-(`docs/proposals/dispatch-tiers.md`, a sign-off document, no `src/` change).
-Re-read against three newer pieces of evidence -- the packing-speed fix now
-on `main` (`8dd01dd`), the `ccsd_t_*` mechanism findings (F1/F2, branch
-`ccsd-t-stall`), and the workload-representativeness feature table
-(`benchmark/results/dontpack-C0-feature-table.csv`) -- the proposal
-recommends **against** building Octavian-style `dontpack`/`maybeinline`
-tiers now: the translated triggers fire on none of the cases where
-QuasiStrided both loses and is packing-bound, packing is 1-11% of runtime on
-every genuine multi-index case profiled post-fix, and the one residual loss
-pattern is a per-call floor, not packing. It names an evidence gate (run the
-upstream `:mps`/`:ctmrg`/`:trg` categories) under which a narrow,
-real-dtype-only "A-direct" tier would be reconsidered, sketches that design
-conditionally, and ends with the decisions requested from the user. The
-paragraphs above are left as the record of the original framing.
-
-Two smaller follow-ons, both now unblocked rather than urgent: the register
-tile can be enlarged (`NV` up to 28 is allocation-free and spill-free — it
-just measured no faster), and `default_blocking`'s `mc`/`nc` were validated
-at the previous register shape.
+Full narrative for the 2026-09-21 profiling pass, the packing-speed fix,
+the `ccsd_t_*` mechanism fix, the full-grid extension, and the
+dispatch-tiers design review is in `docs/decisions.md` -- this file only
+records what phase the project is in, per its own stated purpose at the
+top.
 
 **Measurement hygiene, learned the hard way this milestone:** ccqlin038 is
 not reliably exclusive. Canary spreads of 4-15% were normal (against Phase
