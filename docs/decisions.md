@@ -4523,3 +4523,189 @@ explicitly out of scope for this pass, as before.
   `MAIN_SHAPES`/`SMALL_SHAPES`/`EXTRA_SHAPES`/dtype grid was not run).
 - Complex dtypes beyond the one Float32 case above (planar/1m kernels
   untouched by this pass).
+
+## Kernel-stalled/store-dominated fix: run-length-aware demotion (F2) and inlined `accumulate` (F1) (2026-09-21)
+
+The prior pass (immediately above) found, but did not fix, two mechanisms
+behind `ccsd_t_1_dim16`/`ccsd_t_1_dim16_f32` being store-dominated/kernel-
+stalled. This pass implements both, in `src/`, each verified with real
+before/after numbers on `ccqlin038`.
+
+### F2: run-length-aware kernel-shape demotion (`src/driver.jl`)
+
+**Mechanism.** `QuasiStridedBackend`'s vectorized store
+(`_store_tile_vector!`) requires EVERY register sliver of a macro block to be
+unit-stride in `C`. Given a composite M-axis with a leading unit-stride run
+of length `run` and a kernel's register-tile height `mr`, this holds iff
+`Qm == run || run % mr == 0` -- confirmed by direct counterexample sweep
+(`benchmark/probes/probe_ccsd_t_stall_f2rule.jl`): the weaker-looking
+`mr <= run` is WRONG (e.g. `run=20, mr=16` satisfies it but only 40% of
+slivers are actually contiguous). `ccsd_t_1_dim16_f32`'s shipped default
+kernel is `(32,6,16)` (`mr=32`), while C's leading run there is only 16:
+`16 % 32 != 0`, so every M-sliver falls to the slow scattered store path,
+which measured at ~75% of total time in the prior pass's profile.
+
+**Fix.** In `plan_contract` (`src/driver.jl`), a new `_demote_for_run(T,
+kernel, run, Qm)` helper runs DOWNSTREAM of the existing `_default_kernel`
+call and the `_prefer_swap` M/N-orientation decision, keyed on whichever
+orientation was actually chosen to feed M (its own run length against the
+kernel it would actually run). If the predicate fails, it searches that
+dtype's `kernel_shapes(T)` menu for shapes whose `mr` divides `run`, and
+picks the LARGEST matching `mr` -- not the smallest: measured directly, at
+`run=16` for Float32 the `(16,6,8)` shape beats `(8,6,8)`. Both demotion
+targets are already-compiled menu entries (`_kernel_from_shape`), so this
+adds no new `SIMDKernel` specialization. Real dtypes only (`T <: Real`); the
+`T` fallback method is a no-op, matching the complex path's unconditional
+scattered store. ~30 lines in `src/driver.jl` (`_demote_for_run` plus the two
+call sites after the swap decision).
+
+**Pinning-test interaction, checked not assumed.** `test/test_driver.jl`'s
+swap-decision pinning test (`"label order: pinning test on the ccsd_t
+shapes..."`) reads `MRk = mr(plan.kernel)` AFTER `plan_contract` returns --
+i.e. from the (possibly F2-demoted) final kernel -- and compares it against
+the swap boolean, which was decided using the PRE-demotion `mr`. This is
+exactly the fragility flagged as a risk before implementation. Checked by
+running the suite: at that test's fixture (`d = 5`), the leading run is
+never more than `d = 5` or `d^2 = 25`, and the smallest real menu `mr` is 8
+(Float64) -- `5 % 8 != 0` and `25 % 8 != 0` for every menu entry -- so
+`_demote_for_run` always finds no matching shape and returns the kernel
+unchanged; the assertion never actually observes a post-demotion `mr`. Full
+suite green with no edit needed to that test. Left as-is rather than
+"fixed proactively", since forcing a change into a passing, correctly-reasoned
+test would have been fixing a problem that measurement showed does not exist.
+
+**`_default_kernel`/`test_target.jl` pinning.** F2 is a new function called
+after `_default_kernel`'s result is already resolved, never folded into it;
+`_default_kernel(T, 9, 8)`'s `===`-pinned identity in `test/test_driver.jl`
+and `test/test_target.jl`'s Qm-based demotion tests are unaffected by
+construction (neither exercises `plan_contract`'s post-swap step).
+
+**New correctness test** (`test/test_driver.jl`, `"F2: run-length-aware
+kernel demotion"`): for the `ccsd_t_1` fixture at `dim=16` (both dtypes),
+asserts `mr(plan.kernel)` resolves to the expected value (16 for Float32,
+demoted from 32; 16 for Float64, unchanged since the default already
+satisfies the predicate), and that both `execute!` and `execute_tilewise!`
+agree with an engine-free reference loop. A second loop over a plain-GEMM
+fixture asserts F2 never fires there (`plan.kernel === _default_kernel(T, Ma,
+Na)`, by identity) since `Qm == run` always holds for a bare matmul's M
+composite.
+
+**Measured (ccqlin038, `benchmark/bench_ccsd_t_store.jl --dims 8,16
+--dtypes Float64,Float32`, reps=15, ABBA-adjacent -- same machine, back to
+back, ~1-3 load-average noise from concurrent orchestration work noted
+below):**
+
+| case | dim | dtype | before (Arm 1-QuasiStrided) | after | speedup |
+|---|---|---|---|---|---|
+| ccsd_t_1 | 16 | Float32 | 3.522e-2 s | 1.626e-2 s | **2.17x** |
+| ccsd_t_1 | 8  | Float32 | 5.086e-4 s | 2.649e-4 s | **1.92x** |
+| ccsd_t_1 | 16 | Float64 | 2.788e-2 s | 2.387e-2 s (F2+F1 combined) | 1.17x (F2 does not fire here; see F1 below for the isolated attribution) |
+| ccsd_t_2/3/4 | 8,16 | both | -- | -- | within noise / small F1-driven gains, no regression |
+
+Both within the predicted 1.4x-2.2x range for the cases F2 targets, and no
+regression on cases where the default kernel already satisfies the
+predicate (`ccsd_t_1` at Float64, and plain GEMM in general, per the ABBA
+guard below).
+
+**Re-profile** (`julia -t 1 --project=benchmark benchmark/profile_to_suite.jl
+ccsd_t_1_dim16 ccsd_t_1_dim16_f32 --tag A2-post-f2`, F2 only, F1 not yet
+applied): `ccsd_t_1_dim16_f32`'s `store` bucket share dropped from ~75% (prior
+pass's finding) to **21.73%** of `QuasiStridedBackend`'s own samples, with
+`microkernel` rising to 57.47%. Artefact:
+`benchmark/results/ccqlin038.flatironinstitute.org-2026-09-21/profiles/buckets_summary-A2-post-f2.txt`.
+
+### F1: inline `Base.accumulate` (`src/kernels/simd.jl`)
+
+**Mechanism.** `Base.accumulate(kernel::SIMDKernel{MR,NR,T,W}, ...)` built and
+returned its 768-byte (at the shipped `(16,6,8)`/`(32,6,16)` shapes)
+accumulator tuple without an `@inline` annotation, so LLVM round-tripped it
+through memory (memset + stack allocation + store-and-reload) at every
+micro-tile call instead of keeping it register-resident, per the prior
+pass's LLVM/native codegen dump.
+
+**Fix.** One line: `function Base.accumulate(...)` -> `@inline function
+Base.accumulate(...)` in `src/kernels/simd.jl`. No semantic change --
+`accumulate` already delegated every K-step to the `@generated`,
+already-`@inline`d `_accumulate_step`; only the outer wrapper's own inlining
+status changed.
+
+**Allocation-cliff check.** `test/test_simd_kernel.jl`'s "allocation:
+`accumulate` and `execute_tile!` are steady-state allocation-free" and "...
+WITH TAIL ROWS ..." testsets already sweep register shapes up to `NV = 24`
+(`(16,6,4)`) and `NV = 28` (`(16,7,4)`) -- the documented dynamic-tuple-
+indexing allocation cliff's range -- and both stayed allocation-free with
+`@inline` added; confirmed by the full suite passing (see below), not by a
+separate ad hoc run, since these tests are exactly the standing regression
+guard for this cliff.
+
+**Measured, isolated from F2** (driver.jl at its pre-F2 baseline, only
+`simd.jl`'s `@inline` applied, `ccsd_t_1` dim=16 Float64 -- F2 never fires
+on this case, so its effect is F1 alone):
+
+| | median (15 reps) | vs. no-F1 baseline |
+|---|---|---|
+| Arm 1 (QuasiStrided), no F1 | 2.788e-2 s | -- |
+| Arm 1 (QuasiStrided), F1 only | 2.561e-2 s | **1.089x (+8.9%)** |
+
+Matches the predicted +5-10% for a small-`kc` case. On a large-`kc` case
+(plain 512x512x512 GEMM, `kc=256` forced, Float64, `median_time_s`, 15 reps,
+via a scratch harness script calling `plan_contract`/`execute!` directly):
+F1-off 4.4897e-3 s, F1-on 4.3389e-3 s -- **+3.4%, no regression**, consistent
+with "negligible change" (F1's win is proportional to per-call overhead,
+which large-`kc` amortizes away).
+
+**Re-profile** (same command, `--tag A2-post-f1`, both fixes applied):
+`ccsd_t_1_dim16` (Float64) end-to-end time dropped from 0.029243 s/call (F2
+only) to 0.026680 s/call (F2+F1), a further 8.8% -- consistent with the
+isolated measurement above. `profile_buckets.jl`'s bucket table folds
+`zero_accumulator` into the same `microkernel` bucket as `_accumulate_step`
+(see its `BUCKETS` table), so the ~29-30% "zero_accumulator share" figure
+from the prior pass's finer-grained analysis is not separately visible in
+this profiler's coarser bucket; the wall-clock improvement above is the
+figure of record for this pass. Artefact:
+`benchmark/results/ccqlin038.flatironinstitute.org-2026-09-21/profiles/buckets_summary-A2-post-f1.txt`.
+
+### Full-suite and ABBA guard results
+
+- `Pkg.test()`: 35180/35180 pass (was 35170 before this pass's +10 new F2
+  tests), including `test/test_driver.jl`'s and `test/test_target.jl`'s
+  pinning tests, unedited.
+- `benchmark/bench_real_path_guard.jl`, ABBA order (`new(A1)`, `base(B1)`,
+  `base(B2)`, `new(A2)`, `MAIN_SHAPES`+`SMALL_SHAPES`+scattered, both
+  dtypes, 21 reps): geomean `base/new` = 0.962x, i.e. the fixed tree is
+  **~3.8% faster on plain-GEMM shapes on average**, no shape showing a
+  systematic one-sided regression (per-shape ratios ranged 0.96x-1.13x,
+  consistent with the ~10-14% canary spread the guard itself flagged --
+  the machine was not fully quiet, other orchestration work was running
+  concurrently on `ccqlin038` during this pass; see caveat below).
+  Artefacts: `benchmark/results/ccqlin038.flatironinstitute.org-2026-09-21/
+  real_path_guard_{newf2f1A_run{1,2},baseB_run{1,2}}.csv`.
+
+**Machine-load caveat.** `uptime` load average rose from ~1.4-1.9 to ~2.2-3.2
+over the course of this pass's measurements (other worktrees' concurrent
+benchmarking, per the shared-machine note in this task's brief). The canary
+spread on two of the four guard runs exceeded the guard's own 10% quiet-
+machine threshold. The ccsd_t_1_dim16 F2 speedup (~2x) and the F1 isolated
++8.9% are both far larger than that noise band and are trusted; the ABBA
+guard's ~3.8% aggregate improvement is closer to the noise floor and should
+be read as "no regression, and probably a small real win" rather than a
+tight number -- re-run on a quiet machine for a tighter figure if that
+matters later.
+
+### Artefacts
+
+- `benchmark/results/ccqlin038.flatironinstitute.org-2026-09-21/
+  bench_ccsd_t_store_*.csv`/`summary_*` (baseline-pre-f2, after-f2-f1 tags).
+- `benchmark/results/ccqlin038.flatironinstitute.org-2026-09-21/
+  real_path_guard_{newf2f1A,baseB}_run{1,2}.csv`.
+- `benchmark/results/ccqlin038.flatironinstitute.org-2026-09-21/profiles/
+  buckets_summary-A2-post-f2.txt`, `buckets_summary-A2-post-f1.txt`.
+- `benchmark/probes/probe_ccsd_t_stall_f2rule.jl` (prior pass, reused as the
+  predicate's correctness evidence for F2, unchanged this pass).
+
+### Gate
+
+Both fixes are small (F2 ~30 lines in one file, F1 one line in one file),
+each has a measured before/after matching or exceeding its prediction, the
+full suite is green including both named pinning tests, and the ABBA guard
+shows no regression. Committed to the `ccsd-t-stall` branch.

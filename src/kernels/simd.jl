@@ -128,7 +128,7 @@ compare with a tolerance, never `==`). `packed_a`/`packed_b` may be a
 a large accumulator register-resident — or any contiguous `AbstractVector{T}`
 such as a `Vector` or unit-range `view`.
 """
-function Base.accumulate(
+@inline function Base.accumulate(
         kernel::SIMDKernel{MR, NR, T, W}, acc::NTuple{NV, Vec{W, T}},
         packed_a::PA, packed_b::PB, kc::Int
     ) where {MR, NR, T, W, NV, PA, PB}

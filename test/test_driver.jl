@@ -1202,6 +1202,65 @@ end
     end
 end
 
+@testset "F2: run-length-aware kernel demotion (docs/decisions.md, \"F2\")" begin
+    # The `ccsd_t_1` fixture at dim 16 (benchmark/profile_to_suite.jl's
+    # `ccsd_t_1_dim16`/`ccsd_t_1_dim16_f32`): C's leading unit-stride run
+    # (labels a,i,j -- a is C-adjacent, i breaks it) is exactly 16, while
+    # Qm = 16^3 = 4096, so `Qm == run` never saves this case; only
+    # `run % mr(kernel) == 0` can.
+    d = 16
+    IA = (:i, :j, :m, :a)
+    IB = (:m, :k, :b, :c)
+    IC = (:a, :b, :c, :i, :j, :k)
+    (indA, indB, indC), _ = _lo_labels(IA, IB)
+
+    for (T, expect_mr) in ((Float64, 16), (Float32, 16))
+        # Float64's default (16,6,8) already has `run % mr == 0` (16 % 16 ==
+        # 0): F2 must NOT fire, so `expect_mr` is the UNCHANGED default.
+        # Float32's default is (32,6,16) -- `16 % 32 != 0` -- so F2 must
+        # demote to the LARGEST menu `mr` that still divides 16, which is
+        # `mr = 16` (the `(8,6,8)` shape also divides but is smaller and must
+        # lose), not the smallest.
+        A = randn(T, d, d, d, d)
+        B = randn(T, d, d, d, d)
+        C = zeros(T, d, d, d, d, d, d)
+        Av, Bv, Cv = StridedView(A), StridedView(B), StridedView(C)
+
+        plan = plan_contract(Cv, Av, indA, Bv, indB, indC)
+        @test mr(plan.kernel) == expect_mr
+
+        Cref = _lo_reference(C, Av, indA, Bv, indB, indC; alpha = 1.3, beta = -0.7)
+        Ctw = copy(C)
+        plan_tw = plan_contract(
+            StridedView(Ctw), Av, indA, Bv, indB, indC; kernel = plan.kernel
+        )
+        execute_tilewise!(plan_tw, 1.3, -0.7)
+        @test Ctw ≈ Cref
+
+        Cex = copy(C)
+        plan_ex = plan_contract(StridedView(Cex), Av, indA, Bv, indB, indC)
+        execute!(plan_ex, 1.3, -0.7)
+        @test Cex ≈ Cref
+    end
+
+    # Plain GEMM: `Qm == run` is always true (M's only label is C's own
+    # unit-stride axis), so F2 must never fire regardless of dtype/mr -- the
+    # kernel stays exactly `_default_kernel`'s choice.
+    for T in (Float64, Float32)
+        Ma, Ka, Na = 37, 11, 23
+        Amat = randn(T, Ma, Ka)
+        Bmat = randn(T, Ka, Na)
+        Cmat = zeros(T, Ma, Na)
+        Av, Bv, Cv = StridedView(Amat), StridedView(Bmat), StridedView(Cmat)
+        plan = plan_contract(Cv, Av, (1, 2), Bv, (2, 3), (1, 3))
+        @test plan.kernel === QuasiStrided._default_kernel(T, Ma, Na)
+
+        Cref = Amat * Bmat
+        execute!(plan, 1.0, 0.0)
+        @test Cmat ≈ Cref
+    end
+end
+
 @testset "label order: plain matmul is unchanged; a transposed output swaps" begin
     Ma, Ka, Na = 9, 4, 12
     Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
