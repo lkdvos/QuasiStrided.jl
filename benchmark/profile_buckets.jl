@@ -43,7 +43,7 @@ const SPECIFIC_QS_BUCKETS = [
             "_complex_kernel_from_shape", "default_blocking",
         ],
     ),
-    ("packing", ["pack_a!", "pack_b!", "_pack_panel!", "_pack_sliver!", "_pack_emit", "_check_pack_a", "_check_pack_b"]),
+    ("packing", ["pack_a!", "pack_b!", "_pack_panel!", "_pack_a_contiguous!", "_pack_sliver!", "_pack_emit", "_check_pack_a", "_check_pack_b"]),
     # "store_tile" (no trailing "!") deliberately catches all three store
     # entry points -- `store_tile!`, `_store_tile_scattered!`, and
     # `_store_tile_vector!` -- the last of which does NOT contain the

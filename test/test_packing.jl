@@ -849,3 +849,197 @@ end
     @test run_view(ScalarKernel) == (0, 0, 0, 0)
     @test run_view(SIMDKernel) == (0, 0, 0, 0)
 end
+
+# =====================================================================
+# Packing speed: the restructured
+# `_pack_panel!` (full-sliver branch / valid+zero split for tails) and the
+# `pack_a!` contiguous vector fast path (PackedPanel destination, dense
+# storage, unit-stride rows filling the whole tile, identity-like transform).
+# Every expected value below comes from direct storage indexing, never from
+# tile_load or from the other packing path.
+# =====================================================================
+
+using QuasiStrided: PackedPanel, packed_panel, PtrScatterAxis, _copies_unchanged,
+    _pack_a_contiguous_eligible, _pack_a_contiguous!
+
+# expected[i + MR*p + 1] for an A panel; padding rows are literal zero.
+function _oracle_packed_a(storage, base::Int, rowoffs::Vector{Int}, coloffs::Vector{Int}, MR::Int, transform, ::Type{T}) where {T}
+    kc, m = length(coloffs), length(rowoffs)
+    out = zeros(T, MR * kc)
+    for p in 0:(kc - 1), i in 0:(MR - 1)
+        i < m || continue
+        out[i + MR * p + 1] = convert(T, transform(storage[base + rowoffs[i + 1] + coloffs[p + 1] + 1]))
+    end
+    return out
+end
+# expected[j + NR*p + 1] for a B panel (source rows = K, cols = N).
+function _oracle_packed_b(storage, base::Int, rowoffs::Vector{Int}, coloffs::Vector{Int}, NR::Int, transform, ::Type{T}) where {T}
+    kc, n = length(rowoffs), length(coloffs)
+    out = zeros(T, NR * kc)
+    for p in 0:(kc - 1), j in 0:(NR - 1)
+        j < n || continue
+        out[j + NR * p + 1] = convert(T, transform(storage[base + rowoffs[p + 1] + coloffs[j + 1] + 1]))
+    end
+    return out
+end
+_offs(ax::AffineAxis) = [ax.base + t * ax.stride for t in 0:(ax.count - 1)]
+_offs(ax::ScatterAxis) = collect(ax.offsets[1:ax.count])
+_offs(ax::PtrScatterAxis) = [unsafe_load(ax.offsets, t + 1) for t in 0:(ax.count - 1)]
+_dense_storages(v::Vector{T}) where {T} = @static isdefined(Base, :Memory) ?
+    (v, (m = Memory{T}(undef, length(v)); copyto!(m, v); m)) : (v,)
+
+@testset "pack_a! fast-path gate predicates" begin
+    @test _copies_unchanged(identity, Float64)
+    @test _copies_unchanged(identity, ComplexF64)
+    @test _copies_unchanged(conj, Float64)
+    @test _copies_unchanged(conj, Float32)
+    @test !_copies_unchanged(conj, ComplexF64)   # conj is NOT the identity on complex
+    @test !_copies_unchanged(x -> -x, Float64)
+end
+
+@testset "pack_a!: PackedPanel destination vs direct indexing, eligible and ineligible gates" begin
+    for T in (Float64, Float32), MR in (4, 16)
+        kernel = KernelDescriptor(Val(MR), Val(3), T)
+        vals = T.(collect(1.0:2000.0))
+        for storage in _dense_storages(vals)
+            coloffs_scatter = [7, 900, 300, 1500]
+            colcases = Any[
+                AffineAxis(0, MR, 5), AffineAxis(0, 1, 3), AffineAxis(1800, -MR, 6),   # +, unit, negative stride
+                AffineAxis(40, 0, 4),                                                    # zero stride (broadcast K)
+                ScatterAxis(coloffs_scatter, 4),
+                PtrScatterAxis(pointer(coloffs_scatter), 4),
+            ]
+            rowoffs_contig = collect(0:(MR - 1))
+            rowcases = Any[
+                (AffineAxis(0, 1, MR), true), (AffineAxis(5, 1, MR), true),              # eligible: unit stride, full
+                (AffineAxis(0, 2, MR), false), (AffineAxis(MR + 3, -1, MR), false),      # stride != 1
+                (AffineAxis(0, 1, MR - 1), false), (AffineAxis(0, 1, 0), false),         # tail / empty
+                (ScatterAxis(rowoffs_contig, MR), false),                                 # contiguous but scattered type
+                (PtrScatterAxis(pointer(rowoffs_contig), MR), false),                     # the driver's scattered row axis
+            ]
+            transforms = Any[identity, conj, x -> -x]
+            for (rows, row_eligible) in rowcases, cols in colcases, transform in transforms, base in (0, 11)
+                kc = axis_length(cols)
+                src = SourceTile(storage, base, rows, cols)
+                expected = _oracle_packed_a(storage, base, _offs(rows), _offs(cols), MR, transform, T)
+                canary = T(-999)
+                buf = fill(canary, MR * kc + 8)
+                # The fast path must fire exactly when the row axis is eligible
+                # AND the transform is a straight copy on T -- and never for a
+                # Vector destination.
+                GC.@preserve buf coloffs_scatter rowoffs_contig begin
+                    panel = packed_panel(buf, 1, MR * kc)
+                    @test _pack_a_contiguous_eligible(panel, src, transform, nrows(src), Val(MR), T) ==
+                        (row_eligible && (transform === identity || transform === conj))
+                    @test !_pack_a_contiguous_eligible(buf, src, transform, nrows(src), Val(MR), T)
+                    pack_a!(panel, src, kernel, transform)
+                end
+                @test buf[1:(MR * kc)] == expected
+                @test all(==(canary), buf[(MR * kc + 1):end])
+                # The Vector destination (generic path) must agree with the panel.
+                vecdst = fill(canary, MR * kc)
+                GC.@preserve coloffs_scatter pack_a!(vecdst, src, kernel, transform)
+                @test vecdst == expected
+            end
+        end
+    end
+end
+
+@testset "_pack_a_contiguous! directly against the direct-indexing oracle" begin
+    # The fast path on its own (no gate in between): every column-axis kind,
+    # nonzero row base folded into `rowbase`, both dtypes, into a canaried
+    # panel that is a middle sliver of a larger buffer.
+    for T in (Float64, Float32), MR in (4, 16)
+        vals = T.(collect(1.0:2000.0))
+        koffs = [7, 900, 300, 1500]
+        for storage in _dense_storages(vals), base in (0, 11), rowbase in (0, 5)
+            rows = AffineAxis(rowbase, 1, MR)
+            for cols in Any[AffineAxis(0, MR, 5), AffineAxis(1800, -MR, 6), AffineAxis(40, 0, 4),
+                    ScatterAxis(koffs, 4), PtrScatterAxis(pointer(koffs), 4)]
+                kc = axis_length(cols)
+                expected = _oracle_packed_a(storage, base, _offs(rows), _offs(cols), MR, identity, T)
+                canary = T(-999)
+                buf = fill(canary, MR * kc + 16)
+                GC.@preserve buf koffs begin
+                    panel = packed_panel(buf, 9, MR * kc)
+                    _pack_a_contiguous!(panel, storage, base + rowbase, cols, Val(MR), kc)
+                end
+                @test buf[9:(8 + MR * kc)] == expected
+                @test all(==(canary), buf[1:8]) && all(==(canary), buf[(9 + MR * kc):end])
+            end
+        end
+    end
+end
+
+@testset "pack_a!/pack_b!: every tail width; values, literal-zero padding, transform never on padding" begin
+    kernel = KernelDescriptor(Val(8), Val(6), Float64)
+    MR, NR = mr(kernel), nr(kernel)
+    storage = collect(1.0:500.0)
+    calls = Ref(0)
+    counting = x -> (calls[] += 1; 3.0 * x)
+    for kc in (1, 5), dst in (:vector, :panel)
+        for m in 0:MR
+            src = SourceTile(storage, 20, AffineAxis(2, 3, m), AffineAxis(0, 40, kc))
+            expected = _oracle_packed_a(storage, 20, _offs(src.rows), _offs(src.cols), MR, x -> 3.0 * x, Float64)
+            buf = fill(-777.0, MR * kc + 4)
+            calls[] = 0
+            if dst === :vector
+                pack_a!(view(buf, 1:(MR * kc)), src, kernel, counting)
+            else
+                GC.@preserve buf pack_a!(packed_panel(buf, 1, MR * kc), src, kernel, counting)
+            end
+            @test buf[1:(MR * kc)] == expected
+            @test calls[] == m * kc
+            @test all(==(-777.0), buf[(MR * kc + 1):end])
+        end
+        for n in 0:NR
+            src = SourceTile(storage, 20, AffineAxis(0, 40, kc), AffineAxis(2, 3, n))
+            expected = _oracle_packed_b(storage, 20, _offs(src.rows), _offs(src.cols), NR, x -> 3.0 * x, Float64)
+            buf = fill(-777.0, NR * kc + 4)
+            calls[] = 0
+            if dst === :vector
+                pack_b!(view(buf, 1:(NR * kc)), src, kernel, counting)
+            else
+                GC.@preserve buf pack_b!(packed_panel(buf, 1, NR * kc), src, kernel, counting)
+            end
+            @test buf[1:(NR * kc)] == expected
+            @test calls[] == n * kc
+            @test all(==(-777.0), buf[(NR * kc + 1):end])
+        end
+    end
+end
+
+@testset "pack_a!/pack_b!: zero steady-state allocation on the driver's argument types" begin
+    # PackedPanel destination, dense storage (Memory on >= 1.11), AffineAxis /
+    # PtrScatterAxis axes, identity and conj -- the fast path and both
+    # `_pack_panel!` branches.
+    function run_driver_types(::Type{T}, MR, NR) where {T}
+        kernel = KernelDescriptor(Val(MR), Val(NR), T)
+        kc = 7
+        storage = _dense_storages(rand(T, 4000))[end]
+        koffs = [0, MR, 3 * MR, 2 * MR, 5 * MR, 4 * MR, 6 * MR]
+        bufa = zeros(T, MR * kc); bufb = zeros(T, NR * kc)
+        bytes = Int[]
+        GC.@preserve bufa bufb koffs begin
+            pa = packed_panel(bufa, 1, MR * kc); pb = packed_panel(bufb, 1, NR * kc)
+            full = SourceTile(storage, 0, AffineAxis(0, 1, MR), AffineAxis(0, MR, kc))
+            fullscat = SourceTile(storage, 0, AffineAxis(0, 1, MR), PtrScatterAxis(pointer(koffs), kc))
+            tail = SourceTile(storage, 0, AffineAxis(0, 1, MR - 1), AffineAxis(0, MR, kc))
+            strided = SourceTile(storage, 0, AffineAxis(0, 2, MR), AffineAxis(0, 2 * MR, kc))
+            bfull = SourceTile(storage, 0, AffineAxis(0, 1, kc), AffineAxis(0, kc, NR))
+            btail = SourceTile(storage, 0, AffineAxis(0, 1, kc), AffineAxis(0, kc, NR - 1))
+            for (src, tf) in ((full, identity), (full, conj), (fullscat, identity), (tail, identity), (strided, conj))
+                pack_a!(pa, src, kernel, tf)
+                push!(bytes, @allocated pack_a!(pa, src, kernel, tf))
+            end
+            for (src, tf) in ((bfull, identity), (btail, conj))
+                pack_b!(pb, src, kernel, tf)
+                push!(bytes, @allocated pack_b!(pb, src, kernel, tf))
+            end
+        end
+        return bytes
+    end
+    @test all(iszero, run_driver_types(Float64, 16, 6))
+    @test all(iszero, run_driver_types(Float32, 32, 6))
+    @test all(iszero, run_driver_types(Float64, 4, 3))
+end

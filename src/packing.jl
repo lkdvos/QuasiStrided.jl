@@ -88,14 +88,87 @@ end
 
 # Shared inner loop for pack_a!/pack_b!; `load`/`packed_offset` close over the
 # operand-specific index mapping. `kc == 0` is handled by the caller.
+#
+# `PD` (the physical dim: MR or NR) is a compile-time constant. A full sliver
+# (`valid == PD`) gets a constant-trip-count inner loop that LLVM fully
+# unrolls; a tail sliver writes its valid lanes and then its zero padding as
+# two separate loops. Either way no loop body holds a conditional load: the
+# previous `i < valid ? load : zero` select compiled to a per-element branch
+# around the load, which blocked if-conversion and kept the whole loop scalar
+# (1.3-1.7x on B, 1.5-2x on A's fallback, measured on ccqlin038 / Julia
+# 1.13 against the driver's argument types). The per-K-step store order
+# (0, 1, ..., PD-1) and the padding contract (padding lanes never read
+# `source` and never call `transform`) are unchanged.
 @inline function _pack_panel!(
-        packed::V, ::Type{T}, physical_dim::Int, kc::Int, valid::Int,
+        packed::V, ::Type{T}, ::Val{PD}, kc::Int, valid::Int,
         transform::F, load::L, packed_offset::P
-    ) where {V, T, F, L, P}
-    @inbounds for p in 0:(kc - 1)
-        for i in 0:(physical_dim - 1)
-            v = i < valid ? convert(T, transform(load(i, p)))::T : zero(T)
-            panel_store!(packed, packed_offset(i, p), v)
+    ) where {V, T, PD, F, L, P}
+    if valid == PD
+        @inbounds for p in 0:(kc - 1)
+            for i in 0:(PD - 1)
+                panel_store!(packed, packed_offset(i, p), convert(T, transform(load(i, p)))::T)
+            end
+        end
+    else
+        @inbounds for p in 0:(kc - 1)
+            for i in 0:(valid - 1)
+                panel_store!(packed, packed_offset(i, p), convert(T, transform(load(i, p)))::T)
+            end
+            for i in valid:(PD - 1)
+                panel_store!(packed, packed_offset(i, p), zero(T))
+            end
+        end
+    end
+    return packed
+end
+
+# `transform` is `identity` or `conj` (src/driver.jl, `plan_contract`). On a
+# real element type `conj` is the identity, so both admit a straight copy.
+# This is only the *value* half of the eligibility test: a straight copy is
+# vectorizable only in conjunction with the eltype/storage/destination
+# conditions in `_pack_a_contiguous_eligible` below.
+@inline _copies_unchanged(::typeof(identity), ::Type) = true
+@inline _copies_unchanged(::typeof(conj), ::Type{T}) where {T <: Real} = true
+@inline _copies_unchanged(::Any, ::Type) = false
+
+# Gate for `_pack_a_contiguous!`, kept as its own function so a test can
+# assert it fires for the driver's argument types and stays off for every
+# ineligible shape (test/test_packing.jl). All but `m == MR` and the stride
+# test fold at compile time (they inspect types only). `_unit_stride_rows`
+# (src/kernels/simd.jl) has methods for exactly the three `Axis` kinds and
+# deliberately NO fallback: an unknown axis type must be a MethodError here,
+# never a silent `true`/`false`.
+@inline function _pack_a_contiguous_eligible(
+        packed::V, source::QSTile, transform::F, m::Int, ::Val{MR}, ::Type{T}
+    ) where {V, F, MR, T}
+    return packed isa PackedPanel{T} && source.storage isa DenseVector{T} &&
+        _copies_unchanged(transform, T) && m == MR && _unit_stride_rows(source.rows)
+end
+
+# Fast path for the common A sliver: unit-stride rows filling the whole
+# register tile, straight copy, `PackedPanel` destination, dense storage --
+# every M-sliver of every column-major (or unit-stride-fastest multi-index) A
+# in the profiling pass. Each K step is then `MR` contiguous source elements
+# landing at `MR` contiguous packed offsets (`i + MR*p`), i.e. one
+# `Vec{MR,T}` load/store per K step. Padding never arises here (`m == MR`),
+# and `_check_pack_a` has already validated every address `base + rows.base +
+# i + col_offset(p)`, `0 <= i < MR`, against `length(storage)` -- exactly the
+# span each `vload` reads -- so nothing is read that the scalar path would not
+# have read. Measured 2-2.6x (Float64) / 4-7x (Float32) over the scalar loop
+# on the driver's argument types (ccqlin038 / Julia 1.13; `smallN_256x256x12`
+# went from 62% to 33% packing share and 16 to 35 GFLOP/s; docs/decisions.md,
+# "Packing speed"). Same eligibility shape as `_vector_store_eligible`
+# (src/kernels/simd.jl).
+@inline function _pack_a_contiguous!(
+        packed::PackedPanel{T}, storage::DenseVector{T}, rowbase::Int, cols::C,
+        ::Val{MR}, kc::Int
+    ) where {T, C, MR}
+    GC.@preserve storage begin
+        sp = pointer(storage)
+        dp = packed.ptr
+        for p in 0:(kc - 1)
+            v = vload(Vec{MR, T}, sp + sizeof(T) * (rowbase + axis_offset(cols, p)))
+            vstore(v, dp + sizeof(T) * (MR * p))
         end
     end
     return packed
@@ -120,9 +193,14 @@ function pack_a!(
     m, kc = _check_pack_a(packed, source, kernel)
     kc == 0 && return packed
 
+    if _pack_a_contiguous_eligible(packed, source, transform, m, Val(MR), T2)
+        rowbase = source.base + source.rows.base
+        return _pack_a_contiguous!(packed, source.storage, rowbase, source.cols, Val(MR), kc)
+    end
+
     load = (i, p) -> tile_load(source, i, p)
     packed_offset = (i, p) -> packed_a_offset(kernel, i, p)
-    _pack_panel!(packed, T2, MR, kc, m, transform, load, packed_offset)
+    _pack_panel!(packed, T2, Val(MR), kc, m, transform, load, packed_offset)
     return packed
 end
 
@@ -147,18 +225,20 @@ function pack_b!(
 
     load = (j, p) -> tile_load(source, p, j)  # source.rows=K, source.cols=N
     packed_offset = (j, p) -> packed_b_offset(kernel, j, p)
-    _pack_panel!(packed, T2, NR, kc, n, transform, load, packed_offset)
+    _pack_panel!(packed, T2, Val(NR), kc, n, transform, load, packed_offset)
     return packed
 end
 
 # ===========================================================================
 # Complex packing
 #
-# `_pack_panel!` above is deliberately UNTOUCHED and `_pack_panel_complex!`
-# below is a parallel loop rather than a generalisation of it, so that "the
-# real path is byte-identical" stays a `git diff` fact rather than an argument
-# (docs/decisions.md, "Complex element-type milestone"). Only the validation
-# preamble is shared, which cannot change either loop's generated code.
+# `_pack_panel_complex!` below is a parallel loop rather than a generalisation
+# of `_pack_panel!`, so that the complex milestone left the real path
+# byte-identical as a `git diff` fact rather than an argument
+# (docs/decisions.md, "Complex element-type milestone"); the later real-path
+# restructuring (full/tail split, contiguous A fast path) likewise left THIS
+# loop untouched. Only the validation preamble is shared, which cannot change
+# either loop's generated code.
 #
 # Everything below writes `real(T)` into the packed buffer. The `transform`
 # contract, frozen format-independently in that section:

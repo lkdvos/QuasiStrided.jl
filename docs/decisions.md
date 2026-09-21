@@ -4523,3 +4523,156 @@ explicitly out of scope for this pass, as before.
   `MAIN_SHAPES`/`SMALL_SHAPES`/`EXTRA_SHAPES`/dtype grid was not run).
 - Complex dtypes beyond the one Float32 case above (planar/1m kernels
   untouched by this pass).
+
+## Packing speed: vectorizing the real packing loop as it exists today (2026-09-21)
+
+Opened 2026-09-21 on branch `packing-speed` (worktree off `main` @ `f318eb9`),
+as a bounded follow-up to the profiling pass above, which put 62.7% of
+`smallN_256x256x12`'s time in `packing` alone. Question: can the packing
+code itself be made faster -- loop structure, vectorization, bounds-check
+placement -- *without* changing when or whether packing happens? (The
+"should we pack at all" question -- Octavian-style `dontpack`/`maybeinline`
+dispatch tiers -- is a separate track and was not touched.) Scope pinned in
+advance: `src/kernels/*.jl`, `src/target.jl`, `QuasiStridedBackend`'s
+hard-reject invariant and the complex packing loop all off-limits; a fix
+ships only if it is roughly <=50 lines in one `src/` file, has a *measured*
+win, and is fully verified (full suite, new tests against the scalar path
+as a reference across tail/padding combinations, re-profile).
+
+### Evidence: the scalar loop never vectorized, because of the conditional load
+
+`@code_llvm` on `pack_a!` at the driver's exact argument types
+(`PackedPanel{Float64}`, `QSTile{Memory{Float64},AffineAxis,AffineAxis}`,
+`KernelDescriptor{16,6,Float64}`, `identity`) showed no `<N x double>`
+anywhere: the old `_pack_panel!` body `v = i < valid ? load(i,p) : zero(T)`
+compiled to a per-element *branch* around the load (blocks `L64 -> L68
+(load) / L99 (phi with 0.0) -> store double ... align 1`, 16 trips per K
+step, loop bound compared against a runtime `valid`). A load under a
+condition cannot be if-converted without a masked load, so LLVM refused to
+vectorize the loop at all; every element paid a compare, a branch, a scalar
+load, a scalar store, and a `stride*i` multiply (the row stride is a runtime
+field). Micro-timing on the driver's types: 0.74-0.94 ns/element for A at
+Float64 vs 0.26-0.28 ns/element for `copyto!` of the same bytes. The
+baseline tree profile (`smallN_256x256x12-...-D1-probe.tree.txt`) had 30433
+of 42774 samples under `pack_a!`, split roughly 13.4k on the load+select
+line, 8.8k on the store line, 3.1k loop control.
+
+Tile geometry of the four profiled cases, read off their `ContractPlan`s:
+every one has an A whose M axis is unit-stride (column-major or
+unit-stride-fastest multi-index) and a `Memory{Float64}` storage, kernel
+`SIMDKernel{16,6,Float64,8}`, transforms `identity`/`identity`. So "unit-stride
+rows filling a full MR sliver, straight copy, `PackedPanel` destination" is
+the common A case, not a special one.
+
+### Change (`src/packing.jl` only; 40 non-comment lines)
+
+1. **`_pack_panel!` full/tail split.** The physical dim (MR or NR) is now a
+   `Val{PD}` compile-time constant, and the body has two branches: a full
+   sliver (`valid == PD`) runs a constant-trip inner loop with an
+   *unconditional* load, which LLVM fully unrolls (and, on the B side,
+   vectorizes as gathers); a tail sliver writes its `0:valid-1` values and
+   then its `valid:PD-1` literal zeros as two separate loops. No loop body
+   holds a conditional load any more. Per-K-step store order and the padding
+   contract (padding lanes never read `source`, never call `transform`) are
+   unchanged. This alone is 1.5-2x on A's fallback and 1.3-1.7x on B.
+2. **`_pack_a_contiguous!` fast path**, gated by `_pack_a_contiguous_eligible`:
+   `packed isa PackedPanel{T}` && `source.storage isa DenseVector{T}` &&
+   `_copies_unchanged(transform, T)` (`identity`, or `conj` on a real `T`)
+   && `m == MR` && `_unit_stride_rows(source.rows)`. Each K step is then one
+   `vload(Vec{MR,T})` from `base + rows.base + axis_offset(cols, p)` and one
+   `vstore` to `packed.ptr + MR*p` -- the column axis may be any `Axis`
+   (affine with any stride including negative/zero, or `PtrScatterAxis`);
+   only the row axis needs contiguity. Type-only tests fold at compile time.
+   The gate is its own function so a test can assert it *fires* for the
+   driver's argument types and stays off for every ineligible shape (a
+   review finding: without that, a silently broken gate would pass every
+   value test and only show up as a benchmark regression).
+
+**Why it is safe.** Padding never arises in the fast path (`m == MR`
+exactly). `_check_pack_a` runs first and `checked_tile_storage_bounds`
+validates every address `base + rows.base + i + col_offset(p)`, `0 <= i <
+MR`, against `length(storage)` -- exactly the span each `Vec{MR}` load
+covers -- so nothing is read that the scalar path would not have read.
+Negative or non-unit row strides fall through to the scalar path (a
+negative-stride "contiguous" run is not a forward vector load). `conj` on a
+real eltype is the identity, so the copy is exact; on a complex eltype
+`_copies_unchanged` is `false` (pinned by test). The destination is the
+borrowed `PackedPanel` pointer `execute!` already `GC.@preserve`s; the source
+is `GC.@preserve`d locally. `_unit_stride_rows` (src/kernels/simd.jl) has
+methods for exactly the three `Axis` kinds and deliberately no fallback, so
+an unknown axis type is a `MethodError`, never a silent default.
+`_pack_panel_complex!` is untouched (its header comment now says so).
+
+### Measured
+
+Micro (driver argument types, min of 1000 reps, ccqlin038, Julia 1.13.0,
+shared machine at load ~4-5/32):
+
+| pack | shape | before | after | ratio |
+|---|---|---|---|---|
+| A, Float64 MR=16 | 256x256 | 48.7 us | 18.5 us (`copyto!`: 17.7 us) | 2.6x |
+| A, Float64 | 225x225 (tail slivers) | 33.8 us | 13.8 us | 2.5x |
+| A, Float64 | 4096x16 | 55.0 us | 28.1 us | 2.0x |
+| A, Float32 MR=32 | 256x256 | 36.6 us | 5.3 us | 7.0x |
+| B, Float64 NR=6 | 256x12 | 1.55 us | 1.03 us | 1.5x |
+| B, Float64 | 225x225 | 26.1 us | 18.8 us | 1.4x |
+
+Re-profile with `benchmark/profile_to_suite.jl`, tags `D1-probe` (before) and
+`D1-post` (after), same session; artefacts under
+`benchmark/results/ccqlin038.flatironinstitute.org-2026-09-21/profiles/*-D1-{probe,post}.*`:
+
+| case | GFLOP/s before -> after | packing share | microkernel share |
+|---|---|---|---|
+| `smallN_256x256x12` | 16.0 -> **34.6** (2.2x) | 62.1% -> **32.8%** | 21.9% -> 40.3% |
+| `scattered_64` | 39.3 -> **51.6** (1.3x) | 25.7% -> **7.0%** | 57.5% -> 71.5% |
+| `ao2mo_2_dim16` | 11.7 -> **14.5** (1.2x) | 34.2% -> **10.1%** | 27.5% -> 42.5% |
+| `dim15_2_2_2` | 46.0 -> **49.4** (1.07x) | 19.5% -> **11.2%** | 70.1% -> 76.5% |
+
+Post-change, ~90% of `smallN`'s remaining packing samples sit inside
+`SIMD.vload`/`vstore` -- i.e. plain data movement at ~35 GB/s against
+`copyto!`'s ~60 GB/s -- so the loop is no longer the problem; what is left
+is memory traffic that only "don't pack A for small N" removes. Note the
+`D1-probe` baseline for `smallN` (16.0 GFLOP/s) came in below the earlier
+`r1` figure (19.0) on a busier machine; the relative packing-share drop and
+the 2x micro-timings are far outside that noise and were reproduced in three
+separate micro-runs.
+
+### Tests added (`test/test_packing.jl`)
+
+Gate-predicate unit tests (incl. `conj` on `ComplexF64` is NOT a straight
+copy); a PackedPanel-vs-direct-indexing oracle over `{Float64,Float32} x MR
+in {4,16} x {Vector,Memory} storage x 8 row cases (eligible unit-stride at
+two bases / stride 2 / negative / tail / empty / contiguous-but-`ScatterAxis`
+/ contiguous-but-`PtrScatterAxis`) x 6 column cases (affine +/unit/negative/
+zero stride, `ScatterAxis`, `PtrScatterAxis`) x {identity, conj, x->-x} x 2
+tile bases`, asserting at each point that the gate evaluates to exactly
+`row_eligible && transform in (identity, conj)` for the panel and `false` for
+a `Vector` destination, that the panel and the `Vector` path agree with the
+oracle, and that a suffix canary is untouched; `_pack_a_contiguous!` called
+directly against the oracle into a middle sliver of a canaried buffer; every
+tail width `m in 0:MR`, `n in 0:NR` for both destination kinds with
+literal-zero padding and a call-counting transform; zero steady-state
+allocation on the driver's exact argument types (PackedPanel + Memory +
+Affine/PtrScatter, identity and conj, full/tail/strided) for (16,6,F64),
+(32,6,F32), (4,3,F64). `benchmark/profile_buckets.jl`'s "packing" bucket
+also names `_pack_a_contiguous!` explicitly so the attribution does not
+depend on the `pack_a!` ancestor frame surviving inlining.
+
+### Not done, flagged for later
+
+- **Per-sliver validation cost on tiny tiles.** `checked_tile_storage_bounds`
+  + `axis_offset_range` + `_check_pack_a/b` self-time is 7.4% of
+  `ao2mo_2_dim16` (K extent 16 = one MR sliver of 256 elements per call),
+  3.2% of `scattered_64`, ~1% elsewhere. Hoisting the storage-bounds check
+  to once per macro block in `_execute_nest!` would remove it, but needs an
+  unchecked internal `pack_a!` entry point and so changes the public
+  "all validation before any write" contract -- a separate decision.
+- **B-side loop order** (`j` outer / `p` inner, contiguous source reads for
+  unit-stride K) measured 1.1-1.4x over the old loop but no better than the
+  full-sliver branch above on the same shapes; dropped.
+- **Complex packing** (`_pack_panel_complex!`) has the same per-element
+  `if t < valid` and would take the same full/tail split, plus a
+  deinterleaving vector path for planar A with unit-stride rows; untouched,
+  needs its own tests against `test/test_packing_complex.jl`'s oracle.
+- `ao2mo_2_dim16`'s largest non-kernel bucket is now `driver_loop` (28.7%:
+  `fill_offsets!`/`describe_block`/`_classify_slivers!`), outside this task.
