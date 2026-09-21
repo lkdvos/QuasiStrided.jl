@@ -1,18 +1,34 @@
 # Profiles QuasiStridedBackend() vs StridedBLAS() on tensor-contraction
-# cases drawn from the upstream TensorOperationsBenchmarks suite, bucketing
-# sampled cost into adapter/planning/packing/microkernel/store/blas/etc.
+# cases drawn from the upstream TensorOperationsBenchmarks suite plus a few
+# of this project's own benchmark/harness.jl shapes (plain square GEMM,
+# small-skewed, and the permuted/negative-stride/sliced "scattered" fixture),
+# bucketing sampled cost into adapter/planning/packing/microkernel/store/
+# blas/etc.
 #
 #   julia --project=benchmark benchmark/profile_to_suite.jl [caseid ...]
 #
-# With no case ids, profiles every case in CASES below; edit that list to
-# add/replace cases. Writes flat/tree profiles, an optional ProfileCanvas
+# With no case ids, profiles every case in CASES and DIRECT_CASES below; edit
+# those lists to add/replace cases. CASES goes through the TensorOperations
+# adapter, profiled under both QuasiStridedBackend() and StridedBLAS();
+# DIRECT_CASES calls `plan_contract`/`execute!` directly (no adapter, no
+# backend choice) for fixtures `harness.jl` builds directly rather than as
+# plain labels/dims. Writes flat/tree profiles, an optional ProfileCanvas
 # HTML flamegraph, and a bucket table per (case, backend) to
 # benchmark/results/<hostname>-<date>/profiles/.
 #
 # CAVEAT: with `C=true`, Julia's profiler also samples idle helper threads
-# (GC/IO, sitting in `__futex_abstimed_wait_common`), inflating "other" --
-# this does not steal samples from named buckets (leaf/self-time only), so
-# named-bucket percentages stay reliable even when "other" is large.
+# (GC/IO, sitting in `__futex_abstimed_wait_common`). `profile_buckets.jl`'s
+# `compute_buckets` classifies by walking each sample's whole backtrace (not
+# just its leaf frame -- see that file's module docstring for why), so an
+# idle thread's samples still land in "other" rather than stealing from a
+# named bucket, but they are not filtered out by thread id, so a busy
+# machine can inflate "other" here. Re-run on a quiet machine if "other" is
+# large and unexplained.
+#
+# NOTE: each run OVERWRITES the previous one's artefacts for the same case
+# (fixed filenames under `results_dir()`); pass `--tag <label>` to suffix
+# every output file for this run instead, so repeated runs (e.g. for a
+# reproducibility check) don't clobber each other.
 
 using Profile
 using TensorOperations
@@ -58,10 +74,79 @@ const CASES = [
         ),
         dtype = Float32,
     ),
+    # C[m,n] = A[m,k] * B[k,n] -- plain square GEMM, large and compute-bound
+    # by construction; the reference point for "what does the microkernel
+    # share look like when there's nothing else to do."
+    (
+        id = "plain_256",
+        IA = [:m, :k], IB = [:k, :n], IC = [:m, :n],
+        dims = Dict(:m => 256, :k => 256, :n => 256),
+        dtype = Float64,
+    ),
+    (
+        id = "plain_512",
+        IA = [:m, :k], IB = [:k, :n], IC = [:m, :n],
+        dims = Dict(:m => 512, :k => 512, :n => 512),
+        dtype = Float64,
+    ),
+    # Same GEMM shape, but N=12: STATUS.md's "Next task" flags this as the
+    # regime where packing/per-call overhead, not the microkernel, dominates.
+    (
+        id = "smallN_256x256x12",
+        IA = [:m, :k], IB = [:k, :n], IC = [:m, :n],
+        dims = Dict(:m => 256, :k => 256, :n => 12),
+        dtype = Float64,
+    ),
 ]
 
-const SELECTED_IDS = filter(a -> !startswith(a, "--"), ARGS)
+# Cases that go through `plan_contract`/`execute!` directly (bypassing the
+# TensorOperations adapter entirely), for fixtures that aren't expressible as
+# a plain label/dims dict -- e.g. `harness.jl`'s permuted-A/negative-stride-B/
+# sliced-C fixture. `builder(T, rng)` must return the `(Av, indA, Bv, indB,
+# Cv, indC)` tuple `plan_contract` expects (see `benchmark/harness.jl`,
+# `build_plain`/`build_scattered`). Profiled once, unbucketed by backend
+# (there is no backend choice on this path), under the pseudo-backend name
+# `"QuasiStridedDirect"` so `profile_buckets.jl`'s QuasiStrided bucket set
+# applies (its `adapter/prepare`/`TO overhead` buckets simply read 0 here,
+# since no TensorOperations frame is ever on the stack).
+const DIRECT_CASES = [
+    (
+        id = "scattered_64", dtype = Float64,
+        builder = (T, rng) -> build_scattered(T, rng),
+        # F[a,b,n] = A[a,b,k] * B[k,n] in `harness.jl`'s naming (a_n=64,
+        # k_n=64, b_n=16, n_n=64): 2 * a_n*b_n*n_n (output) * k_n (contracted).
+        flops = 2.0 * 64 * 16 * 64 * 64,
+    ),
+]
+
+function _argopt(name::String, default::String)
+    pfx = "--$(name)="
+    for (i, a) in enumerate(ARGS)
+        startswith(a, pfx) && return a[(length(pfx) + 1):end]
+        if a == "--$(name)" && i < length(ARGS)
+            return ARGS[i + 1]
+        end
+    end
+    return default
+end
+
+const TAG = _argopt("tag", "")
+_tagged(base::String) = isempty(TAG) ? base : base * "-" * TAG
+
+const SELECTED_IDS = filter(
+    a -> !startswith(a, "--") && !(a == TAG && !isempty(TAG)), ARGS
+)
 const SELECTED_CASES = isempty(SELECTED_IDS) ? CASES : filter(c -> c.id in SELECTED_IDS, CASES)
+const SELECTED_DIRECT_CASES = isempty(SELECTED_IDS) ? DIRECT_CASES : filter(c -> c.id in SELECTED_IDS, DIRECT_CASES)
+
+# 2 * (product of C's extents) * (product of the contracted extents) --
+# the standard GEMM-equivalent flop count for one tensor contraction.
+function case_flops(case)
+    contracted = [l for l in case.IA if l in case.IB && !(l in case.IC)]
+    nC = prod(case.dims[l] for l in case.IC; init = 1)
+    nK = prod(case.dims[l] for l in contracted; init = 1)
+    return 2.0 * nC * nK
+end
 
 const BACKENDS = [
     ("QuasiStridedBackend", QuasiStridedBackend()),
@@ -108,7 +193,10 @@ end
 
 Warm up, profile >=2s of repeated `tensorcontract!` calls under `backend`,
 write flat/tree profiles, an `@allocated` figure, an optional ProfileCanvas
-flamegraph, and a bucket table (also appended to `io_summary`).
+flamegraph, and a bucket table (also appended to `io_summary`). Also takes
+a separate, harness-standard (>=15-rep median) timing measurement -- used
+for the printed GFLOP/s figure, so it does not depend on the single
+untimed call used only to size the profiling loop's rep count.
 """
 function profile_one!(io_summary, case, backendname, backend)
     rng = Random.Xoshiro(0x5eed_5eed)
@@ -117,6 +205,9 @@ function profile_one!(io_summary, case, backendname, backend)
     α, β = one(T), zero(T)
 
     call!() = tensorcontract!(C, A, pA, false, B, pB, false, pAB, α, β, backend)
+
+    median_s = median_time_s(call!; reps = 15)
+    gflops = case_flops(case) / median_s / 1.0e9
 
     call!()  # warm up
     call!()
@@ -141,7 +232,7 @@ function profile_one!(io_summary, case, backendname, backend)
     data = Profile.fetch(include_meta = false)
     total_samples = count(iszero, data)
 
-    base = joinpath(PROFILE_DIR, "$(case.id)-$(backendname)")
+    base = joinpath(PROFILE_DIR, _tagged("$(case.id)-$(backendname)"))
 
     open(base * ".flat.txt", "w") do io
         Profile.print(io, format = :flat, sortedby = :count, C = true)
@@ -155,24 +246,98 @@ function profile_one!(io_summary, case, backendname, backend)
     buckets = compute_buckets(data, backendname)
 
     open(base * ".buckets.txt", "w") do io
+        @printf(io, "measured (median of 15 reps): %.9f s/call  %.3f GFLOP/s\n", median_s, gflops)
         print_bucket_table(io, case.id, backendname, buckets, total_samples, allocated_bytes, reps)
     end
+    @printf(stdout, "measured (median of 15 reps): %.9f s/call  %.3f GFLOP/s\n", median_s, gflops)
     print_bucket_table(stdout, case.id, backendname, buckets, total_samples, allocated_bytes, reps)
     print_bucket_table(io_summary, case.id, backendname, buckets, total_samples, allocated_bytes, reps)
 
     return (
         case_id = case.id, backend = backendname, total_samples = total_samples,
         allocated_bytes = allocated_bytes, reps = reps, canvas_ok = canvas_ok,
-        buckets = buckets,
+        buckets = buckets, median_s = median_s, gflops = gflops,
+    )
+end
+
+"""
+    profile_one_direct!(io_summary, case)
+
+Same as `profile_one!`, but for a `DIRECT_CASES` entry: builds the fixture
+via `case.builder`, plans once with `plan_contract` (default kernel/blocking),
+and profiles repeated `execute!` calls -- no TensorOperations adapter, no
+backend choice.
+"""
+function profile_one_direct!(io_summary, case)
+    backendname = "QuasiStridedDirect"
+    rng = Random.Xoshiro(0x5eed_5eed)
+    T = case.dtype
+    fx = case.builder(T, rng)
+    Av, indA, Bv, indB, Cv, indC = fx.Av, fx.indA, fx.Bv, fx.indB, fx.Cv, fx.indC
+    plan = plan_contract(Cv, Av, indA, Bv, indB, indC)
+    α, β = one(T), zero(T)
+
+    call!() = execute!(plan, α, β)
+
+    median_s = median_time_s(call!; reps = 15)
+    gflops = case.flops / median_s / 1.0e9
+
+    call!()  # warm up
+    call!()
+    allocated_bytes = @allocated call!()
+
+    t0 = time_ns()
+    call!()
+    t1 = time_ns()
+    per_call_s = max((t1 - t0) / 1.0e9, 1.0e-6)
+    reps = max(1, ceil(Int, 2.0 / per_call_s))
+
+    Profile.init(n = 10^7, delay = 1.0e-4)
+    Profile.clear()
+    Profile.@profile begin
+        for _ in 1:reps
+            call!()
+        end
+    end
+
+    data = Profile.fetch(include_meta = false)
+    total_samples = count(iszero, data)
+
+    base = joinpath(PROFILE_DIR, _tagged("$(case.id)-$(backendname)"))
+
+    open(base * ".flat.txt", "w") do io
+        Profile.print(io, format = :flat, sortedby = :count, C = true)
+    end
+    mincount = max(1, round(Int, 0.01 * total_samples))
+    open(base * ".tree.txt", "w") do io
+        Profile.print(io, format = :tree, C = true, mincount = mincount)
+    end
+
+    canvas_ok = try_profilecanvas_html(base * ".html")
+    buckets = compute_buckets(data, backendname)
+
+    open(base * ".buckets.txt", "w") do io
+        @printf(io, "measured (median of 15 reps): %.9f s/call  %.3f GFLOP/s\n", median_s, gflops)
+        print_bucket_table(io, case.id, backendname, buckets, total_samples, allocated_bytes, reps)
+    end
+    @printf(stdout, "measured (median of 15 reps): %.9f s/call  %.3f GFLOP/s\n", median_s, gflops)
+    print_bucket_table(stdout, case.id, backendname, buckets, total_samples, allocated_bytes, reps)
+    print_bucket_table(io_summary, case.id, backendname, buckets, total_samples, allocated_bytes, reps)
+
+    return (
+        case_id = case.id, backend = backendname, total_samples = total_samples,
+        allocated_bytes = allocated_bytes, reps = reps, canvas_ok = canvas_ok,
+        buckets = buckets, median_s = median_s, gflops = gflops,
     )
 end
 
 function main()
-    summary_path = joinpath(PROFILE_DIR, "buckets_summary.txt")
+    summary_path = joinpath(PROFILE_DIR, _tagged("buckets_summary") * ".txt")
     results = []
     open(summary_path, "w") do io_summary
         println(io_summary, "# Bucketed cost-attribution summary")
-        println(io_summary, "# generated $(Dates.now()) on $(gethostname())")
+        print_env_header(io_summary, "profile_to_suite.jl")
+        println(io_summary, "git_commit = ", git_commit())
         println(io_summary)
         for case in SELECTED_CASES
             for (backendname, backend) in BACKENDS
@@ -180,6 +345,11 @@ function main()
                 r = profile_one!(io_summary, case, backendname, backend)
                 push!(results, r)
             end
+        end
+        for case in SELECTED_DIRECT_CASES
+            @info "Profiling" case = case.id backend = "QuasiStridedDirect"
+            r = profile_one_direct!(io_summary, case)
+            push!(results, r)
         end
     end
     @info "Done" summary_path profile_dir = PROFILE_DIR

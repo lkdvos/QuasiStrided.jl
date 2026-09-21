@@ -4282,3 +4282,244 @@ expected to be unchanged at `35168/35168`, 0 failed/errored).
   working record of what motivated the fix. One clarifying paragraph was
   added near the top of that script's Arms list this milestone, without
   rewriting the arms themselves.
+
+## Profiling pass: where does QuasiStrided spend its time? (2026-09-21)
+
+Opened 2026-09-21 directly on `main`. Goal: reuse the bucketed profiler built
+on the (now-merged) `upstream-bench` branch to get a general-purpose,
+artefact-traced answer to "how much of QuasiStrided's own time is spent in
+the microkernel vs. everything else" across a handful of representative
+benchmark cases, rather than relying only on the isolated micro-benchmarks
+behind STATUS.md's "Next task" claim ("packing and per-call overhead is now
+the whole gap"). No `src/` change; benchmark-tooling only.
+
+### T0: merged `upstream-bench` (PR #5) into `main`
+
+`git merge-tree` showed only two conflicts, both append-only docs
+(`STATUS.md`, this file); every `benchmark/*.jl` file merged cleanly,
+including keeping `main`'s own later additions (`bench_ccsd_t_store.jl`,
+`bench_store_path.jl`, `probes/`) untouched, since the branch never touched
+those paths. Resolved both doc conflicts by keeping both sides' sections in
+chronological order (no content dropped). `Pkg.test()` on the merged tree:
+35170/35170 passing. Pushed directly to `main` (merge commit `19dd25c`);
+GitHub auto-detected and closed PR #5 as merged.
+
+**Scope note, found while resolving the merge and confirmed with the user
+before proceeding**: the branch is not purely benchmark tooling. A later
+commit on it (`3428c61`, "QuasiStridedBackend: fall back to StridedNative
+for tensoradd!/tensortrace!") reverses clause 1 of "Hard-reject, never fall
+back" (see "Amendment 7" above) -- a real `src/tensoroperations.jl` behavior
+change, done "at the user's explicit direction" per its own commit message
+in an earlier session, tested (34656/34656 passing at the time) and
+documented (Amendment 7, above), but never reflected in PR #5's own GitHub
+description. Merged in as-is per the user's explicit choice when asked.
+
+### T2: extended `benchmark/profile_to_suite.jl`'s case coverage
+
+Added three label/dims cases to `CASES` (`plain_256`, `plain_512`: plain
+square GEMM at the two largest `MAIN_SHAPES` sizes; `smallN_256x256x12`:
+the exact shape STATUS.md's "Next task" cites as 16 vs. Octavian's 87
+GFLOP/s), and one new `DIRECT_CASES` list + `profile_one_direct!` for
+fixtures that go through `plan_contract`/`execute!` directly rather than
+the TensorOperations adapter -- specifically `harness.jl`'s
+`build_scattered` fixture (permuted A, negative-stride B, sliced-with-offset
+C), which isn't expressible as a plain label/dims dict. `profile_buckets.jl`
+was **not** left unchanged as originally planned -- see the two corrections
+below (the second found by an independent review of the first).
+
+### Correction 1 (found during T2 smoke-testing): leaf-only classification was wrong for compute-bound cases
+
+The merged `profile_buckets.jl` classified each sample by its **leaf frame
+only** (documented as deliberate self-time attribution, to avoid
+inclusive/"Count"-column double-counting). Smoke-testing the new `plain_512`
+case (a 512³ square GEMM, compute-bound by construction) exposed why that's
+wrong: it measured **3.48% microkernel, 94.15% "other"** -- worse than
+every small/skewed case, which should be impossible for a plain dense
+matmul. The `.flat.txt` dump's self-time column showed the actual hot leaf
+frames were `@SIMD/…/LLVM_intrinsics.jl` (`fmuladd`, `vload`, vector
+construction) directly beneath `_accumulate_step`/`accumulate`
+(`src/kernels/simd.jl:80,138`) in the tree profile -- i.e. genuine FMA-loop
+work, but attributed to zero named bucket because the leaf instruction lives
+in the `SIMD.jl` *package's own* source file, which carries neither
+"kernels/" nor "accumulate" in its path. Leaf-only self-time systematically
+undercounts "microkernel" whenever the actual hot instruction is an inlined
+third-party intrinsic. First fix: walk each sample's backtrace leaf-to-root
+and take the first frame matching a named bucket by EITHER function name or
+file substring, instead of checking only the leaf.
+
+### Correction 2 (found by an `orch-reviewer` pass on Correction 1, before committing): file-level catch-alls swallow more-specific ancestors
+
+An independent review of Correction 1 (before any of this was committed)
+found that a single leaf-to-root pass checking function-name-or-file
+substrings together, first-match-wins, has the same problem one level up:
+`profile_buckets.jl`'s `"microkernel"` bucket has a bare `"kernels/"`
+file-path catch-all, and `"planning"` has a bare `"driver.jl"` catch-all.
+A generic, unnamed frame (e.g. a `macro expansion` thunk inside
+`_store_tile_vector!`'s generated body, still in `src/kernels/simd.jl`)
+would match `"kernels/"` immediately and stop the walk right there --
+never reaching `_store_tile_vector!` itself one frame further up, which
+should have classified it as `"store"`. Quantified by the reviewer against
+Correction 1's own artefacts: `ccsd_t_1_dim16_f32`'s true store-path share
+was ~74-76% self-time (`_store_tile_scattered!`/`_axpby_tile!`), not the
+37.9% Correction 1 reported -- the difference had been silently absorbed
+into "microkernel". Similarly, `"driver.jl"` absorbed the entire executed
+macro-blocking loop nest (`_execute_nest!`, `execute!`, per-block
+bookkeeping) into "planning", inflating that bucket 4-5x over the actual
+one-time `plan_contract` cost (`ao2mo_2_dim16`: reviewer measured
+`plan_contract` inclusive at ~5% vs. a reported "planning" bucket of ~21%).
+The reviewer also found: a missing store-path substring (`_store_tile_vector!`
+does not contain the literal substring `"store_tile!"` -- the `!` lands
+after "vector", not "tile" -- so it matched nothing until the `"kernels/"`
+catch-all grabbed it under Correction 1); an overclaimed noise excuse (18-20%
+below the historical isolated-GFLOP/s claim is well outside this project's
+own "~10% is noise" convention, and this run was on Julia 1.13.0 while every
+prior measurement was 1.12.6 -- a live, unmentioned confound); two headline
+GFLOP/s figures with no artefact on disk to trace them to; and that
+`profile_to_suite.jl` used fixed output filenames, so a same-day repeat
+silently overwrote the first repeat's artefacts (`.claude/orchestration/profiling-pass.md`'s
+claim of "two repeats' worth of artefacts" was therefore false for the run
+it described).
+
+**Second fix** (`benchmark/profile_buckets.jl`): split each backend's bucket
+list into `SPECIFIC_*_BUCKETS` (function-name substrings only -- unambiguous
+regardless of which file a frame happens to live in) and `FALLBACK_*_BUCKETS`
+(the old file-level catch-alls). `_classify_backtrace` now runs the SPECIFIC
+pass across a sample's *entire* stack first; only if nothing anywhere in the
+stack matches specifically does it re-walk the same stack allowing FALLBACK
+matches. This is what makes the generated store body classify correctly:
+its `macro expansion` leaf matches nothing specific, but continuing the walk
+(still within the specific-only pass) reaches `_store_tile_vector!` itself.
+Also: added the missing `"store_tile"` (no bang) substring; split the old
+`"planning"` bucket into `"planning"` (the one-time `plan_contract`
+construction: `_classify_labels`, `_order_free_labels`, `_default_kernel`,
+`default_blocking`, ...) and a new `"driver_loop"` bucket (the *executed*
+macro-blocking nest: `_execute_nest!`, `execute!`, `_axis_of`,
+`_classify_slivers!`, `fill_offsets!`, ...); tightened several
+over-broad substrings the reviewer flagged as latent risks (bare `"gc"`,
+`"promote"`, `"StridedView"`, `"tile_offset"`) even though none of them were
+empirically wrong in this run. Also (in `profile_to_suite.jl`): added a
+`--tag` flag so repeated runs no longer overwrite each other's artefacts,
+and a proper >=15-rep `median_time_s` measurement (reused from `harness.jl`,
+independent of the profiling loop's own untimed rep-count heuristic) whose
+GFLOP/s figure is now printed directly into every `.buckets.txt` file, so
+every throughput number below has an on-disk source.
+
+**Net effect of both fixes, `plain_512`**: microkernel 3.48% (leaf-only) ->
+84.90-86.11% (Correction 1, file-catch-all-first) -> ~80.3-80.4% + a
+correctly separated ~4.6-5.1% `store` (Correction 2). `ccsd_t_1_dim16_f32`:
+59.0% microkernel / 37.9% store (Correction 1) -> 16.3-16.8% microkernel /
+75.1-75.6% store (Correction 2) -- confirming the reviewer's prediction that
+this case is store-dominated, not compute-dominated, by roughly 4:1. All
+numbers below are post-both-fixes, from a fresh two-repeat run.
+
+### T3: run and triage (two repeats `r1`/`r2`, `ccqlin038`, 2026-09-21, Julia 1.13.0)
+
+Every case reproduced within ~5 percentage points across two independent
+runs (`--tag r1`/`--tag r2`, non-overwriting) on any bucket >=10% share
+(the largest drift was `ao2mo_2_dim16`'s `driver_loop`, 21.5% vs. 25.0%);
+every bucket table's own sanity line summed to 100.00%; "other" <=0.21%
+everywhere. Artefacts:
+`benchmark/results/ccqlin038.flatironinstitute.org-2026-09-21/profiles/*-r{1,2}.{flat,tree,buckets}.txt`,
+GFLOP/s figures quoted below are each traceable to that case's own
+`.buckets.txt` (repeat 1) on disk.
+
+Verdict rule (fixed before looking at the corrected numbers): **compute-bound**
+requires microkernel+store share >=80% *and* in-situ kernel-path throughput
+(achieved GFLOP/s / (microkernel+store) share) within 80% of a same-day
+isolated reference; **kernel-stalled** if the share threshold passes but the
+throughput leg does not (the "compute path" bucket is large, but per-sample
+throughput inside it is far below what an isolated kernel call reaches --
+i.e. it isn't actually issuing FMAs efficiently, more likely stalled on
+scattered stores or cache misses); otherwise **overhead-bound**, naming the
+dominant non-kernel bucket. Isolated same-day reference
+(`benchmark/bench_store_path.jl --batch 5000 --reps 9 --skip-native`,
+shipped default shapes, kc=256): Float64 `(16,6,8)`: 63.77 GFLOP/s as a
+plain `Vector`, 82.66 GFLOP/s as a `PackedPanel` (the driver's actual
+representation); Float32 `(32,6,16)`: 108.31 / 159.50 GFLOP/s. Neither
+Float64 figure matched the historical "101-103 GFLOP/s" claim on this run
+(reported honestly by that script's own repro check) -- this is an 18-23%
+gap, outside this project's own "~10% is noise" convention, so it is NOT
+waved off as noise here; the most likely explanation is that this run used
+Julia 1.13.0, while every prior measurement in this project used 1.12.6 --
+a codegen/inlining difference between compiler versions is a live,
+unconfirmed alternative to a real regression, and re-measuring on 1.12.6 is
+a natural follow-up, not done this pass.
+
+| case (backend=QuasiStrided unless noted) | achieved GFLOP/s | microkernel | store | driver_loop | packing | planning | verdict |
+|---|---|---|---|---|---|---|---|
+| `plain_512` (512³ GEMM) | 61.6 | 80.4% | 4.6% | 3.6% | 11.3% | 0.2% | **compute-bound**: combined share 85.0%; in-situ = 61.6/0.850 = 72.5 GFLOP/s = 87.7% of the 82.66 GFLOP/s isolated (`PackedPanel`) reference |
+| `plain_256` (256³ GEMM) | 54.5 | 73.0% | 3.4% | 3.7% | 18.5% | 0.9% | overhead-bound: combined share 76.4% (just under the 80% threshold); named bucket: packing |
+| `scattered_64` (permuted/negative-stride/sliced, direct path) | 41.7 | 57.5% | 9.6% | 8.3% | 24.5% | 0.0% | overhead-bound: packing (share 67.1%) |
+| `ccsd_t_1_dim16` (six-index output, post label-order fix) | 17.4 | 63.8% | 16.1% | 17.0% | 3.0% | 0.1% | **kernel-stalled**, not compute-bound: combined share 79.9% (borderline) but in-situ = 17.4/0.799 = 21.8 GFLOP/s = only 26% of the 82.66 GFLOP/s isolated reference -- the throughput leg fails decisively even though the share leg is close to passing |
+| `ccsd_t_1_dim16_f32` (same shape, Float32) | 15.9 | 16.8% | 75.1% | 7.0% | 1.0% | 0.1% | overhead-bound: **store**, decisively -- combined share is nominally 91.9%, but it is store, not FMA work, that dominates it (in-situ throughput would be 15.9/0.919 = 17.3 GFLOP/s, 10.8% of the Float32 isolated reference, confirming this is not "fast work counted as compute") |
+| `dim15_2_2_2` (rank-4, GEMM-like, dim=15) | 46.9 | 71.5% | 4.4% | 4.4% | 17.7% | 1.5% | overhead-bound: combined share 75.9% (just under threshold); named bucket: packing |
+| `ao2mo_2_dim16` (small multi-index) | 11.9 | 28.4% | 9.8% | 21.5% | 33.5% | 4.5% | overhead-bound: packing, with driver-loop bookkeeping a close second -- the smallest-dims case here, consistent with per-call/per-block overhead dominating tiny problems |
+| `smallN_256x256x12` (STATUS.md's own cited shape) | 19.0 | 24.0% | 1.4% | 4.2% | 62.7% | 4.9% | **overhead-bound: packing**, decisively -- the strongest, most direct confirmation of STATUS.md's "packing is the whole gap" claim in this whole pass |
+
+`StridedBLAS` reference buckets (for cases where it's profiled): 98.5-99.94%
+"blas" on the three plain-GEMM-shaped cases (`plain_256`, `plain_512`,
+`dim15_2_2_2`); 23-32% "blas" and 63-76% "permute/copy" on the three
+multi-index `ccsd_t_*`/`ao2mo_2` cases (StridedBLAS pays a real permute/copy
+cost to reshape into a 2D GEMM view for these shapes, which is a fair
+comparison point, not a QuasiStrided-specific defect).
+
+### Reconciliation with STATUS.md's "Next task"
+
+**Corroborated, with numbers**: `smallN_256x256x12` is the same shape
+STATUS.md's "Next task" already names, and this pass's fresh, general-purpose
+profiler puts 62.7% of its own time in `packing` alone (24.0% microkernel) --
+a stronger, more specific statement than the prior isolated-microbenchmark
+comparison ("25-54 GFLOP/s vs. Octavian's 79-98"), because it now names
+*which* engine-internal code the missing time goes to, not just that overall
+throughput is lower. **Qualified**: large square GEMM (`plain_512`) *is*
+compute-bound by this pass's fixed threshold; `plain_256` and `dim15_2_2_2`
+are close (75-76% combined share, just under the 80% cut) but not over it --
+"packing is the whole gap" should not be read as "the microkernel share is
+ever small on large cases", but it is also not uniformly >=80% on every
+case above the smallest sizes either; the gap narrows with size rather than
+vanishing at a clean cutoff. **New evidence, not previously isolated, and
+corrected from this pass's own first attempt**: the `ccsd_t_1_dim16_f32`
+case is genuinely store-dominated (~75% store share, confirmed by two
+independent classification methods after Correction 2), not a borderline
+compute-bound case as this pass's own first (pre-review) draft claimed --
+worth a follow-up look at whether the vectorized store fast-path's
+eligibility guard is Float32-specific in some way for six-index outputs,
+not investigated further this pass (single case, read-only finding, `src/`
+untouched). **Also new**: `ccsd_t_1_dim16` (Float64, same shape) is
+kernel-stalled, not compute-bound, despite a combined microkernel+store
+share near the 80% cutoff -- its in-situ throughput is only ~26% of the
+isolated reference, meaning whatever is inside that "compute path" bucket
+is not running anywhere near peak FMA rate. Neither `ccsd_t_1_dim16` nor its
+Float32 twin should be cited as evidence this project is compute-bound on
+six-index outputs; both are evidence of the opposite.
+
+### Gate: no fix shipped this pass
+
+None of the findings above met the bounded-fix bar (<=~50 lines, one file,
+outside the frozen kernel/driver/blocking core, with a predicted measurable
+win, verifiable by the full suite + an ABBA guard + re-profiling). The
+`ccsd_t_1_dim16`/`ccsd_t_1_dim16_f32` findings are genuine candidates for a
+future milestone but need their own fact-finding (why is the in-situ
+microkernel-path throughput so low even where its sample share is large?)
+before any fix is proposed. The larger, already-known lever -- Octavian-style
+`dontpack`/`maybeinline` dispatch tiers for small/skewed shapes -- remains
+explicitly out of scope for this pass, as before.
+
+### Follow-ups, explicitly out of scope for this pass
+
+- Investigate why `ccsd_t_1_dim16`'s microkernel+store-attributed samples
+  correspond to only ~26% of isolated-reference throughput (kernel-stalled,
+  not compute-bound) and whether `ccsd_t_1_dim16_f32`'s store-path share
+  (~75%) is dtype-specific or shape-specific, and whether either is worth a
+  fix.
+- Re-measure the isolated microkernel reference on Julia 1.12.6 (this
+  project's other reference measurements) to check whether the 18-23% gap
+  from the historical "101-103 GFLOP/s" figure is a Julia-1.13-specific
+  codegen change or a real regression -- not distinguished this pass.
+- The Octavian-style `dontpack`/`maybeinline` dispatch tiers STATUS.md's
+  "Next task" already flags -- a substantial engine-design decision, not
+  started.
+- A wider case sweep (this pass profiled 9 cases total; the full
+  `MAIN_SHAPES`/`SMALL_SHAPES`/`EXTRA_SHAPES`/dtype grid was not run).
+- Complex dtypes beyond the one Float32 case above (planar/1m kernels
+  untouched by this pass).

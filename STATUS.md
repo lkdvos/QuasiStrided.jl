@@ -8,15 +8,14 @@ detail belongs in `docs/decisions.md`.
 ## Integrated revision
 
 Local git repo at `/mnt/home/ldevos/Projects/QuasiStrided.jl`. `main` is at
-`3e712ea` ("Add TensorOperations.jl backend (QuasiStridedBackend) (#2)") --
-the TensorOperations integration milestone was squash-merged as PR #2 on
-2026-09-10 and is published. The stale text that used to stand here, saying
-that milestone was "still entirely uncommitted", is resolved.
-
-Current work is on branch `blis`, based on `3e712ea`: the hardware-derived
-register shape milestone (see "Hardware-derived register shape milestone"
-below). Note `Manifest.toml` and `benchmark/results/` are both gitignored, so
-the committed manifest is stale relative to `Project.toml` and a fresh clone
+`19dd25c` (merge of `upstream-bench`, PR #5, into `main` -- 2026-09-21),
+which follows the label-order milestone (PR #7, `49213bc`), the vectorized
+store fast-path fix (PR #6, `4ff065a`), and complex element-type support
+(PR #4, `71c1536`), on top of the original TensorOperations integration
+(PR #2, `3e712ea`, squash-merged 2026-09-10). All published, all on `main`;
+there is no separate long-lived work branch as of this entry. Note
+`Manifest.toml` and `benchmark/results/` are both gitignored, so the
+committed manifest is stale relative to `Project.toml` and a fresh clone
 needs `Pkg.resolve()`; benchmark result directories exist on disk but are not
 in the tree.
 
@@ -389,6 +388,29 @@ engine has no equivalent of:
 QuasiStrided always packs both. Adding tiers 1-2 is the highest-value next
 item, and it targets exactly the small and skewed shapes a tensor network
 produces (`256x256x12` measures 16 GFLOP/s here against Octavian's 87).
+
+**Corroborated by a general-purpose profiler, 2026-09-21** (`docs/decisions.md`,
+"Profiling pass: where does QuasiStrided spend its time?"): profiling
+`256x256x12` directly puts 62.7% of its own time in `packing` and only 24.0%
+in the microkernel -- the missing time has a name now, not just a lower
+GFLOP/s number. Large square GEMM (512³) *is* compute-bound by this pass's
+own threshold (80.4% microkernel + 4.6% store, in-situ throughput ~88% of a
+same-day isolated reference); 256³ and the rank-4 `dim15_2_2_2` case are
+close but just under the threshold (75-76% combined share), so the
+microkernel-share gap narrows with size rather than vanishing at a clean
+cutoff. The six-index `ccsd_t_*` case is **not** compute-bound at either
+dtype, which corrects this pass's own first-draft finding: at Float64 its
+in-situ throughput is only ~26% of the isolated reference despite a
+near-80% sample share (kernel-stalled, not compute-bound), and at Float32
+it is decisively store-dominated (~75% of its own time in the scattered
+store path) -- both are new, narrower findings worth a follow-up look, not
+investigated further this pass. Tooling: `benchmark/profile_to_suite.jl` +
+`benchmark/profile_buckets.jl` (merged from the former `upstream-bench`
+branch, PR #5, then fixed twice in this pass -- first for leaf-only
+self-time misattributing inlined `SIMD.jl` FMA-intrinsic frames to "other",
+then, per an independent review before committing, because a bare
+file-path catch-all could still swallow a more specific ancestor frame
+first -- see `docs/decisions.md` for both corrections in detail).
 
 Keep the priority honest, though: on **genuine multi-index contractions** —
 the actual target — QuasiStrided already matches or beats TBLIS, the C++ BSMTC
