@@ -254,6 +254,61 @@ function axis_offset_range(ax::PtrScatterAxis)
 end
 
 """
+    descriptor_offset_range(d::BlockDescriptor, buffer::Vector{Int}, first::Int) -> (lo::Int, hi::Int)
+
+Min/max offset the interval `d` classifies can produce (`(0, -1)` if empty) --
+the [`BlockDescriptor`](@ref) counterpart of [`axis_offset_range`](@ref), and
+numerically identical to `axis_offset_range(_axis_of(d, buffer, first))`
+without materializing the axis. `O(1)` when `d.regular`; otherwise a scan of
+`buffer[first+1 : first+d.count]`, which is the same scan the scatter axis
+would do.
+"""
+function descriptor_offset_range(d::BlockDescriptor, buffer::Vector{Int}, first::Int)
+    d.count == 0 && return (0, -1)
+    d.regular && return axis_offset_range(AffineAxis(d.base, d.stride, d.count))
+    lo = hi = buffer[first + 1]
+    for t in 1:(d.count - 1)
+        v = buffer[first + t + 1]
+        lo = min(lo, v)
+        hi = max(hi, v)
+    end
+    return (lo, hi)
+end
+
+"""
+    checked_span_bounds(base::Int, rows::Tuple{Int,Int}, cols::Tuple{Int,Int}, storage_length::Int)
+
+Validate that every address `base + r + c` with `r` in the closed row-offset
+range `rows` and `c` in the closed column-offset range `cols` lies in
+`0:storage_length-1`; an empty range (`hi < lo`, the `(0, -1)` convention of
+[`axis_offset_range`](@ref)) always passes. Throws `BoundsError` otherwise.
+`Int128` internally so nothing can wrap.
+
+This is the whole of [`checked_tile_storage_bounds`](@ref)'s arithmetic, split
+out so a caller that knows the offset RANGES of a region -- rather than the
+axes of one tile -- can validate that region in one call. Because the check
+only ever looks at the four extremes, and because `(rlo + clo)` and
+`(rhi + chi)` are both realized addresses of any rectangular (row-set x
+column-set) region, it is exact for such a region, not conservative: it
+accepts a region iff it accepts every rectangular sub-region of it, and
+rejects iff at least one address is out of bounds. `src/driver.jl` relies on
+that equivalence to check a whole macro block once instead of each of its
+slivers.
+"""
+function checked_span_bounds(
+        base::Int, rows::Tuple{Int, Int}, cols::Tuple{Int, Int}, storage_length::Int
+    )
+    (rlo, rhi) = rows
+    (clo, chi) = cols
+    (rhi < rlo || chi < clo) && return nothing
+    lo128 = Int128(base) + Int128(rlo) + Int128(clo)
+    hi128 = Int128(base) + Int128(rhi) + Int128(chi)
+    (lo128 >= 0 && hi128 <= Int128(storage_length - 1)) ||
+        throw(BoundsError("tile addresses [$lo128, $hi128] exceed storage bounds [0, $(storage_length - 1)]", base))
+    return nothing
+end
+
+"""
     checked_tile_storage_bounds(base::Int, rows::Axis, cols::Axis, storage_length::Int)
 
 Validate every address `base + row_offset(i) + col_offset(j)` lies in
@@ -262,13 +317,9 @@ otherwise.
 """
 function checked_tile_storage_bounds(base::Int, rows::Axis, cols::Axis, storage_length::Int)
     (axis_length(rows) == 0 || axis_length(cols) == 0) && return nothing
-    (rlo, rhi) = axis_offset_range(rows)
-    (clo, chi) = axis_offset_range(cols)
-    lo128 = Int128(base) + Int128(rlo) + Int128(clo)
-    hi128 = Int128(base) + Int128(rhi) + Int128(chi)
-    (lo128 >= 0 && hi128 <= Int128(storage_length - 1)) ||
-        throw(BoundsError("tile addresses [$lo128, $hi128] exceed storage bounds [0, $(storage_length - 1)]", base))
-    return nothing
+    return checked_span_bounds(
+        base, axis_offset_range(rows), axis_offset_range(cols), storage_length
+    )
 end
 
 """

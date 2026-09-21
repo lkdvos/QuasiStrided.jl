@@ -199,6 +199,54 @@ function fill_offsets!(
 end
 
 """
+    affine_ramp(g::AxisGroup{D,P}) -> (isramp::Bool, steps::NTuple{P,Int})
+
+Whether **every** map of `g` is a single affine ramp in the logical
+coordinate, i.e. `offsets(g, q)[p] == q * steps[p]` for every `0 <= q <
+axis_length(g)`, and the per-map step when it is. `steps` is meaningless (and
+returned only so the result type is stable) when `isramp` is `false`.
+
+This is exactly the condition [`normalize_group`](@ref) tests when it folds
+`g` down to rank `<= 1`: singleton dimensions never advance their coordinate
+and so contribute nothing, and two retained dimensions compose into one ramp
+iff `next_stride[p] == (product of retained lengths so far) * step[p]` for
+*every* map -- the same Int128 comparison `normalize_group` uses, so a
+non-representable product is "not a ramp" rather than a wrapped accidental
+match. A rank-zero group (all dimensions singleton, `Q == 1`) is a ramp with
+step 0, and an empty domain (`Q == 0`) is vacuously one.
+
+Callers use it to replace a materialized offset buffer with closed-form
+arithmetic (`src/driver.jl`, `_execute_nest!`). It reads only `g`'s type
+parameters and fields, so with a concretely typed `g` it unrolls to a handful
+of integer compares and allocates nothing.
+"""
+function affine_ramp(g::AxisGroup{D, P}) where {D, P}
+    zerosteps = ntuple(_ -> 0, Val(P))
+    steps = zerosteps
+    run = 1
+    started = false
+    for d in 1:D
+        L = g.lengths[d]
+        L == 0 && return (true, zerosteps)  # empty domain: vacuously a ramp.
+        L == 1 && continue                  # singleton: coordinate never advances.
+        Sd = ntuple(p -> g.strides[p][d], Val(P))
+        if !started
+            steps = Sd
+            run = L
+            started = true
+        else
+            for p in 1:P
+                Int128(run) * Int128(steps[p]) == Int128(Sd[p]) ||
+                    return (false, zerosteps)
+            end
+            # A sub-product of the validated cardinality; cannot overflow.
+            run *= L
+        end
+    end
+    return (true, steps)
+end
+
+"""
     BlockDescriptor
 
 Classification of a materialized offset interval for one map: `base` (first

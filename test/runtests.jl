@@ -33,6 +33,7 @@ using QuasiStrided: AxisGroup, axis_length, offsets, fill_offsets!, BlockDescrip
     include("test_driver.jl")
     include("test_phase3_integration.jl")
     include("test_macro_driver.jl")
+    include("test_per_call_floor.jl")
     # Included last: it does a bare `using TensorOperations`, which exports
     # its own `scalartype` and would otherwise conflict with the `scalartype`
     # restored from QuasiStrided above for any file included after it.

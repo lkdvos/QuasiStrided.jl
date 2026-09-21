@@ -5462,3 +5462,335 @@ here approaches this project's usual single-workstation memory budget.
 
 Commit: see this file's own git history / `STATUS.md` for the SHA this
 section's own changes landed under.
+
+## Per-call floor: cheaper planning, once-per-block bounds validation, closed-form affine blocks (2026-09-21)
+
+Follow-up track authorized off `docs/proposals/dispatch-tiers.md` section 5.2,
+which recommended *against* Octavian-style dispatch tiers and pointed at the
+per-call/per-block floor instead. Three items were named there; all three are
+implemented here. Measured on `ccqlin038` (Cascade Lake, AVX-512), Julia
+1.13.0, single-threaded, load average 2.5-3.1 throughout (32 cores; the
+machine was shared but quiet -- canary spreads 0.5-8.4%, see below).
+
+### Where the time actually was, before
+
+Profiler baseline, taken on a `git archive` extract of the base commit
+`20e1002` so it is a genuine same-day A/B rather than a recollection
+(`benchmark/profile_to_suite.jl ... --tag basetree-pre`):
+
+| case | s/call | GFLOP/s | planning | driver_loop | gc/alloc | alloc/call |
+|---|---|---|---|---|---|---|
+| `ao2mo_2_dim16` | 115.4 us | 18.18 | 7.08% | 29.83% | 4.62% | 6080 B |
+| `plain_64` | 16.34 us | 32.08 | 23.51% | 10.95% | 6.96% | 4368 B |
+| `smallMN_16x256x16` | 10.09 us | 12.99 | 33.88% | 11.67% | 11.86% | 4368 B |
+
+**Data-quality note, recorded because it nearly produced a false headline.**
+The first "pre" run in this pass (`--tag percallfloor-pre`, on the working
+tree before any edit) reported `smallMN_16x256x16` at **48.6 us / 2.70
+GFLOP/s**. That figure is an outlier and is not used anywhere below: the base
+tree re-measured 10.09 us minutes later, the ABBA guard independently puts
+base `execute!` alone at 5.9 us for that shape, and the same run's
+`ao2mo_2_dim16` (17.73) and `plain_64` (31.10) agree with the base tree's
+(18.18, 32.08) to within 3%. Taking the outlier at face value would have
+claimed an 8x win where the real one is 1.67x.
+
+### 1. `plan_contract`: 4.1-6.4 us and 5.0-7.0 KB per call, now 1.0-2.3 us and 1.8-2.6 KB
+
+Three changes in `src/driver.jl`, all behaviour-preserving:
+
+* **`_classify_labels` no longer builds three `Set`s.** The label tuples'
+  LENGTH is a compile-time constant (the `NA`/`NB`/`NC` type parameters -- one
+  specialization per arity), even though their contents are not, so membership
+  is a `_label_in(lbl, tuple)` scan that unrolls into integer compares. The
+  three output `Vector`s are sized once to their `NA`/`NB` worst case and
+  `resize!`d down instead of `push!`ed into.
+* **`_build_pair_group` no longer calls `ntuple(f, ::Int)`.** This was the
+  single largest item: 656 B and 0.75 us per group *at `D == 1`*, three groups
+  per plan. `D = length(labels)` is genuinely a runtime value (which labels are
+  shared is a property of the label *values*), so the old `ntuple(f, D)` calls
+  inferred as `Tuple{Vararg{Int}}`, heap-boxed, and every element was then read
+  back through a dynamic `getindex`. But `D <= N1` and `N1` *is* static, so the
+  new `_pair_group_rank(Val(N1), ...)` ladder resolves the rank in at most
+  `N1 + 1` compile-time-dispatched compares and `_pair_group_static(Val{D})`
+  then runs with statically sized tuples throughout: **656 B / 0.75 us -> 32 B
+  / 0.06 us**. `Base.strides(v1)` is also hoisted out of the per-dimension
+  closures, where it was rebuilt once per `d`.
+* **`_order_free_labels` replaces `sortperm` + permuted copy with an in-place
+  stable insertion sort of a single copy.** These lists have at most `ndims(C)`
+  entries, so `O(n^2)` with `n <= 6` is free and three `Vector` allocations
+  become one. A fresh vector is still returned: sorting `labels` in place would
+  mutate `_classify_labels`'s output, which `test/test_driver.jl`'s label-order
+  pinning reads afterwards.
+
+Measured end to end (`plan_contract` with a warm reused workspace):
+
+| case | before | after |
+|---|---|---|
+| `plain_64` | 4976 B, 5.46 us | 1840 B, 2.31 us |
+| `smallMN_16x256x16` | 4976 B, 4.13 us | 1840 B, 1.39 us |
+| `ao2mo_2_dim16` | 6784 B, 6.36 us | 2176 B, 0.96 us |
+| `ccsd_t_1` (dim 4) | 7040 B, 6.37 us | 2560 B, 1.56 us |
+
+**Not made allocation-free, and it cannot be** by this route. Each composite's
+RANK is a value property of the label sets, so the three `AxisGroup`s and the
+`ContractPlan` built from them are type-unstable until the `_plan_contract`
+function barrier; the residual ~1.8 KB is the three label `Vector`s, the boxed
+groups, and that barrier's return. Removing it needs the label tuples to carry
+their classification in their types, which is a `@tensor`-macro-level change,
+not a driver one. `test/test_per_call_floor.jl` pins a 3 KB ceiling (against
+the old 5-7 KB) rather than zero, so a regression to the `Set` / runtime-
+`ntuple` construction is caught without pretending the floor is zero.
+
+### 2. Storage-bounds validation hoisted to once per macro block
+
+Authorized explicitly, including the change to `pack_a!`'s documented "all
+validation happens before any write" contract, on condition that any entry
+point that skips a check a caller would expect is named `unsafe_*`. That
+condition is met: the new entry points are `unsafe_pack_a!`, `unsafe_pack_b!`
+(`src/packing.jl`), `unsafe_execute_tile!` (`src/kernel.jl`) and
+`unsafe_execute_micro_tile!` (`src/driver.jl`), and they are spelled out at
+every call site -- `_pack_sliver!(unsafe_pack_b!, ...)`, not a boolean flag.
+`pack_a!`/`pack_b!`/`execute_tile!` and all four kernels' `execute_tile!`
+bodies are **unchanged**; the only edit to the checked path is that the check
+now sits behind a `Val`-typed compile-time constant (`BOUNDS &&
+checked_tile_storage_bounds(...)`), which folds to the same code at
+`Val(true)`.
+
+**What moved, and only what moved.** The `unsafe_*` forms still validate the
+row/column extent against the kernel's `(MR, NR)`, `kc >= 0`, both packed
+buffer capacities, the packed eltype, and the empty / `kc == 0` / `alpha == 0`
+short-circuits. Exactly one thing is skipped: the address-range check against
+`length(storage)`.
+
+**The safety argument, which is an equivalence and not an approximation.**
+`_execute_nest!` now makes three `checked_span_bounds` calls, and each is
+provably the conjunction of the per-sliver / per-tile checks it replaces:
+
+1. *The check is exact for a rectangular region, not conservative.*
+   `checked_tile_storage_bounds` never enumerates addresses; it computes
+   `[base + rlo + clo, base + rhi + chi]` and requires that interval inside
+   `[0, len-1]`. For a region that is a full row-set x column-set product --
+   which every tile and every macro block here is -- `rlo + clo` and
+   `rhi + chi` are both *realized* addresses (take the argmin row with the
+   argmin column, and the argmax with the argmax), so the interval's endpoints
+   are attained and the test is accept-iff-all-addresses-in-bounds.
+   `checked_span_bounds` is that arithmetic, factored out and fed ranges
+   instead of axes.
+2. *The block's offset set is exactly the union of its slivers'.*
+   `_classify_slivers!` partitions `buf[0:blocklen)` into slivers at
+   `sfirst = s*reg_tile`, `scount = min(reg_tile, blocklen - sfirst)`; every
+   buffer entry belongs to exactly one sliver, and no sliver is empty
+   (`s < cld(blocklen, reg_tile)` forces `scount >= 1`). So
+   `min_s(min(rows_s)) = min(rows_block)` and likewise for max.
+3. *The other axis is shared, or likewise a union.* For A, every M-sliver is
+   paired with the same K axis `colsA_k`; for B, every N-sliver with the same
+   `rowsB_k`. For C the micro-tile loop is the **full cross product** of the
+   M-sliver rows and N-sliver columns, so the union over tiles is exactly
+   (block rows) x (block columns).
+
+   Combining 1-3: block-check-passes <=> every-sliver-check-passes. Not a tight
+   superset -- an equality. `test/test_per_call_floor.jl` asserts it as a
+   randomized property over 400 cases with positive/negative/zero strides and
+   scattered axes, comparing the two decisions directly.
+4. *Ordering is preserved.* Each hoisted check precedes every read of, or
+   write to, the operand it guards, in the same relative order as before
+   (B before A before C). A hoisted check that throws may leave the workspace
+   packed, which is unobservable; nothing has been written to `C`.
+5. *`execute_tilewise!` is untouched* and still checks per tile, so the
+   package keeps an independent oracle for both the values and the rejections.
+
+Ranges are produced without an extra pass: `_classify_slivers!` accumulates the
+block range from each sliver descriptor as it classifies it (`O(1)` per regular
+sliver via the new `descriptor_offset_range`; for an irregular one, exactly the
+scan the per-sliver check used to do anyway).
+
+Tested, not assumed: a `CountingStorage <: AbstractVector` whose `length`
+increments a counter shows `execute!` asking each of A/B/C for its length
+**exactly once** per call on a 40x7x30 plan with 20+ micro-tiles, while
+`execute_tilewise!` on the same plan asks `>= ntiles` times. Rejection is
+tested through six deliberately-broken plans (destination one element short,
+each source one element short, and negative bases on all three), each of which
+must still raise `BoundsError` with nothing written -- and the destination case
+is cross-checked against `execute_tilewise!` raising too.
+
+### 3. Closed-form block description for affine-ramp composites
+
+New `affine_ramp(g::AxisGroup{D,P})` in `src/axis_group.jl` answers whether
+every map of `g` satisfies `offsets(g, q)[p] == q * step[p]` over the whole
+domain -- exactly the condition under which `normalize_group` would fold `g` to
+rank `<= 1`, tested with the same `Int128` comparison so a non-representable
+product is "not a ramp" rather than a wrapped accidental match. Singleton
+dimensions are skipped (their coordinate never advances), rank zero is a ramp
+with step 0, and an empty domain is vacuously one.
+
+`_execute_nest!` evaluates it once per `execute!` (each composite's type is
+concrete there, so it unrolls to a handful of integer compares) and, where it
+holds, replaces `fill_offsets!` + `describe_block` with `_ramp_slivers!` /
+`_ramp_descriptor` / `_ramp_offset_range`: no offset buffer is materialized and
+no buffer is scanned. `_ramp_descriptor` reproduces `describe_block`'s output
+*field for field*, including its `stride == 0` convention for a count-1 block,
+so the two paths are comparable with `==` and not merely behaviourally
+equivalent -- `test/test_per_call_floor.jl` asserts exactly that over 300
+randomized (group, block, sliver-size) triples.
+
+**Deliberately not generalized.** Anything not provably a ramp falls back to
+the existing buffer path, unchanged, per the brief. The `if` is a runtime
+branch on a per-call `Bool`, not a plan type parameter, so no `ContractPlan`
+field or type parameter changed and no existing pinning test moved.
+
+**`normalize_group` is NOT applied to the plan's composites, deliberately.**
+Doing so would widen the ramp path to every *foldable* composite (e.g.
+`ccsd_t_1`'s N composite folds from rank 3 to rank 2; `dim15_2_2_2`'s fold to
+contiguous), but it rewrites `plan.mgroup`/`ngroup`'s rank, and
+`test/test_driver.jl:1194-1195` pins `plan.mgroup.lengths == ntuple(_->d, 3)`
+as part of the *label-order* milestone's contract. Changing a pin that belongs
+to another milestone to buy a performance path is a separate decision, and the
+`affine_ramp` predicate above is itself the fold test, so the extension is
+cheap to make later: apply `normalize_group` to the three groups and update
+those two pins to compare against the normalized expectation. Left undone.
+
+### Measured result
+
+Re-profile on the working tree (`--tag percallfloor-post`), against the base
+tree run above:
+
+| case | GFLOP/s base -> new | planning | driver_loop | gc/alloc | alloc/call |
+|---|---|---|---|---|---|
+| `ao2mo_2_dim16` | 18.18 -> **21.67** (1.19x) | 7.08% -> 1.61% | 29.83% -> 27.27% | 4.62% -> 0.48% | 6080 -> 1472 B |
+| `plain_64` | 32.08 -> **42.62** (1.33x) | 23.51% -> 5.80% | 10.95% -> 4.88% | 6.96% -> 1.63% | 4368 -> 1232 B |
+| `smallMN_16x256x16` | 12.99 -> **21.64** (1.67x) | 33.88% -> 9.50% | 11.67% -> 3.05% | 11.86% -> 4.23% | 4368 -> 1232 B |
+
+Both targeted buckets shrank in absolute time, not only in share: `planning`
+8.2 -> 1.6 us / 3.8 -> 0.7 us / 3.4 -> 0.6 us, `driver_loop` 34.4 -> 26.4 us /
+1.8 -> 0.6 us / 1.2 -> 0.2 us on the three cases respectively.
+
+`ao2mo_2_dim16`'s `driver_loop` share barely moves because its N composite is
+`C[a,b,r,s] = A[q,b] * B[a,q,r,s]`, whose N labels `(a, r, s)` have C-strides
+`(1, 256, 4096)` with the `b` label's stride-16 axis sitting *between* them:
+`16*1 != 256`, so it does not fold and is not a ramp. Its M and K composites
+are ramps and do take the fast path, which is the 8 us that did come off. Two
+further, bounded ideas for that case are recorded under "Deferred" below.
+
+**ABBA guard** (`benchmark/bench_real_path_guard.jl`, 21 reps, base tree
+extracted from `20e1002` with `git archive`, A-B-A-B-B-A over three runs per
+tree, per-shape median of the three): geomean new/base **0.9207**, median
+0.9343, **0 of 18 shapes slower than base by more than 5%**. 16 of 18 are
+faster; the two that are not (`Float64/256^3` 1.040, `Float64/512^3` 1.026)
+are large compute-bound shapes this change cannot touch, are inside the
+instrument's own ~5-6% resolution, and are not part of a one-sided shift --
+which is the pattern the guard's header says to look for. Canary spreads
+0.5%/1.1%/0.5%/5.9%/8.4% across the six runs. Note the guard times `execute!`
+only (the plan is built once outside the loop), so it sees item 2 + item 3 and
+*none* of item 1.
+
+Full suite green: **52679 passed, 0 failed** (47224 before this pass; 5455 new
+in `test/test_per_call_floor.jl`). Forced-ISA runs (`QS_FAKE_ISA=avx2/32/16`
+and `unknown/0/0`) pass with only the two residues
+`test/forced_isa_runner.jl`'s own header documents (`test_target.jl:38`'s
+re-detection assertion, and the Bumper-dependent allocator testsets being
+absent outside the test environment).
+
+### Deferred, with the reason
+
+* **`normalize_group` on the plan's composites** -- see above; blocked only by
+  two label-order pinning tests, and worth revisiting as its own small change.
+* **`ao2mo_2_dim16`'s remaining 27% `driver_loop`.** Two bounded ideas, both
+  unimplemented here:
+  1. *Identical maps.* That composite's two maps have **equal** stride tuples
+     (`B` and `C` agree on `a, r, s`), so `fill_offsets!` fills two buffers
+     with identical contents and `_classify_slivers!` classifies each twice.
+     Filling one and reusing its descriptors would roughly halve the cost, and
+     the condition (`g.strides[1] == g.strides[2]`) is a cheap exact test. It
+     needs the `_axis_of` call sites to select the shared buffer, which is a
+     third structural path through the nest -- judged not worth stacking on
+     this pass's two.
+  2. *Piecewise-affine slivers.* A non-folding composite's offset sequence is
+     still affine with step `strides[p][1]` on any interval that does not cross
+     a multiple of `lengths[1]`. A sliver `[q0, q0+c)` is therefore a closed-
+     form `AffineAxis` iff `q0 ÷ L1 == (q0+c-1) ÷ L1`, with only the crossing
+     slivers needing the buffer. On `ao2mo_2` (`L1 = 16`, `NR = 6`) that is 2
+     of every 3 slivers. This is a genuine generalization of item 3 and the
+     brief explicitly scoped item 3 to the rank-1 case, so it is written up
+     rather than built.
+* **Complex packing's conditional load** (`_pack_panel_complex!`) -- still
+  untouched, as it was after the packing-speed milestone; unrelated to the
+  floor, and the complex path is not among the profiled regressions.
+
+**Bucket attribution note.** The profiler's `SPECIFIC_QS_BUCKETS` walks a
+sample's whole stack, so every new helper was already attributed correctly
+before this pass touched `benchmark/profile_buckets.jl` -- `affine_ramp` /
+`_ramp_slivers!` / `checked_span_bounds` reach `_execute_nest!` (driver_loop)
+and `_pair_group_static` reaches `plan_contract` (planning) -- and the
+`unsafe_pack_a!` / `unsafe_execute_tile!` names contain the `pack_a!` /
+`execute_tile!` substrings their buckets already match on. The names were
+added to the lists anyway, for explicitness; because each one's only caller is
+already in the same bucket, the addition cannot change any classification, and
+the post numbers above (taken before the addition) stand. `other` was
+0.18-0.60% in all three post profiles, which is the check that nothing
+escaped.
+
+### Adversarial review of the bounds-check hoist: two test gaps closed
+
+An independent adversarial review of item 2 found **no correctness defect** --
+the reviewer tried and failed to construct a counterexample to the equivalence
+argument above, for negative strides, zero strides, irregular/scattered
+slivers and all four kernel types -- but flagged one real hole in how it was
+*tested*, specifically in the silently-under-validated direction. Both gaps
+are now closed in `test/test_per_call_floor.jl`.
+
+**Gap 1: the equivalence property test supplied its own aggregate range.** It
+computed `blockrange = (minimum(rowoffs), maximum(rowoffs))` and fed that to
+`checked_span_bounds`, so it proved the check is equivalent *given a correct
+aggregate range* -- and would have passed unchanged if `_classify_slivers!`'s
+own accumulation tracked only the first or only the last sliver. That is the
+dangerous direction: a too-SMALL aggregate range throws nothing and still
+computes correct values on every in-bounds input, so no other test in the file
+would have noticed either. Added: a 500-case test that calls
+`_classify_slivers!` on hand-written (hence genuinely irregular; the
+ramp-vs-classify test can only reach regular blocks by construction) buffers
+and compares its returned range against `minimum`/`maximum` over the true
+buffer contents, plus a hand-built case with both extremes planted in an
+*interior* sliver -- one reached through `descriptor_offset_range`'s scan
+branch, one through its affine branch at a negative stride -- where the first
+and last slivers are deliberately unremarkable.
+
+**Gap 2: every rejection test used a dense column-major GEMM**, whose offsets
+increase monotonically, so its out-of-bounds address is necessarily in the
+LAST sliver -- which even a last-only accumulation would catch. Added a
+fixture whose binding address is strictly interior: `C[m,n1,n2] = A[m,k] *
+B[k,n1,n2]` with `C` a REVERSED view along `n2`, giving the N composite the C
+map `(+M, -M*N1)` over lengths `(13, 3)`. Offsets climb by `M` inside each
+`n1` run and fall by `13M` at every run boundary, so at `NR = 6` the slivers
+straddle those boundaries (irregular) and the block maximum lands at logical
+coordinate `q = 12`, sliver 2 of 7. One element off the destination then makes
+exactly that interior address overflow. The test derives where the extreme
+sits rather than asserting it by hand, checks the correctly sized plan still
+computes the right answer, and confirms `BoundsError` with **nothing written**.
+
+That fixture's discriminating power is asserted directly, by handing
+`checked_span_bounds` the true range (rejects) and the first-only and
+last-only ranges (both silently accept), rather than by mutating the driver.
+A mutation run was done once, out of tree, and is why: a driver with the
+first-sliver-only bug does not merely accept the plan, it performs the
+out-of-bounds write, corrupts the heap and hangs. Recording that here because
+it is the concrete demonstration that this hoist is the part of the change
+with real teeth, and that the accumulation -- not just `checked_span_bounds`
+-- has to be tested directly.
+
+**Incidental behaviour change, pinned rather than left implicit.** Hoisting
+made `execute!`'s rejection *stricter*: it now fails before any write for the
+whole block, where the old per-tile check wrote every tile preceding the
+offending one. `execute_tilewise!` still has the old behaviour, so the two
+differ, and the test asserts both sides of that (`all(iszero, C)` after
+`execute!`, `any(!iszero, C)` after `execute_tilewise!`). "Atomic" is a claim
+about one macro block only: with several blocks, earlier ones can still have
+been written before a later block's check throws.
+
+**One docstring narrowed.** `execute!`'s said "no address this driver can
+reach is unvalidated"; that is very slightly too strong, because the
+pre-existing `Qk == 0 || alpha == 0` beta-only short-circuit reaches
+`_scale_all_of_C!`, which has never had a storage-bounds check (it writes
+through `scale_tile!`'s `@inbounds` path on `AxisGroup`s validated at
+construction). Unchanged behaviour, not introduced here; the sentence is now
+scoped to the macro-blocking pack/execute path and the exception named
+explicitly.
