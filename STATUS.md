@@ -412,6 +412,39 @@ then, per an independent review before committing, because a bare
 file-path catch-all could still swallow a more specific ancestor frame
 first -- see `docs/decisions.md` for both corrections in detail).
 
+**Follow-up, 2026-09-21**: the profiler above was then run over the *full*
+`MAIN_SHAPES`/`SMALL_SHAPES`/`EXTRA_SHAPES` grid at all four dtypes
+(`Float64`/`Float32`/`ComplexF64`/`ComplexF32`), plus the `1m`
+(`OneMKernel`) complex kernel directly (`docs/decisions.md`, "T4: extended
+the grid..."). **The first attempt at this sweep (`--tag r1`) was
+contaminated by concurrent execution on the shared workstation** (this
+pass's own smoke test ran, unnoticed, *inside* that sweep's execution
+window rather than before or after it) and has been superseded by a clean
+re-run (`--tag r2`, verified as the sole process on the machine, plus
+targeted `--tag r3` spot-checks on cases that still looked noisy) -- see
+`docs/decisions.md`'s "T4" section for the full contamination story and the
+corrected numbers. Headline, on the clean data: the packing-dominance
+finding generalizes cleanly -- every `smallM`/`smallMN`/`smallN` case is
+packing-dominated at all four dtypes, **except one**
+(`smallMN_16x256x16_c64`, the `ComplexF64` case, which is
+planning-dominated; its `ComplexF32` sibling `smallMN_16x256x16_c32` is
+packing-dominated like the rest -- correcting an earlier miscount of "two"
+`smallMN` cases as planning-dominated), not just the one
+`smallN_256x256x12`/`Float64` case already cited above, and the
+microkernel-share gap narrows with size at every dtype (though `Float32`
+is the one dtype where even `plain_512` stays just under this pass's 80%
+share threshold, confirmed on two independent clean runs). New wrinkle: two
+`ComplexF64`/`ComplexF32` `shallowK_256x24x256` cases turned out to be
+store-dominated, not microkernel-dominated, inside their own >=80% combined
+share -- the same "looks compute-bound by share alone, isn't" trap T3
+already caught for `ccsd_t_1_dim16_f32`, now also seen on complex dtypes.
+This pass still uses a share-only verdict rule (no fresh isolated
+complex-kernel throughput reference existed to run T3's full two-legged
+rule) and two cases (`smallM_12x256x256`/`Float64` and
+`smallN_256x256x12_f32`) remain genuinely noisy on their packing-share
+figure even after three repeats -- both flagged as follow-ups in
+`docs/decisions.md`, not done.
+
 Keep the priority honest, though: on **genuine multi-index contractions** —
 the actual target — QuasiStrided already matches or beats TBLIS, the C++ BSMTC
 reference, on 4 of 5 measured points, and beats `StridedBLAS` by 1.0x-2.4x.

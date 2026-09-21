@@ -4676,3 +4676,342 @@ depend on the `pack_a!` ancestor frame surviving inlining.
   needs its own tests against `test/test_packing_complex.jl`'s oracle.
 - `ao2mo_2_dim16`'s largest non-kernel bucket is now `driver_loop` (28.7%:
   `fill_offsets!`/`describe_block`/`_classify_slivers!`), outside this task.
+
+### T4: extended the grid to every `MAIN_SHAPES`/`SMALL_SHAPES`/`EXTRA_SHAPES` shape, all four dtypes, and the `1m` complex kernel (2026-09-21, follow-up pass)
+
+Addresses the last two T3 follow-ups above (wider case sweep; complex
+dtypes) additively: `benchmark/profile_to_suite.jl`'s `CASES` gained every
+`MAIN_SHAPES ∪ SMALL_SHAPES ∪ EXTRA_SHAPES` shape (`harness.jl`'s
+`ShapeSpec`s, looked up by name into a new `SHAPES_BY_NAME` dict rather than
+re-hardcoding dims) as a plain square-GEMM-shaped label/dims case, at both
+real dtypes (`Float64`/`Float32`, all shapes) and both complex dtypes
+(`ComplexF64`/`ComplexF32`, `MAIN_SHAPES ∪ SMALL_SHAPES` only --
+`1024x256x1024` was left out of the complex grid to keep this pass's total
+sweep time bounded, deliberately narrower than the real-dtype grid, which
+also covers `EXTRA_SHAPES`. **Correction**: an earlier draft of this section
+justified the exclusion by claiming the fixture is ">1 GB" at `ComplexF64`;
+that is wrong by about 40x -- the shape's `A`+`B`+`C` arrays together are
+only ~25 MB at `ComplexF64` (`C` alone is 1024×1024×16 B ≈ 16 MB). The
+exclusion itself may still be reasonable on sweep-runtime grounds; the
+memory-footprint reason was simply false and is retracted here). The three
+shapes T3 already covered at `Float64` (`plain_256`, `plain_512`,
+`smallN_256x256x12`) are guarded by `_EXISTING_CASE_IDS` so this pass never
+emits a duplicate case id for them; every other id is new. `DIRECT_CASES`
+gained two `OneMKernel` entries (`onem_256`/`onem_512`, both complex dtypes)
+that call `plan_contract(...; kernel = ...)` directly with
+`kernel_shapes(T, OneMMethod())[end]` -- the only way to reach `1m` at all,
+since `src/driver.jl`'s `_default_complex_method` always returns
+`PlanarMethod()` for a plain label/dims contraction, so none of the new
+complex `CASES` above ever exercise it. **Correction**: an earlier draft
+called `[end]` "the shipped default register shape"; there is no shipped
+`1m` default -- `1m` is never auto-selected, and `[end]` is simply the
+menu's fallthrough/last entry. Concretely, `kernel_shapes(ComplexF64,
+OneMMethod())[end] = (MR=8, NR=8, W=8)`, which the Complex element-type
+milestone's own Phase F sweep (see that section above) measured as the
+*worst*-ranked of the three `1m` shapes on this machine; `kernel_shapes(
+ComplexF32, OneMMethod())[end] = (MR=16, NR=8, W=16)`, which that same sweep
+ranked *best* of its three. So the `onem_256_c64`/`onem_512_c64` rows below
+and the `onem_256_c32`/`onem_512_c32` rows are each measuring a different,
+dtype-specific point in the `1m` shape menu -- opposite ends of the ranking
+-- not a matched pair; do not read the `c64`-vs-`c32` `onem_*` comparison
+below as apples-to-apples. `case_flops` was switched from a hardcoded
+`2.0 * ...` to `flops_per_mac(case.dtype) * ...` (`harness.jl`'s existing
+helper, `8` for complex dtypes vs `2` for real) so GFLOP/s figures stay
+correct for the new complex cases. No other files touched; changes are
+additive only, `benchmark/profile_buckets.jl` untouched.
+
+**Correction, 2026-09-21 (this entry rewritten after an independent
+review): the first full sweep below was contaminated by concurrent
+execution, and its write-up's contamination story was backwards.** The
+smoke test (`--tag smoke`, three representative new ids) and what was then
+called "the quiet, uncontended full run" (`--tag r1`) were **not**
+sequential -- `buckets_summary-r1.txt`'s header timestamp is
+`2026-09-21T12:23:55`, `buckets_summary-smoke.txt`'s is
+`2026-09-21T12:30:35`, and the full 81-unit `r1` sweep's own artefact
+mtimes span `12:23:55`-`12:42:32` (about 18.5 minutes, matching the clean
+re-run's duration below) -- so the smoke test ran entirely *inside* the
+full sweep's own execution window, not before or after it. The full `r1`
+sweep was therefore almost certainly the smoke test's own contamination
+source (two Julia processes on the same machine at once), not an
+independent "unrelated CPU-bound job" as originally written, and `r1`'s own
+numbers for whatever cases happened to profile during that ~64 s overlap
+are suspect on exactly the same grounds. This was caught by comparing `r1`
+against this same shape/dtype's original, independent profiling pass (`main`
+worktree, `benchmark/results/ccqlin038.flatironinstitute.org-2026-09-21/profiles/*-r{1,2}.buckets.txt`):
+`ccsd_t_1_dim16`'s microkernel share and `smallN_256x256x12`'s throughput/
+gc-alloc share both drifted outside this project's standing 5-point
+reproducibility bar. `r1`'s own `.buckets.txt` sanity lines and low "other"
+shares (<=0.52%) do NOT catch this kind of contamination -- `other` only
+inflates when the *profiled* process itself gets descheduled, not when a
+second, separately-profiled process on the same core steals cycles between
+samples -- so "clean-looking buckets" was never good evidence that `r1` was
+uncontended. **`r1` is superseded below by a clean re-run; do not treat any
+`r1` number in this section as trustworthy without cross-checking r2/r3.**
+
+**Clean re-run (`--tag r2`, `ccqlin038`, 2026-09-21, Julia 1.13.0)**: run as
+the *only* process on the machine -- verified before starting (no other
+`julia`/benchmark processes running, `uptime` load average 2.4-2.8 on this
+32-core box, the only sustained CPU consumer being an unrelated, pre-existing
+stale VSCode Julia language-analysis helper pinned to one core since
+2026-09-16, which cannot contend with a `-t 1` benchmark process on an
+otherwise-idle 32-core machine) and monitored throughout (no other
+`profile_to_suite.jl`/`bench_*` process observed while it ran; header
+timestamp `2026-09-21T15:01:14`, last artefact written `15:20:27` EDT, ~19
+minutes end to end, in line with `r1`'s own ~18.5-minute duration). All 81
+(case, backend) units completed without error; "other" was
+<=0.39% on every row (worst: `smallMN_16x256x16_c64` at 0.39%), at least as
+clean as the (falsely) "quiet" `r1` claim and with none of `r1`'s timing
+overlap. Artefacts:
+`benchmark/results/ccqlin038.flatironinstitute.org-2026-09-21/profiles/*-r2.{flat,tree,buckets}.txt`,
+`buckets_summary-r2.txt`.
+
+**Reproducibility check, r1 vs r2, whole grid**: bucket-share agreement (any
+bucket >=10% share, 5-point bar) held for most of the 81 units, but not all
+-- seven cases exceeded the bar (`ccsd_t_1_dim16` microkernel +4.4 to +7.1
+points depending on which `r1`/original-pass number it's compared against;
+`smallMN_16x256x16` planning; `smallM_12x256x256` and
+`smallM_12x256x256_f32` packing/microkernel; `smallN_256x256x12`
+gc/alloc+throughput; `smallN_256x256x12_c32` and `smallN_256x256x12_f32`
+packing). All seven are small/packing-dominated cases -- exactly the
+regime most sensitive to a few hundred microseconds of contention per call.
+Given `r1` is established contaminated, `r2` (not `r1`) is treated as
+authoritative for the table below, and a third repeat (`--tag r3`, same
+"only process on the machine" protocol, targeted at just the flagged case
+ids to keep the check cheap) was run for all seven to confirm `r2` itself is
+not also an outlier:
+
+- `ccsd_t_1_dim16` (`QuasiStridedBackend`): microkernel/store/GFLOP-s across
+  `r1`=70.9%/12.6%/17.4, `r2`=68.1%/13.6%/18.1, `r3`=63.6%/16.4%/17.4, vs. the
+  **original, independent pass**'s own `r1`=63.8%/16.1%/17.4 and
+  `r2`=62.9%/18.3%/17.3. `r3` reproduces the original pass closely; `r2` was
+  within-bar against the original's `r1` (+4.4 points) but just outside it
+  against the original's `r2` (+5.3 points) -- resolved by `r3` as ordinary
+  noise, not a real regression. Combined (microkernel+store) share is
+  stable at 79.9-84.6% across all four clean readings, so the case's
+  *verdict* (compute-path, ~80% share) never moved; only the
+  microkernel/store split wobbles by a few points run to run, which this
+  case has done since T3 first profiled it.
+- `smallN_256x256x12` (`QuasiStridedBackend`): the blocking finding was a
+  43% throughput drop (18.97 -> 10.85 GFLOP/s) and gc/alloc jumping
+  1.57%->6.50% in the contaminated `r1`. Clean `r2` measures 17.085 GFLOP/s
+  (within ~10% of the original pass's 17.5-19.0 GFLOP/s, ordinary run-to-run
+  noise) and gc/alloc at 4.61% -- better than the contaminated reading but
+  still above the original pass's 1.57-1.60%. gc/alloc is a <10%-share
+  bucket so it falls outside this project's 5-point reproducibility bar by
+  convention, but the residual elevation (4.6% vs 1.6%) is real enough to
+  flag rather than wave away; every other bucket (packing 62.6% vs
+  62.7-64.6%, microkernel 21.6% vs 22.9-24.0%) reproduces the original pass
+  within ~2.4 points. Not investigated further this pass -- see follow-ups.
+- `smallMN_16x256x16`, `smallM_12x256x256_f32`, `smallN_256x256x12_c32`: all
+  three resolved cleanly -- `r2` and `r3` agree within the 5-point bar on
+  every bucket (e.g. `smallMN_16x256x16` planning 22.5%/21.7%,
+  `smallM_12x256x256_f32` microkernel 35.0%/34.2%), confirming `r1` (not
+  `r2`) was the outlier for these.
+- `smallM_12x256x256` and `smallN_256x256x12_f32`: **genuinely noisy after
+  three repeats, reported honestly rather than forced to a number.**
+  `smallM_12x256x256` packing share reads 37.4% (`r1`), 45.4% (`r2`), 38.3%
+  (`r3`) -- `r2` is the outlier here (`r1`/`r3` agree within 1 point), but
+  three data points aren't enough to call it settled either way.
+  `smallN_256x256x12_f32` packing reads 65.5% (`r1`), 79.1% (`r2`), 71.0%
+  (`r3`) -- a ~14-point spread across three clean-looking runs of the same
+  tiny (256×256×12, `Float32`), sub-30-µs-per-call case. In both cases the
+  *verdict* (packing is the dominant, >=37% bucket by a wide margin over
+  every other bucket) never changes, only the exact percentage; the table
+  below reports each as a range rather than picking one run's number. This
+  is consistent with -- and a sharper instance of -- this project's own
+  standing "measurement hygiene" note (STATUS.md, "Next task": "ccqlin038 is
+  not reliably exclusive... treat anything under ~10% as noise") applied to
+  the shortest-duration cases in this grid.
+
+**Provenance note**: this worktree's `-r1`/`-r2`/`-r3` tags are **not** the
+same artefacts as the original profiling pass's own `-r1`/`-r2` in the
+`main` worktree (`benchmark/results/ccqlin038.flatironinstitute.org-2026-09-21/`
+there) -- both happen to share a results-directory date because both ran on
+2026-09-21, but they are separate measurement passes (the original pass's
+8-case T3 sweep vs. this pass's 81-unit grid extension) with independently
+numbered repeat tags. Where this section compares against "the original
+pass", that always means the `main`-worktree artefacts explicitly, never
+this worktree's own superseded `r1`.
+
+**Verdict rule for this section, deliberately simplified from T3's**: T3
+used a two-legged rule (combined microkernel+store share >=80% for
+"compute-bound", but *only if* in-situ throughput --
+`achieved GFLOP/s / share` -- was also within 80% of a same-day isolated
+microkernel reference; otherwise "kernel-stalled" even at a high share).
+That second leg needs a fresh isolated reference per dtype/kernel
+combination (`bench_store_path.jl` only covers the two real dtypes'
+`PlanarMethod`-adjacent shapes; the `1m`/complex-planar kernels have no
+equivalent isolated-reference script run this pass). Measuring that for
+four dtypes x nine new shapes x two kernel families was judged out of
+scope for a grid-extension pass -- **the table below uses the share leg
+only** (combined microkernel+store share >=80% -> "compute-path", else
+name the largest of packing/driver_loop/planning as "overhead: <bucket>").
+This means a few rows below that would likely be reclassified
+"kernel-stalled" under T3's full rule are instead reported as "compute-path"
+here on share alone; where a case's `store` share, not `microkernel`, is
+the larger of the two (a T3-flagged smell -- see `ccsd_t_1_dim16_f32`
+above), that is called out in the table notes rather than silently folded
+into "compute-path". Treat every "compute-path" verdict below as
+share-only, not confirmed-efficient; T3's own worked examples show both can
+diverge.
+
+New cases only (the eight already-tabulated T3 cases -- `ao2mo_2_dim16`,
+`ccsd_t_1_dim16[_f32]`, `dim15_2_2_2`, `plain_256`, `plain_512`,
+`scattered_64`, `smallN_256x256x12` -- reproduce within a few points of T3's
+own numbers on the clean `r2` re-run and are not repeated here; see T3's
+table above for those, and the reproducibility-check discussion above for
+the two that did *not* reproduce on the first, contaminated `r1` attempt).
+**All numbers below are from the clean `r2` re-run** (not the superseded
+`r1`), except the two cells flagged noisy in the reproducibility check
+above, which report the `r1`/`r2`/`r3` range instead of a single number.
+`QuasiStridedBackend` (or `QuasiStridedDirect` for the `onem_*` rows)
+buckets only; `bl gflop/s` is that same case's `StridedBLAS` figure for
+reference (`-` where there is none, i.e. the `onem_*`/`scattered_64`
+direct-path cases). **Caveat on the `qs`/`bl` GFLOP/s columns**: a handful
+of the shortest-duration cases (tens of µs/call) showed 2-3x run-to-run
+swings in this *timing* figure between `r1` and `r2` (e.g. `plain_64`
+24.4->8.5 GFLOP/s, `plain_128_c32` 88.2->31.3 GFLOP/s) with no
+corresponding drift in that same case's bucket shares (all within the
+5-point bar) -- i.e. the wall-clock median is noisier than the profiler's
+own cost attribution at this size, consistent with STATUS.md's standing
+"treat anything under ~10% as noise" caveat, here exceeded by a wide margin
+for these two specific readings. Treat single-run GFLOP/s figures below as
+indicative, not precise, for any case under ~50 µs/call; the bucket-share
+columns are the load-bearing data in this table:
+
+| case | qs GFLOP/s | bl GFLOP/s | microkernel | store | packing | driver_loop | planning | combined | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| `plain_64` | 8.5 | 84.0 | 33.2% | 3.7% | 30.2% | 9.6% | 17.5% | 36.9% | overhead: packing |
+| `plain_64_f32` | 30.3 | 198.0 | 23.5% | 2.8% | 37.1% | 7.5% | 21.6% | 26.3% | overhead: packing |
+| `plain_64_c64` | 36.7 | 60.2 | 41.0% | 18.1% | 13.7% | 5.5% | 16.9% | 59.1% | overhead: planning |
+| `plain_64_c32` | 45.2 | 97.6 | 30.4% | 19.4% | 19.6% | 5.4% | 17.6% | 49.8% | overhead: packing |
+| `plain_128` | 43.6 | 64.8 | 57.2% | 3.7% | 27.3% | 5.1% | 5.1% | 60.9% | overhead: packing |
+| `plain_128_f32` | 63.3 | 56.3 | 40.1% | 2.8% | 40.5% | 6.2% | 7.8% | 42.9% | overhead: packing |
+| `plain_128_c64` | 54.1 | 74.9 | 64.4% | 14.2% | 13.5% | 3.6% | 3.4% | 78.6% | overhead: packing (borderline) |
+| `plain_128_c32` | 31.3 | 139.9 | 51.9% | 20.0% | 19.2% | 3.6% | 4.0% | 71.9% | overhead: packing |
+| `plain_256_f32` | 91.0 | 156.7 | 60.7% | 1.9% | 31.1% | 3.9% | 1.7% | 62.6% | overhead: packing |
+| `plain_256_c64` | 68.3 | 77.4 | 77.5% | 9.7% | 9.8% | 1.9% | 0.7% | 87.2% | compute-path |
+| `plain_256_c32` | 122.6 | 155.0 | 70.1% | 13.9% | 12.5% | 1.9% | 1.1% | 84.1% | compute-path; store is about a fifth of microkernel's own share (not "half", correcting the earlier draft) |
+| `plain_512_f32` | 124.4 | 172.3 | 75.7% | 1.6% | 19.8% | 2.4% | 0.4% | 77.3% | overhead: packing (borderline) |
+| `plain_512_c64` | 73.9 | 85.1 | 76.8% | 11.2% | 10.0% | 1.8% | 0.2% | 88.0% | compute-path |
+| `plain_512_c32` | 158.2 | 175.4 | 77.5% | 11.3% | 9.8% | 0.9% | 0.3% | 88.8% | compute-path |
+| `big_1024x256x1024` | 56.9 | 84.5 | 80.5% | 3.2% | 10.9% | 5.1% | 0.2% | 83.8% | compute-path |
+| `big_1024x256x1024_f32` | 118.4 | 176.6 | 81.8% | 3.0% | 10.9% | 4.0% | 0.2% | 84.9% | compute-path |
+| `shallowK_256x24x256` | 29.8 | 63.4 | 56.7% | 13.4% | 10.1% | 13.3% | 4.8% | 70.1% | overhead: driver_loop |
+| `shallowK_256x24x256_f32` | 51.5 | 104.8 | 45.1% | 11.2% | 18.4% | 14.4% | 8.1% | 56.3% | overhead: packing |
+| `shallowK_256x24x256_c64` | 34.1 | 43.0 | 42.6% | 43.5% | 4.0% | 6.6% | 2.4% | 86.1% | compute-path; **store > microkernel**, likely store-dominated not compute-dominated (T3's `ccsd_t_1_dim16_f32` pattern) |
+| `shallowK_256x24x256_c32` | 46.9 | 85.8 | 31.3% | 52.4% | 5.4% | 5.4% | 4.0% | 83.7% | compute-path; **store > microkernel** (same caveat) |
+| `smallM_12x256x256` | 14.1 | 25.3 | 41.9% | 1.9% | 45.4% (noisy: 37.4-45.4% across `r1`/`r2`/`r3`, see reproducibility check above) | 4.8% | 4.3% | 43.9% | overhead: packing |
+| `smallM_12x256x256_f32` | 22.2 | 102.3 | 35.0% | 3.3% | 47.8% | 6.2% | 5.2% | 38.3% | overhead: packing |
+| `smallM_12x256x256_c64` | 19.2 | 16.8 | 61.8% | 3.3% | 28.6% | 2.1% | 3.3% | 65.1% | overhead: packing |
+| `smallM_12x256x256_c32` | 20.7 | 59.1 | 63.1% | 3.7% | 27.0% | 1.4% | 3.0% | 66.9% | overhead: packing |
+| `smallMN_16x256x16` | 3.2 | 63.9 | 17.0% | 0.6% | 42.0% | 9.7% | 22.5% | 17.6% | overhead: packing |
+| `smallMN_16x256x16_f32` | 11.5 | 79.6 | 11.1% | 0.6% | 39.8% | 11.3% | 26.8% | 11.7% | overhead: packing |
+| `smallMN_16x256x16_c64` | 16.4 | 38.2 | 43.6% | 3.3% | 15.6% | 2.5% | 23.4% | 46.9% | overhead: planning |
+| `smallMN_16x256x16_c32` | 14.8 | 57.8 | 50.8% | 3.7% | 25.1% | 2.4% | 9.6% | 54.4% | overhead: packing |
+| `smallN_256x256x12_f32` | 16.6 | 45.8 | 11.0% | 0.5% | 79.1% (noisy: 65.5-79.1% across `r1`/`r2`/`r3`, see reproducibility check above) | 3.0% | 4.7% | 11.4% | overhead: packing |
+| `smallN_256x256x12_c64` | 32.2 | 43.7 | 38.7% | 4.7% | 46.2% | 2.4% | 5.5% | 43.5% | overhead: packing |
+| `smallN_256x256x12_c32` | 51.5 | 72.4 | 28.5% | 6.6% | 51.4% | 3.1% | 7.7% | 35.1% | overhead: packing |
+| `onem_256_c64` (`1m` kernel, direct) | 57.6 | - | 77.0% | 10.1% | 11.3% | 1.5% | 0.0% | 87.1% | compute-path |
+| `onem_256_c32` | 110.0 | - | 64.9% | 16.0% | 17.5% | 1.6% | 0.0% | 80.9% | compute-path (borderline) |
+| `onem_512_c64` | 57.0 | - | 71.8% | 11.4% | 15.5% | 1.2% | 0.0% | 83.2% | compute-path |
+| `onem_512_c32` | 147.8 | - | 74.7% | 12.3% | 12.0% | 1.0% | 0.0% | 87.0% | compute-path |
+
+**Caveat on all four `onem_*` rows**: these are `DIRECT_CASES` -- `plan_contract`
+runs once, outside the profiled loop, so `planning`/`adapter/prepare` read
+essentially 0% for every `onem_*` row by construction. Every `CASES` (adapter-
+path) row above re-plans on every call (the `@tensor`/`tensorcontract!`
+adapter calls `plan_contract` fresh each time), so its `planning` bucket is a
+real per-call cost. Do not compare an `onem_*` row's combined
+(microkernel+store) share, or its `planning`/`adapter/prepare` figures,
+directly against an adapter-path row's as if they measured the same thing --
+the `onem_*` numbers are structurally advantaged on exactly the buckets this
+section calls "overhead". See also the dtype-ranking caveat on the `1m`
+shape menu earlier in this section: `onem_256_c64`/`onem_512_c64` use the
+*worst*-ranked `1m` shape for `ComplexF64` and `onem_256_c32`/`onem_512_c32`
+use the *best*-ranked shape for `ComplexF32`, so the `c64`-vs-`c32` `onem_*`
+comparison is doubly non-apples-to-apples (different plan-cost structure,
+different relative position in each dtype's own shape ranking).
+
+### Findings from the extended grid
+
+- **Packing dominance is not a Float64-only or `MAIN_SHAPES`-only story.**
+  Every `smallM`/`smallMN`/`smallN` case is `overhead: packing` at all four
+  dtypes, **except one** -- `smallMN_16x256x16_c64` is `overhead: planning`
+  (23.4% planning vs. 15.6% packing; `smallMN_16x256x16_c32` is
+  `overhead: packing`, 25.1% packing vs. 9.6% planning, so this is *not* "the
+  two `smallMN` complex cases" as an earlier draft of this section claimed --
+  only the `ComplexF64` one is planning-dominated, correcting that count).
+  `planning`'s one-time `plan_contract` cost is large relative to a tiny
+  per-call workload in that one case. STATUS.md's headline
+  `smallN_256x256x12` finding (T3: 62.7% packing) generalizes cleanly across
+  dtype and across the other two small-shape families, not a fluke of one
+  shape/dtype pair.
+- **The share gap narrows with size, at every dtype, same as T3 found for
+  Float64 alone.** `plain_64` -> `plain_512` combined share climbs
+  monotonically within each dtype column on the clean `r2` data (Float64:
+  36.9% -> 84.7%[^plain512-f64]; `f32`: 26.3% -> 77.3%; `c64`: 59.1% ->
+  88.0%; `c32`: 49.8% -> 88.8%), and `big_1024x256x1024` (both real dtypes)
+  clears 80% -- consistent with T3's "narrows with size rather than a clean
+  cutoff" framing, now confirmed across the whole dtype range rather than
+  just Float64/Float32. **Correction**: an earlier draft of this bullet, built
+  from the contaminated `r1` run, reported a non-monotonic dip in the
+  `ComplexF64` column (86.6% at `plain_256_c64` down to 84.6% at
+  `plain_512_c64`). The clean `r2` re-run resolves this to a monotonic
+  increase (87.2% -> 88.0%) -- the dip was a contamination artifact, not a
+  real effect, and every dtype column is monotonic in the clean data.
+  `Float32` is the one dtype where even `plain_512` stays just under the 80%
+  share line (77.3% on the clean re-run, up from the contaminated run's
+  75.9% but still under the line) -- worth a look, not chased further this
+  pass; see follow-ups.
+- **New store-dominated cases, same pattern as T3's `ccsd_t_1_dim16_f32`.**
+  Both `ComplexF64`/`ComplexF32` variants of `shallowK_256x24x256` have
+  `store` share exceeding `microkernel` share outright (43.5%/52.4% vs.
+  42.6%/31.3%) -- clearing the 80% combined-share bar on `store` weight, not
+  microkernel weight, exactly the pattern T3 flagged as a false
+  "compute-bound" read without the throughput leg. `plain_256_c32` shows a
+  milder version of the same thing (13.9% store vs. 70.1% microkernel --
+  microkernel still leads by a wide margin, but store is a much larger
+  fraction of the combined share than any real-dtype `plain_*` case at the
+  same size). Neither is chased to a root cause this pass (no isolated
+  complex-kernel store-path reference exists yet to confirm "kernel-stalled"
+  the way T3 did for `ccsd_t_1_dim16`); flagged as a follow-up below.
+- **`1m` (`OneMKernel`) looks broadly similar to the planar complex kernel's
+  own share profile** (`onem_256_c64`/`onem_512_c64`/`onem_512_c32` clear
+  80% combined share on microkernel weight, not store weight, unlike the
+  `shallowK` complex cases above; `onem_256_c32` is the one borderline case
+  at 80.9%, packing-heavy at 17.5%) -- no evidence from this pass that `1m`
+  has a qualitatively different overhead profile than `PlanarMethod` at the
+  one square-GEMM shape tested per size, but only two sizes were profiled,
+  the direct-vs-adapter plan-cost asymmetry noted above applies, and no
+  isolated `1m` reference exists to check throughput, so this is a weak,
+  share-only observation.
+
+[^plain512-f64]: `plain_512` (`Float64`) is a T3-carryover case, not repeated
+in the table above; its clean `r2` combined share is 84.7% (microkernel
+80.9% + store 3.7%), used here for the column endpoint.
+
+### Follow-ups from this pass, not investigated further
+
+- An isolated-reference throughput measurement for the complex
+  (`PlanarMethod`/`OneMMethod`) kernel families, analogous to
+  `bench_store_path.jl`'s real-dtype `PackedPanel` figures, so the new
+  complex/`1m` rows above can be reclassified under T3's full two-legged
+  rule instead of the share-only simplification used here.
+- Root-cause the two `shallowK_256x24x256` complex store-dominated cases
+  and `plain_256_c32`'s elevated store share (see "New store-dominated
+  cases" above) -- is the vectorized store fast-path's eligibility guard
+  narrower for complex dtypes on this shape family, similar to the
+  Float32-specific question T3 already raised for `ccsd_t_1_dim16_f32`?
+- `plain_512_f32` staying just under the 80% combined-share line while
+  every other dtype's `plain_512` clears it -- confirmed on both `r1`
+  (75.9%) and `r2` (77.3%), i.e. this is not run-to-run noise from the
+  contamination episode, but it's still only two data points; worth a
+  dedicated look at whether it's a real `Float32`-specific packing-cost
+  effect at this size.
+- `smallM_12x256x256` (real `Float64`) and `smallN_256x256x12_f32`: packing
+  share did not settle after three repeats (see the reproducibility-check
+  discussion above) -- worth either more reps or a look at whether these two
+  specific (shape, dtype) pairs are unusually close to a cache/allocation
+  boundary that makes packing cost bimodal, rather than assuming more
+  repeats alone will converge it.
