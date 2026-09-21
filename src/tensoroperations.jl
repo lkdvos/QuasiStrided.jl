@@ -24,23 +24,31 @@ macro-blocking engine ([`QuasiStrided.contract!`](@ref)):
     @tensor backend = QuasiStridedBackend() C[i, j] := A[i, k] * B[k, j]
 
 Contraction only, and only for strided operands sharing a single element type
-out of `Float32`/`Float64`/`ComplexF32`/`ComplexF64`; everything else
-(`TensorOperations.tensoradd!`, `TensorOperations.tensortrace!`, mixed or
-unsupported eltypes -- mixed real/complex included, since promotion belongs in
-TensorOperations' own `promote_contract` layer -- a non-strided operand, an
-output aliased with an input, or a conjugated output view) throws an
-`ArgumentError`.
+out of `Float32`/`Float64`/`ComplexF32`/`ComplexF64`; everything else (mixed
+or unsupported eltypes -- mixed real/complex included, since promotion
+belongs in TensorOperations' own `promote_contract` layer -- a non-strided
+operand, an output aliased with an input, or a conjugated output view)
+throws an `ArgumentError` from `TensorOperations.tensorcontract!`.
+
+`TensorOperations.tensoradd!`/`TensorOperations.tensortrace!` fall back to
+`TO.StridedNative()` (QuasiStrided has no analog of either): a timing taken
+on those two operations under this backend measures `StridedNative`, not
+this engine -- this is the one exception to the "never falls back" rule
+below, added 2026-09-16 so a `@tensor` network mixing a contraction with an
+add/trace step can run wholesale under this backend (see docs/decisions.md,
+"Amendment: tensoradd!/tensortrace! fall back").
 
 TensorOperations' `conjA`/`conjB` flags are honored for complex eltypes: they
 are forwarded to `plan_contract`, which folds each with the corresponding
 operand's `StridedView.op` and applies the result in the packing pass. A
 conjugated *output* `C` is rejected rather than supported.
 
-It is not registered with `TensorOperations.select_backend` and never falls
-back to another backend, so a timing taken with this backend always measures
-this engine. Rationale is frozen in docs/decisions.md, "TensorOperations
-integration milestone: Phase A direction freeze" and "Complex element-type
-milestone: Phase A direction freeze".
+It is not registered with `TensorOperations.select_backend`, and
+`tensorcontract!` never falls back to another backend for any ineligible
+input, so a timing taken on a *contraction* with this backend always
+measures this engine. Rationale is frozen in docs/decisions.md,
+"TensorOperations integration milestone: Phase A direction freeze" and
+"Complex element-type milestone: Phase A direction freeze".
 """
 struct QuasiStridedBackend <: TO.AbstractBackend end
 
@@ -146,14 +154,6 @@ never routed to another backend.
 _qs_eligible(C, A, B) = _qs_eltype_ok(C, A, B) && _qs_strided_ok(C, A, B)
 
 @noinline _qs_throw(msg::AbstractString) = throw(ArgumentError(msg))
-
-@noinline function _qs_throw_unsupported(f)
-    return _qs_throw(
-        "QuasiStridedBackend implements contraction only, so $f is not " *
-            "supported. Use a different backend (e.g. backend=StridedNative()) for " *
-            "networks that need an addition or trace step."
-    )
-end
 
 # Step 1 of the frozen argument-checking order: hard-reject every ineligible
 # input class before any TensorOperations check runs. `_qs_eligible` is the
@@ -356,19 +356,24 @@ function TO.tensorcontract!(
     return C
 end
 
-# `tensoradd!`/`tensortrace!` hard-reject: QuasiStrided has no analog of
-# either. Deliberately untyped in `C`/`A` so every call is rejected with this
-# message rather than TO's generic "unknown backend" error.
+# `tensoradd!`/`tensortrace!` fall back to `TO.StridedNative()`: QuasiStrided
+# has no analog of either (no standalone add/permute step, and no trace/
+# diagonal support at all -- `_classify_labels` in `src/driver.jl` rejects
+# repeated labels), so there is nothing of this engine's own to run. Amended
+# 2026-09-16 (docs/decisions.md, "Amendment: tensoradd!/tensortrace! fall
+# back") to fall back rather than hard-reject, reversing the original Phase A
+# freeze's clause 1 -- clause 2 (`tensorcontract!` hard-rejects every
+# ineligible input) is UNCHANGED and still throws, never falls back.
 
 """
     TensorOperations.tensoradd!(C, A, pA, conjA, α, β, ::QuasiStridedBackend, allocator)
 
-Always throws `ArgumentError`: `QuasiStridedBackend` implements contraction
-only ([`TensorOperations.tensorcontract!`](@ref)). QuasiStrided has no
-analog of a standalone add/permute step, so there is nothing to delegate to,
-and this backend never falls back to another one (see
-[`QuasiStridedBackend`](@ref)). Use a different `backend=` for a `@tensor`
-network that needs this step.
+Falls back to `TO.StridedNative()`: `QuasiStridedBackend` implements
+contraction only ([`TensorOperations.tensorcontract!`](@ref)), has no analog
+of a standalone add/permute step, and so has nothing of its own to run here.
+This is the one exception to "never falls back" (see [`QuasiStridedBackend`](@ref));
+a timing taken on a `tensoradd!` call under this backend measures
+`StridedNative`, not this engine -- label results accordingly.
 """
 function TO.tensoradd!(
         C,
@@ -376,18 +381,19 @@ function TO.tensoradd!(
         α::Number, β::Number,
         backend::QuasiStridedBackend, allocator = TO.DefaultAllocator()
     )
-    return _qs_throw_unsupported(TO.tensoradd!)
+    return TO.tensoradd!(C, A, pA, conjA, α, β, TO.StridedNative(), allocator)
 end
 
 """
     TensorOperations.tensortrace!(C, A, p, q, conjA, α, β, ::QuasiStridedBackend, allocator)
 
-Always throws `ArgumentError`: `QuasiStridedBackend` implements contraction
-only ([`TensorOperations.tensorcontract!`](@ref)). QuasiStrided has no
+Falls back to `TO.StridedNative()`: `QuasiStridedBackend` implements
+contraction only ([`TensorOperations.tensorcontract!`](@ref)) and has no
 trace/diagonal support at all (`_classify_labels` in `src/driver.jl` rejects
-repeated labels), so there is nothing to delegate to, and this backend never
-falls back to another one (see [`QuasiStridedBackend`](@ref)). Use a
-different `backend=` for a `@tensor` network that needs a trace step.
+repeated labels), so has nothing of its own to run here. This is the one
+exception to "never falls back" (see [`QuasiStridedBackend`](@ref)); a timing
+taken on a `tensortrace!` call under this backend measures `StridedNative`,
+not this engine -- label results accordingly.
 """
 function TO.tensortrace!(
         C,
@@ -395,5 +401,5 @@ function TO.tensortrace!(
         α::Number, β::Number,
         backend::QuasiStridedBackend, allocator = TO.DefaultAllocator()
     )
-    return _qs_throw_unsupported(TO.tensortrace!)
+    return TO.tensortrace!(C, A, p, q, conjA, α, β, TO.StridedNative(), allocator)
 end
