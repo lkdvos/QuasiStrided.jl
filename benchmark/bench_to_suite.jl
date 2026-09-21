@@ -1,15 +1,26 @@
 # Head-to-head timing of StridedNative(), StridedBLAS() and QuasiStridedBackend()
-# on the upstream TensorOperations.jl benchmark suite's :pairwise/:tccg cases.
+# on the upstream TensorOperations.jl benchmark suite's :pairwise/:tccg/:mps/
+# :ctmrg/:trg cases.
 #
 #   julia --project=benchmark benchmark/bench_to_suite.jl [options]
 #
 # Options (all optional):
-#   --categories pairwise,tccg
+#   --categories pairwise,tccg,mps,ctmrg,trg
 #   --dtypes Float64,Float32
 #   --pairwise-sizes 15,63,128
 #   --tccg-sizes 8,16
+#   --mps-bonddims 32,64,128     # MPS/MPO effective-Hamiltonian bond dim D
+#   --ctmrg-chis 16,32,64        # CTMRG environment bond dim chi
+#   --trg-chis 16,32,48          # TRG plaquette bond dim chi
 #   --reps 21
 #   --max-bytes 2147483648      # per-case skip ceiling
+#
+# :mps/:ctmrg/:trg are multi-tensor `NetworkSpec` cases (run via `ncon`, not
+# `tensorcontract!` directly), unlike :pairwise/:tccg's two-tensor
+# `ContractSpec` cases -- see build_case/run_case! dispatch below. `ncon` has
+# no in-place variant, so timing for these three categories includes output
+# allocation (this matches upstream's own accepted discipline, see
+# TensorOperationsBenchmarks/src/lowering.jl).
 #
 # Writes bench_to_suite.csv / canary_to_suite.csv / summary_to_suite.txt /
 # mismatches_to_suite.txt / PROVENANCE_to_suite.txt to
@@ -18,7 +29,7 @@
 using TensorOperations
 using TensorOperations: StridedNative, StridedBLAS
 using TensorOperationsBenchmarks
-using TensorOperationsBenchmarks: BenchmarkCase, ContractSpec, flops, bytes,
+using TensorOperationsBenchmarks: BenchmarkCase, ContractSpec, NetworkSpec, flops, bytes,
     ArrayProvider, randtensor
 using QuasiStrided
 using QuasiStrided: QuasiStridedBackend
@@ -33,6 +44,9 @@ const DTYPES = parse_dtypes(argopt("dtypes", "Float64,Float32"))
 const CATEGORIES = Symbol.(split(argopt("categories", "pairwise,tccg"), ','))
 const PAIRWISE_SIZES = parse_ints(argopt("pairwise-sizes", "15,63,128"))
 const TCCG_SIZES = parse_ints(argopt("tccg-sizes", "8,16"))
+const MPS_BONDDIMS = parse_ints(argopt("mps-bonddims", "32,64,128"))
+const CTMRG_CHIS = parse_ints(argopt("ctmrg-chis", "16,32,64"))
+const TRG_CHIS = parse_ints(argopt("trg-chis", "16,32,48"))
 const MAX_CASE_BYTES = argopt("max-bytes", 2 * 2^30)
 
 const BACKENDS = (
@@ -41,17 +55,25 @@ const BACKENDS = (
     QuasiStrided = QuasiStridedBackend(),
 )
 
-# `REGISTRY[:pairwise]`/`[:tccg]` are called directly, bypassing
-# `build_suite`/BenchmarkTools, for this project's own timing discipline.
+# `REGISTRY[:pairwise]`/`[:tccg]`/`[:mps]`/`[:ctmrg]`/`[:trg]` are called
+# directly, bypassing `build_suite`/BenchmarkTools, for this project's own
+# timing discipline.
 @assert TOB.REGISTRY[:pairwise] === TOB._pairwise_cases
 @assert TOB.REGISTRY[:tccg] === TOB._tccg_cases
+@assert TOB.REGISTRY[:mps] === TOB._mps_cases
+@assert TOB.REGISTRY[:ctmrg] === TOB._ctmrg_cases
+@assert TOB.REGISTRY[:trg] === TOB._trg_cases
 
 const CASES = vcat(
     :pairwise in CATEGORIES ? TOB._pairwise_cases(PAIRWISE_SIZES) : BenchmarkCase[],
     :tccg in CATEGORIES ? TOB._tccg_cases(TCCG_SIZES) : BenchmarkCase[],
+    :mps in CATEGORIES ? TOB._mps_cases(MPS_BONDDIMS) : BenchmarkCase[],
+    :ctmrg in CATEGORIES ? TOB._ctmrg_cases(CTMRG_CHIS) : BenchmarkCase[],
+    :trg in CATEGORIES ? TOB._trg_cases(TRG_CHIS) : BenchmarkCase[],
 )
 
 _nelem(spec::ContractSpec, I) = prod((spec.dims[l] for l in I); init = 1)
+_nelem_network(spec::NetworkSpec, il) = prod((spec.dims[abs(l)] for l in il); init = 1)
 
 # `bytes(spec)` assumes Float64 elements; this is dtype-generic.
 function case_bytes(spec::ContractSpec, ::Type{T}) where {T}
@@ -59,8 +81,27 @@ function case_bytes(spec::ContractSpec, ::Type{T}) where {T}
     return n * sizeof(T)
 end
 
+# All input tensors plus the (fresh, `ncon`-allocated) output.
+function case_bytes(spec::NetworkSpec, ::Type{T}) where {T}
+    n = sum(_nelem_network(spec, il) for il in spec.indexlists)
+    n += _nelem_network(spec, spec.output)
+    return n * sizeof(T)
+end
+
 params_string(params::NamedTuple) =
     join(("$k=$(getfield(params, k))" for k in keys(params)), ";")
+
+# :pairwise/:tccg cases sweep a leg dimension `dim`; :mps sweeps bond dim `D`;
+# :ctmrg/:trg sweep environment/plaquette bond dim `chi`. This picks whichever
+# is present so the CSV/summary can report a single generic sweep-parameter
+# column across all categories without renaming pairwise/tccg's own `dim`.
+function case_sweepparam(case::BenchmarkCase)
+    p = case.params
+    hasproperty(p, :dim) && return p.dim
+    hasproperty(p, :D) && return p.D
+    hasproperty(p, :chi) && return p.chi
+    error("case $(case.category)/$(case.id) has no known sweep-parameter field (dim/D/chi)")
+end
 
 function build_case(spec::ContractSpec, provider, ::Type{T}) where {T}
     dimsA = ntuple(i -> spec.dims[spec.IA[i]], length(spec.IA))
@@ -69,13 +110,33 @@ function build_case(spec::ContractSpec, provider, ::Type{T}) where {T}
     A = randtensor(provider, spec.IA, dimsA, T)
     B = randtensor(provider, spec.IB, dimsB, T)
     pA, pB, pAB = TensorOperations.contract_indices(spec.IA, spec.IB, spec.IC)
-    return A, B, pA, pB, pAB, dimsC
+    return (; A, B, pA, pB, pAB, dimsC)
 end
 
-function run_case!(backend, C, A, pA, conjA, B, pB, conjB, pAB)
+function build_case(spec::NetworkSpec, provider, ::Type{T}) where {T}
+    tensors = map(spec.indexlists) do il
+        dims = ntuple(i -> spec.dims[abs(il[i])], length(il))
+        return randtensor(provider, il, dims, T)
+    end
+    return (; tensors)
+end
+
+alloc_output(spec::ContractSpec, ctx, ::Type{T}) where {T} = zeros(T, ctx.dimsC)
+# `ncon` has no in-place variant -- it allocates its own output every call;
+# this placeholder is ignored by `run_case!` below.
+alloc_output(::NetworkSpec, ctx, ::Type{T}) where {T} = nothing
+
+function run_case!(backend, spec::ContractSpec, ctx, C)
     return TensorOperations.tensorcontract!(
-        C, A, pA, conjA, B, pB, conjB, pAB,
+        C, ctx.A, ctx.pA, spec.conjA, ctx.B, ctx.pB, spec.conjB, ctx.pAB,
         one(eltype(C)), zero(eltype(C)), backend
+    )
+end
+
+function run_case!(backend, spec::NetworkSpec, ctx, C)
+    return TensorOperations.ncon(
+        ctx.tensors, spec.indexlists, spec.conjlist;
+        order = spec.order, output = spec.output, backend = backend
     )
 end
 
@@ -95,7 +156,7 @@ println(
 function log_row(backend_name, T, case::BenchmarkCase, reps, t, gf, gb)
     println(
         csv_io,
-        "$backend_name,$T,$(case.category),$(case.id),$(case.params.dim),",
+        "$backend_name,$T,$(case.category),$(case.id),$(case_sweepparam(case)),",
         params_string(case.params), ",$reps,",
         @sprintf("%.9f,%.4f,%.4f", t, gf, gb)
     )
@@ -146,17 +207,16 @@ for T in DTYPES
             continue
         end
 
-        A, B, pA, pB, pAB, dimsC = build_case(spec, provider, T)
+        ctx = build_case(spec, provider, T)
         fl = flops(spec)
 
         # Correctness gate before any timing: StridedBLAS is the reference,
         # QuasiStrided must match to `rtol` or its timing is skipped.
         results = Dict{Symbol, Any}()
         for (bname, backend) in pairs(BACKENDS)
-            C = zeros(T, dimsC)
+            C = alloc_output(spec, ctx, T)
             try
-                run_case!(backend, C, A, pA, spec.conjA, B, pB, spec.conjB, pAB)
-                results[bname] = C
+                results[bname] = run_case!(backend, spec, ctx, C)
             catch e
                 msg = sprint(showerror, e)
                 push!(
@@ -192,9 +252,9 @@ for T in DTYPES
         for (bname, backend) in pairs(BACKENDS)
             haskey(results, bname) || continue           # threw above
             bname === :QuasiStrided && !qs_ok && continue # mismatched above
-            C = zeros(T, dimsC)
+            C = alloc_output(spec, ctx, T)
             t = median_time_s(
-                () -> run_case!(backend, C, A, pA, spec.conjA, B, pB, spec.conjB, pAB);
+                () -> run_case!(backend, spec, ctx, C);
                 reps = REPS
             )
             gf = fl / t / 1.0e9
@@ -204,7 +264,7 @@ for T in DTYPES
                 raw,
                 (
                     backend = String(bname), dtype = T, category = case.category,
-                    id = case.id, dim = case.params.dim, t = t, gflops = gf, gbytes = gb,
+                    id = case.id, dim = case_sweepparam(case), t = t, gflops = gf, gbytes = gb,
                 )
             )
         end
@@ -384,6 +444,9 @@ open(PROVENANCE_PATH, "w") do io
     println(io, "categories = ", CATEGORIES)
     println(io, "pairwise sizes = ", PAIRWISE_SIZES)
     println(io, "tccg sizes = ", TCCG_SIZES)
+    println(io, "mps bonddims = ", MPS_BONDDIMS)
+    println(io, "ctmrg chis = ", CTMRG_CHIS)
+    println(io, "trg chis = ", TRG_CHIS)
     println(io, "cases generated = ", length(CASES), " per dtype")
     println(io, "cases actually timed = ", length(raw), " backend-rows total")
     println(io, "case list = ")

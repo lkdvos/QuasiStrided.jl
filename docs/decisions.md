@@ -5320,3 +5320,145 @@ existed).
 
 Second commit: see this file's own git history / `STATUS.md` for the SHA
 this section's own changes landed under.
+
+## `bench_to_suite.jl`: wiring up `:mps`/`:ctmrg`/`:trg`, smoke-tested (2026-09-21)
+
+Per the dispatch-tiers review (section 5.1), extended
+`benchmark/bench_to_suite.jl` to also run the upstream suite's `:mps`,
+`:ctmrg`, `:trg` categories, additively -- `:pairwise`/`:tccg` behavior and
+CLI flags are unchanged. New flags: `--mps-bonddims` (MPS/MPO
+effective-Hamiltonian bond `D`, default `32,64,128`), `--ctmrg-chis` (CTMRG
+environment bond `chi`, default `16,32,64`), `--trg-chis` (TRG plaquette
+bond `chi`, default `16,32,48`). No `src/` changes; scope confirmed via
+`git diff --stat` (`benchmark/bench_to_suite.jl` only).
+
+**The three new categories are `NetworkSpec` cases (multi-tensor `ncon`
+networks), not `ContractSpec` (two-tensor `tensorcontract!`) like
+`:pairwise`/`:tccg`.** The script's `build_case`/`run_case!`/`alloc_output`/
+`case_bytes` were given `NetworkSpec` methods that call
+`TensorOperations.ncon(tensors, indexlists, conjlist; order, output,
+backend)` directly (mirroring what `TensorOperationsBenchmarks`'s own
+`execute(::NetworkSpec, ...)` does), rather than routing through
+`build_suite`/`BenchmarkTools`. `ncon` has no in-place variant, so timing for
+these three categories includes output allocation -- this is upstream's own
+accepted discipline for `NetworkSpec` (see `TensorOperationsBenchmarks/src/
+lowering.jl`'s header comment), not a gap introduced here. A small generic
+helper, `case_sweepparam`, was added so the CSV/summary's single "sweep
+parameter" column reads `case.params.dim` for `:pairwise`/`:tccg`, `.D` for
+`:mps`, `.chi` for `:ctmrg`/`:trg`, without renaming pairwise/tccg's own
+`dim` field. `plot_bench_to_suite.jl` needed **no changes** -- it already
+groups purely by the CSV's `category` string column and treats `dim` as a
+generic sweep value, so it plots the new categories unmodified (verified: ran
+it against an `:mps` result CSV, got correct per-dtype PNGs).
+
+### Smoke test: QuasiStrided runs cleanly on all three, no rejections or mismatches
+
+Ran each new category standalone at minimal size/reps (`ccqlin038`, load
+average ~3.3-3.9 at the time, single-core measurement discipline
+unaffected):
+
+```
+julia --project=benchmark benchmark/bench_to_suite.jl --categories mps   --mps-bonddims 8  --reps 3
+julia --project=benchmark benchmark/bench_to_suite.jl --categories ctmrg --ctmrg-chis 8     --reps 3
+julia --project=benchmark benchmark/bench_to_suite.jl --categories trg   --trg-chis 8       --reps 3
+```
+
+All three: **zero correctness mismatches, zero backend rejections/errors**,
+CSV/summary/mismatches/PROVENANCE files written correctly, `QuasiStridedBackend`
+matched `StridedBLAS` to `rtol` on every case (`1e-10` Float64, `1e-5`
+Float32) -- confirmed both via the script's own mismatch gate and by an
+independent standalone `ncon(...; backend=QuasiStridedBackend())` vs.
+`backend=StridedBLAS()` comparison run directly in the REPL before touching
+the script, for `_trg_case(4)`, `_mps_1site_case(8)`, `_mps_2site_case(8)`,
+`_ctmrg_case(8)`. `QuasiStridedBackend` does **not** reject any of these
+networks -- every edge of every network in all three categories is a plain
+two-tensor pairwise contraction once `ncon` decomposes it (no `tensoradd!`/
+`tensortrace!` ever required), which is exactly what `QuasiStridedBackend`
+already supports; nothing here exercises `tensoradd!`/`tensortrace!` the way
+`:permute`/`:trace` would.
+
+Quick-signal throughput from the smoke runs (`dim`/reps too small to be a
+result, just orientation): at `D=8`/`chi=8`, QuasiStrided ran ~1.05x-1.25x
+slower than `StridedBLAS` across all three categories (`mps` 1.17-1.25x,
+`ctmrg` 1.17-1.18x, `trg` 1.03-1.05x) -- consistent with the
+`:pairwise`/`:tccg` milestone's small-shape overhead findings, nothing new.
+
+### Finding: `StridedNative` (not QuasiStrided) has a severe, size-growing pathology on `:ctmrg`/`:trg` `ncon` networks
+
+Not a QuasiStrided result, but load-bearing for planning the real
+evidence-gate run's walltime budget, so recorded here. Isolated
+single-call timings (`ncon` directly, warm-up discarded, `@elapsed`, no
+harness overhead), Float64:
+
+| category/case | BLAS | QuasiStrided | StridedNative |
+|---|---|---|---|
+| ctmrg chi=8  | 8.20 GFLOP/s | 7.01 GFLOP/s | 0.47 GFLOP/s (17.6x slower) |
+| ctmrg chi=64 | 15.15 GFLOP/s | -- | 0.54 GFLOP/s (28x slower) |
+| trg chi=8    | 4.08 GFLOP/s | 3.87 GFLOP/s | 1.37 GFLOP/s (3.0x slower) |
+| trg chi=32   | 20.03 GFLOP/s | 14.41 GFLOP/s | 0.48 GFLOP/s (42x slower) |
+| trg chi=48   | 36.54 GFLOP/s | 23.32 GFLOP/s | **did not finish in 100s** (single call) |
+
+`ctmrg`'s `StridedNative` penalty is a roughly *constant* ~0.5 GFLOP/s
+regardless of `chi` (a fixed per-call inefficiency, not a scaling blow-up),
+so `:ctmrg`'s total real-run cost stays trivial (sub-minute) even including
+`StridedNative`. **`:trg` is different: `StridedNative`'s penalty grows with
+`chi`** (3x at chi=8, 42x at chi=32, apparently super-linear), and at
+chi=48 a single `ncon` call under `StridedNative` did not complete within
+100 seconds (backtrace shows time spent inside `Strided.jl`'s
+`_mapreduce_kernel!`/`stridedtensorcontract!`, i.e. genuinely inside
+`Strided.jl`'s own contraction path for this network's index/stride
+pattern, not inside `QuasiStrided` or this script). Upstream's own default
+`:trg` sweep goes to `chi=96` (`flops(chi=96) / flops(chi=48) = 64x`), so a
+naive full sweep with `StridedNative` included at upstream's default sizes
+risks **hours-to-indefinite** wall-clock for the `:trg` category alone.
+**Recommendation for the real run**: either cap `--trg-chis` well below
+upstream's default ceiling (`16,24,32` is safely fast; `48` is already
+borderline; do not include `64`/`96` unless `StridedNative` is dropped from
+that category or run under its own generous timeout), or run `:trg` at
+larger `chi` with only `StridedBLAS`/`QuasiStrided` (this script always runs
+all three backends together per case, so excluding `StridedNative` for
+`:trg` specifically would need a small script change, not attempted here --
+out of scope for this pass, which is tooling-plus-smoke-test only).
+
+### Recommended command for the real (Slurm) evidence-gate run
+
+Full default-size run, all five categories, `--reps 21` (this pass did
+**not** run this -- it is the campaign handed to the user to run on Slurm):
+
+```
+julia --project=benchmark benchmark/bench_to_suite.jl \
+    --categories pairwise,tccg,mps,ctmrg,trg \
+    --pairwise-sizes 15,63,128 --tccg-sizes 8,16 \
+    --mps-bonddims 32,48,64,100,128,256,300,512 \
+    --ctmrg-chis 16,24,32,48,64,100 \
+    --trg-chis 16,24,32,48 \
+    --reps 21
+```
+
+Note `--trg-chis` above is **capped at 48**, deliberately narrower than
+upstream's own default `16,24,32,48,64,96` sweep, per the `StridedNative`
+finding above -- go beyond 48 only with a plan for `StridedNative`'s
+non-termination risk at `chi>=64`.
+
+Rough walltime budget (single core, per the project's pinned measurement
+discipline; `:pairwise`/`:tccg` numbers are this project's pre-existing
+experience, not re-measured here): `:pairwise`/`:tccg` together, a few
+minutes (unchanged from the existing milestone); `:mps` (16 cases x 2
+dtypes x 3 backends x ~22 evaluations, `BLAS`/`QuasiStrided`-like
+throughput throughout, no `StridedNative` pathology observed here), roughly
+**5 minutes**; `:ctmrg` (6 cases x 2 dtypes, `StridedNative`'s fixed ~0.5
+GFLOP/s penalty included), well under **2 minutes**; `:trg` capped at
+`chi<=48` (4 cases x 2 dtypes), dominated by the chi=48 `StridedNative`
+calls -- budget **15-30 minutes** conservatively for `:trg` alone, since
+`StridedNative`'s chi=48 single-call cost was not fully characterized (only
+bounded below at >100s for one un-warmed call; the harness's own warm-up
+plus 21 timed reps at chi=48 could be substantially longer). **Total
+suggested Slurm walltime request: 1 hour**, to leave headroom for the
+`:trg`/`StridedNative` uncertainty and machine-load variance. Memory: every
+tensor across all five categories at these sizes is well under 256 MiB
+(upstream's own `within_memory_budget`/`MAX_CASE_BYTES` ceiling, `2^28`
+bytes, already filters anything bigger) -- **a few GB is generous**; nothing
+here approaches this project's usual single-workstation memory budget.
+
+Commit: see this file's own git history / `STATUS.md` for the SHA this
+section's own changes landed under.
