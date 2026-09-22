@@ -1380,15 +1380,21 @@ end
     end
 end
 
-@testset "label order: the swap never fires for complex kernels (no vector store to win)" begin
+@testset "label order: the swap never fires for complex kernels (guarded by T <: Real, deliberately deferred)" begin
     # Same shape/kernel that would trigger the swap for a real dtype at this
-    # mr (ccsd_t_3, d=4: sorted N run 16 >= mr, sorted M run 1) -- but
-    # PlanarKernel/OneMKernel (complex) always scatter-store, so there is
-    # nothing for the swap to win and it measurably costs the as-is
-    # orientation's N-side locality (~2-4%, see driver.jl's `T <: Real`
-    # guard). Also re-confirms conjugation is still correct on the
-    # (now guaranteed unswapped) complex path -- an `op`-carrying A, both
-    # flags exercised, checked against the loop reference.
+    # mr (ccsd_t_3, d=4: sorted N run 16 >= mr, sorted M run 1). Historically
+    # PlanarKernel/OneMKernel (complex) always scatter-stored, so the swap had
+    # nothing to win and measurably cost the as-is orientation's N-side
+    # locality (~2-4%). PlanarKernel now has a vectorized store fast path
+    # (src/kernels/planar.jl), so that rationale is stale, but the guard
+    # itself (`_prefer_swap`'s call site, `T <: Real` in driver.jl) has NOT
+    # been re-evaluated for the complex path yet -- extending it is a
+    # deliberately deferred, unmeasured follow-up
+    # (docs/proposals/complex-fast-paths.md Decision 3). This test only
+    # confirms the current (unchanged) behavior: the swap still doesn't fire
+    # for complex dtypes today. Also re-confirms conjugation is still correct
+    # on the (now guaranteed unswapped) complex path -- an `op`-carrying A,
+    # both flags exercised, checked against the loop reference.
     d = 4
     for T in (ComplexF64, ComplexF32)
         W = QuasiStrided._default_lanewidth(real(T))

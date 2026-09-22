@@ -5794,3 +5794,64 @@ through `scale_tile!`'s `@inbounds` path on `AxisGroup`s validated at
 construction). Unchanged behaviour, not introduced here; the sentence is now
 scoped to the macro-blocking pack/execute path and the exception named
 explicitly.
+
+## ComplexF64 `:tccg` slowdown: root-caused to the planar store path, no fix shipped (2026-09-22)
+
+**Trigger.** Job 7087420's evidence-gate run (`benchmark/results/worker6160-2026-09-22/bench_to_suite.csv`) showed QuasiStrided's median ComplexF64/Float64 GFLOP/s ratio on `:tccg` sitting at **0.29** across all 48 (dtype, case) pairs, against StridedBLAS's **0.68** on the identical cases. A truly efficient complex kernel doing ~4x the real arithmetic of its real counterpart (complex MAC = 4 real multiplies + rounding, against `flops(spec)`'s dtype-blind nominal count) would land near 0.25 by construction; QuasiStrided sits right on that naive floor while StridedBLAS's ZGEMM extracts real efficiency beyond it. That gap, not "complex is inherently slower," is what needed explaining.
+
+**Method.** Added four cases to `benchmark/profile_to_suite.jl`'s `CASES` (additive, existing entries untouched): a ComplexF64 twin of the already-present `ccsd_t_1_dim16` (`ccsd_t_1_dim16_c64`), and a new Float64/ComplexF64 pair for TCCG's `ccsd_6` (`C[i,j,k] = A[i,l,m,k] * B[m,j,l]`, dim=16), chosen because job 7087420 measured its QS/BLAS ratio (36.02 vs 10.46 GFLOP/s, ratio 0.29) squarely at the observed median. Ran `julia --project=benchmark benchmark/profile_to_suite.jl ccsd_t_1_dim16 ccsd_t_1_dim16_c64 ccsd_6_dim16 ccsd_6_dim16_c64` on the login node (login-node CPU, not the Slurm allocation `bench_to_suite.jl`'s numbers came from -- so GFLOP/s figures under the profiler are not directly comparable to job 7087420's; only the **bucket shares** below are used for diagnosis, matching this session's established profiling convention). Every profile's "other" bucket sits at exactly 50.00% in each case -- the idle profiler-listener thread noted in `profile_to_suite.jl`'s own caveat comment -- so all shares below are renormalized against the classified (non-"other") sample count, not the raw total.
+
+**Finding: `ccsd_t_1_dim16` flips from microkernel-dominated to store-dominated under ComplexF64.**
+
+| bucket | Float64 (of classified, non-"other") | ComplexF64 |
+|---|---|---|
+| microkernel | 13053/16467 = **79.3%** | 5058/14631 = **34.6%** |
+| store | 2652/16467 = 16.1% | 8890/14631 = **60.8%** |
+| packing | 273/16467 = 1.7% | 284/14631 = 1.9% |
+| driver_loop | 482/16467 = 2.9% | 393/14631 = 2.7% |
+
+**Finding: `ccsd_6_dim16` (more contracted indices, already packing-heavy at Float64) shifts further toward packing.**
+
+| bucket | Float64 | ComplexF64 |
+|---|---|---|
+| microkernel | 7033/12948 = 54.3% | 4632/10374 = 44.6% |
+| packing | 4009/12948 = 31.0% | 4191/10374 = **40.4%** |
+| store | 267/12948 = 2.1% | 641/10374 = 6.2% |
+| driver_loop | 861/12948 = 6.6% | 235/10374 = 2.3% |
+
+**Root cause, confirmed by reading the source, not just the profile.** `src/kernels/planar.jl`'s `store_tile!` docstring says outright: "Ships the scattered/scalar path only... The unit-stride plane-to-interleave fast path is a deliberately deferred, measurement-gated follow-on and is NOT built here." `_store_tile_planar!` writes every output element through a per-lane call to `_axpby_tile!` (src/kernel.jl) inside a `for lane in 1:W` loop, recombining `Complex(revec[lane], imvec[lane])` one scalar at a time -- there is no equivalent of the real path's `_store_tile_vector!` (src/kernels/simd.jl) for the planar format, at any eligibility condition. `_axpby_tile!` is already `@inline` and already has its `alpha`/`beta` branch resolved once by `_store_prologue!` outside the loop, so there is no cheap hoist left to find here -- the cost is the fundamental one of `MR*NR` scalar scatter-stores instead of `MV*NR` vectorized `W`-wide ones. Complex packing has the analogous gap one layer down: `_pack_panel_complex!` (src/packing.jl:401) is, per its own comment, "a parallel loop rather than a generalisation of `_pack_panel!`", and has no counterpart to `_pack_a_contiguous!` (the vectorized fast path the real path got in this session's "Packing speed" milestone above) -- consistent with `ccsd_6`'s packing share growing 31.0% -> 40.4% under ComplexF64 even though its store share barely moves.
+
+**Disposition: not fixed, written up instead.** Both gaps are exactly the "deliberately deferred, measurement-gated follow-on" work the planar kernel's own docstring flagged when it was built -- a real vectorized planar store path needs a correct interleave-into-`Complex{T}` write (plane-pair -> struct-of-complex, not a same-format copy) under the same alpha/beta/edge-tile contract `_store_tile_vector!` already meets for real, plus its own unit-stride eligibility predicate; a vectorized complex pack path needs the equivalent generalization one layer down. Both are comparable in scope to the real path's Phase H store work and this session's real-packing milestone, not a "tens of lines" patch, and per this investigation's own scoping instruction, a change of that size is a decision for sign-off, not something to ship under time pressure. No `src/` change was made this pass; the four new `profile_to_suite.jl` cases are the only diff. **Recommended next step**, if the ComplexF64 gap is worth closing: a `docs/proposals/`-style design note (mirroring `dispatch-tiers.md`'s format) scoping a vectorized planar store fast path first (bigger single-case win per the `ccsd_t_1_dim16` numbers above), with the complex packing fast path as a candidate follow-on once that lands and is re-measured.
+
+## Complex packing and planar store fast paths: shipped for avx512, `:tccg` gap traced to `_demote_for_run`/`_prefer_swap` (2026-09-22)
+
+**What was built** (the recommended next step from the entry immediately above, followed through). `docs/proposals/complex-fast-paths.md` is the design note; two phases shipped on the `complex-packing-fastpath` branch (commits `4a0f942`, `f62ff28`):
+
+  * A vectorized complex A-panel packing fast path (`_pack_complex_contiguous!`/`_pack_complex_contiguous_eligible`, `src/packing.jl`) for `PlanarFormat`, gated on unit-stride `AffineAxis` rows into dense `Complex` storage on a shipped ISA (avx512 today -- `_isa_vector_bytes(Val(:avx512)) == 64`), with an `identity`/`conj` transform and the `RealFormat`/`OneEFormat` exclusions the gate already documents.
+  * A vectorized planar store fast path (`_store_tile_planar_vector!`/`_complex_vector_eligible`, `src/kernels/planar.jl`), same ISA/format/unit-stride gating, on the `PlanarKernel` store side (`store_tile!`).
+
+`OneMKernel` (the `1m`/`1e` format) is unaffected by the store-side phase -- it never had a vectorized store on this branch -- and the packing phase covers only the `PlanarFormat` A-panel, not `OneEFormat` or the B-panel, matching the design doc's stated scope.
+
+**Measured**: `bench_complex_efficiency.jl`'s geomean complex-efficiency ratio (ComplexF64/ComplexF32, `julia --project=benchmark -O3 benchmark/bench_complex_efficiency.jl`, ccqlin038, 21 reps/shape over `MAIN_SHAPES ∪ SMALL_SHAPES`):
+
+| | ComplexF64 | ComplexF32 |
+|---|---|---|
+| before (`f7fa490`, 1 run) | 0.961 | 0.750 |
+| after (this branch, run 1) | 1.134 | 0.967 |
+| after (this branch, run 2) | 1.122 | 0.935 |
+
+Two "after" runs (not two "before" runs -- one `f7fa490` run was taken given the time budget for this review-response pass; the two "after" runs, taken back to back, show ~0.01-0.03 run-to-run noise in the geomean, which is small next to the ~0.16-0.2 shift from "before") on the same machine, same session. Both dtypes cross the design doc's ">1 means complex amortises overhead better than real" bar for the first time on this branch; ComplexF32 in particular moves from clearly under 1 (paying a structural complex tax) to roughly parity. This is a real, measured improvement on the shapes `bench_complex_efficiency.jl` sweeps (GEMM-shaped and small-N/M/MN cases at avx512), not a projection.
+
+**Honest null result: `ccsd_t_1_dim16` (ComplexF64) store share did not move.** `benchmark/profile_to_suite.jl`'s `ccsd_t_1_dim16` case (dims 16, 6-index output, 1 contracted index -- the same case the entry above profiled) was re-run at ComplexF64 before/after on this branch (temporarily re-adding the `ccsd_t_1_dim16_c64` case used in that entry; not committed here, since it belongs to the `main`-branch profiling session, not this one). Renormalized against the classified (non-"other") sample count, same convention as the entry above:
+
+| bucket | before (`f7fa490`) | after (this branch) |
+|---|---|---|
+| store | 9418/15546 = 60.6% | 7756/13187 = 58.8% |
+| microkernel | 5380/15546 = 34.6% | 4837/13187 = 36.7% |
+
+A ~2 point shift, within noise for a single profiling run each side -- effectively unmoved, despite this branch shipping exactly the planar store fast path the previous entry's root cause pointed at. **Traced to `_demote_for_run`'s `T <: Real` guard** (`src/driver.jl`): `ccsd_t_1_dim16`'s A/B index structure does not give the default complex kernel's `mr` a leading unit-stride C run that's already a multiple of it, which is precisely the condition `_demote_for_run` exists to fix for real dtypes by picking a smaller-`mr` menu shape (`docs/decisions.md`, "F2" -- see the entry above the store-fastpath section). Because `_demote_for_run`'s specific method is `where {T <: Real}` with a real-only fallback, `ComplexF64` never gets demoted, the store-eligible unit-stride run condition is never satisfied for this shape's default kernel, and `_complex_vector_eligible` (this branch's new gate) correctly falls back to the scalar path -- not because the new fast path is broken, but because the kernel it would apply to is never selected here. The store fast path is real and measured on shapes where the default kernel's `mr` already divides the run (per the `bench_complex_efficiency.jl` numbers above); `ccsd_t_1_dim16` simply isn't one of them.
+
+**Two now-measurably-justified follow-ups**, per this design's own Decision 3 (ship the store fast path first, measure, extend the demotion/swap guards as separate later changes):
+
+  1. **Extend `_demote_for_run` to complex** (higher expected value for `:tccg`-like cases such as `ccsd_t_1_dim16`): per the landmine now recorded at its definition site (`src/driver.jl`), this is not a simple `T <: Real` bound relaxation -- the function's demotion search reads the single-argument `kernel_shapes(T)`, whose complex fallback is `_legacy_shape(T)` at register pressure 30 (over AVX2's 16 ymm register budget). A correct extension must route through the two-argument `kernel_shapes(T, method::ComplexMethod)`/`_complex_kernel_from_shape` construction path instead. Needs its own before/after measurement on `ccsd_t_1_dim16`-shaped cases once built.
+  2. **Extend `_prefer_swap` to complex**: now that `PlanarKernel` has a vector store to potentially win with a swap, the old "nothing to win" rationale (recorded stale at `_prefer_swap`'s definition and call site, `src/driver.jl`) no longer holds by construction, but whether the swap is actually a net win for complex on real workloads is unmeasured. Needs its own before/after measurement, separate from (1) -- the two guards interact (a swap changes which orientation's `mr`/run-length `_demote_for_run` would need to fix) and should not be bundled into one unvalidated change.

@@ -21,7 +21,7 @@
 #   path's runtime-indexed `_acc_lane` helper (src/kernels/simd.jl) must not be
 #   used here.
 
-using SIMD: Vec, vload, vstore
+using SIMD: Vec, vload, vstore, shufflevector
 
 """
     PlanarKernel{MR,NR,T,W}(descriptor)
@@ -275,9 +275,13 @@ end
 # `(QSTile{S,R,C}, kernel)` by dispatch, so the reference project's
 # kernel-writes-a-stack-tile / separate-writeback split would buy nothing and
 # would re-introduce the memory round-trip Phase H removed at ~4x
-# (docs/decisions.md, "The fused `store_tile!` is kept"). The unit-stride
-# plane-to-interleave fast path is a deliberately deferred, measurement-gated
-# follow-on and is NOT built here.
+# (docs/decisions.md, "The fused `store_tile!` is kept").
+#
+# This remains the FALLBACK and the reference. The unit-stride
+# plane-to-interleave fast path that used to be described here as "deliberately
+# deferred" now exists as `_store_tile_planar_vector!` below; this function is
+# unchanged, still serves every ineligible destination, and is what the fast
+# path is tested against (test/test_planar_store_fastpath.jl).
 @generated function _store_tile_planar!(
         destination::QSTile, acc::NTuple{NA, Vec{W, R}},
         alpha::T, beta::T, kernel::PlanarKernel{MR, NR, T, W},
@@ -328,6 +332,287 @@ end
     end
 end
 
+# ----------------------------------------------------------------------------
+# Vectorized unit-stride store fast path (Phase 2 of
+# docs/proposals/complex-fast-paths.md, Section 3.3)
+#
+# The mirror image of the complex PACK fast path (src/packing.jl, Phase 1):
+# packing deinterleaves `Complex{T}`'s native `[re,im,re,im,...]` layout into
+# two planes, and this interleaves two planes back into it. Unlike packing,
+# this also has to do real arithmetic -- `alpha*r + beta*C_old` with COMPLEX
+# `alpha`/`beta`, which mixes the two planes -- so the whole of the difficulty
+# is in reproducing that arithmetic, not in the data movement.
+#
+# ARITHMETIC: this reproduces the expression tree Base's own `Complex`
+# arithmetic specifies -- the same tree `_axpby_tile!` reaches through --
+# operand for operand, with the scalars broadcast to `Vec`. Section 3.3 of the
+# proposal suggested reusing `_accumulate_step_planar`'s four-real-FMA
+# grouping instead; that would have been *a* correct grouping, but a
+# deliberately different one, and there is no reason to accept a second
+# grouping when the scalar path's own is expressible verbatim in lanes.
+#
+# The three `beta` regimes, identical to `_axpby_tile!`'s:
+#
+#   beta == 0   alpha * r
+#               = Complex(ar*rr - ai*ri, ar*ri + ai*rr)        (Base `*`,
+#                 four UNFUSED multiplies; Julia does not set LLVM's `contract`
+#                 flag, so `ar*rr - ai*ri` stays two `vmul` + one `vsub` in
+#                 both the scalar and the vector form -- the same fact the
+#                 `_accumulate_step_planar` guardrail above relies on, used
+#                 here to preserve rounding rather than to avoid losing it.)
+#   beta == 1   muladd(alpha, r, C_old)
+#   otherwise   muladd(alpha, r, beta * C_old)
+#
+#               with Base's `muladd(z,w,x)` =
+#                 Complex(muladd(zr, wr, -muladd(zi, wi, -xr)),
+#                         muladd(zr, wi, muladd(zi, wr, xi)))
+#
+# HOW CLOSE THE TWO PATHS ACTUALLY AGREE, measured rather than assumed
+# (16205 elements over every shipped shape, both dtypes, seven alpha/beta
+# regimes; test/test_planar_store_fastpath.jl re-runs the measurement):
+#
+#   * Every VECTORIZED FULL BLOCK is bit-exact to the tree above -- zero
+#     misses against an independently written, optimization-barriered
+#     transcription of it, compared with `isequal` so `-0.0` and NaN payloads
+#     count. `SIMD.Vec`'s `*`/`-` carry no LLVM `contract` flag, so the lanes
+#     round exactly where the source text says they do.
+#   * Against `_store_tile_planar!` the agreement is exact at `beta == 0` and
+#     `beta == 1`, and ~1 ULP in the general-`beta` regime. The variability is
+#     on the SCALAR side, not this one: LLVM SLP-vectorizes Base's
+#     `muladd(::Complex, ::Complex, ::Complex)` into `<2 x double>` ops and
+#     marks them `contract` (plainly visible in `@code_llvm` of
+#     `muladd(a, r, b*c)` at `ComplexF64`: `fmul contract` / `fsub contract`),
+#     letting the backend fuse a multiply the source text rounds separately.
+#     Whether it fires depends on inlining context, so the scalar path is not
+#     bit-reproducible even against ITSELF across call sites -- measured: 6 of
+#     the 16205 elements differ between this function's own scalar row tail and
+#     `_store_tile_planar!`, running character-identical source. Requiring the
+#     fast path to match it bitwise would be requiring it to match an LLVM
+#     heuristic. This is the situation the proposal's Section 6.4 anticipated
+#     ("compare with a tolerance, never `==`"), with the cause now identified.
+#
+# The `beta` regimes are the SAME three `_axpby_tile!` has, chosen by the same
+# `iszero`/`isone` tests on the same per-call scalar: the beta-applied-once
+# contract (src/kernel.jl's `_store_prologue!`/`_axpby_tile!`) is untouched,
+# and in particular `beta == 0` never loads the destination here either.
+#
+# NOT an `unsafe_` path: it skips no validation a caller would otherwise get.
+# `_store_prologue!` runs first and unchanged, the `(v+1)*W <= m` test keeps
+# every straddling row-vector on the scalar tail exactly as the real path's
+# `_store_tile_vector!` does, and `j < n` keeps padding columns unwritten -- so
+# the set of addresses touched is exactly the set `_store_tile_planar!` would
+# have touched.
+# ----------------------------------------------------------------------------
+
+"""
+    _complex_vector_eligible(tile::QSTile, ::Type{T}) -> Bool
+
+Whether `tile` can take a vectorized complex store/load: unit-stride
+`AffineAxis` rows into rank-1 dense `Complex` storage, on an ISA this ships
+for. The complex counterpart of [`_vector_store_eligible`](@ref)
+(src/kernels/simd.jl) and, per the proposal's Section 5, deliberately ONE
+predicate -- the same shape question asked of a destination tile here and
+(through `_pack_complex_contiguous_eligible`'s clauses) of a source tile in
+src/packing.jl, sharing the ISA half literally via
+`_complex_fastpath_isa_eligible`.
+
+Unit stride plus rank-1 dense storage is what makes `reinterpret`ing the
+storage pointer from `Ptr{Complex{R}}` to `Ptr{R}` a sound bitcast: `W`
+consecutive rows are then `W` consecutive `Complex{R}` values and hence `2W`
+consecutive `R`s. It is unsound for a `ScatterAxis`/`PtrScatterAxis` row, for
+a strided `AffineAxis`, and for non-`DenseArray` storage, and all three are
+excluded here (proposal Section 3.3).
+
+The storage clause inspects types only, so at each specialization the whole
+predicate folds to `_unit_stride_rows(tile.rows) && <isa check>` or to `false`.
+"""
+@inline _complex_vector_eligible(tile::QSTile, ::Type{T}) where {T} =
+    _unit_stride_rows(tile.rows) && tile.storage isa DenseVector{T} &&
+    _complex_fastpath_isa_eligible()
+
+# --- interleave / deinterleave ---------------------------------------------
+#
+# GUARDRAIL, the same one src/packing.jl's shuffle primitives carry: every
+# index tuple is built HERE from `W` at specialization time, never hardcoded to
+# the AVX-512 shape this was written against. `W` is `lanewidth(kernel)`, which
+# the driver derives from `kernel_shapes`, so the patterns follow the shipped
+# menus automatically (proposal Section 6.2). `@generated` because
+# `shufflevector` needs a literal `Val` index tuple.
+#
+# Lane order: `v` is `[re_0, im_0, ..., re_{W-1}, im_{W-1}]`, i.e. `W`
+# consecutive `Complex{R}` values read through their native binary layout.
+
+# Even lanes: the real parts.
+@generated function _deinterleave_re(v::Vec{N, R}, ::Val{W}) where {N, R, W}
+    N == 2 * W || return :(throw(ArgumentError("_deinterleave_re: expected N == 2W")))
+    idx = ntuple(k -> 2 * (k - 1), W)
+    return :(shufflevector(v, Val($idx)))
+end
+
+# Odd lanes: the imaginary parts.
+@generated function _deinterleave_im(v::Vec{N, R}, ::Val{W}) where {N, R, W}
+    N == 2 * W || return :(throw(ArgumentError("_deinterleave_im: expected N == 2W")))
+    idx = ntuple(k -> 2 * (k - 1) + 1, W)
+    return :(shufflevector(v, Val($idx)))
+end
+
+# The inverse: two planes back into `Complex{R}`'s layout. Lane `2t` takes
+# `re[t]` (first source), lane `2t+1` takes `im[t]` (second source, offset by
+# `W` in the index space `shufflevector` uses for a two-operand shuffle).
+@generated function _interleave_planes(re::Vec{W, R}, im::Vec{W, R}, ::Val{W}) where {W, R}
+    idx = ntuple(k -> isodd(k) ? (k - 1) ÷ 2 : W + (k - 1) ÷ 2, 2 * W)
+    return :(shufflevector(re, im, Val($idx)))
+end
+
+# --- the per-block arithmetic ----------------------------------------------
+#
+# One full `W`-row block of one column: read `W` old `Complex{R}` values (only
+# when `beta != 0`), compute `alpha*r + beta*C_old` in split planes, interleave,
+# write them back. `at` is the ZERO-based index of the block's first REAL in
+# the reinterpreted storage, i.e. twice the complex element index.
+#
+# `ar`/`ai`/`br`/`bi` are pre-broadcast once per `store_tile!` call rather than
+# per block; `beta` itself is passed only so the two `iszero`/`isone` tests are
+# the identical tests `_axpby_tile!` makes on the identical value.
+@inline function _planar_store_block!(
+        sp::Ptr{R}, at::Int, rev::Vec{W, R}, imv::Vec{W, R},
+        ar::Vec{W, R}, ai::Vec{W, R}, br::Vec{W, R}, bi::Vec{W, R},
+        beta::Complex{R}, ::Val{W}
+    ) where {R, W}
+    if iszero(beta)
+        # Base `*`: unfused, and deliberately so (see the section header).
+        newre = ar * rev - ai * imv
+        newim = ar * imv + ai * rev
+    else
+        old = vload(Vec{2 * W, R}, sp + sizeof(R) * at)
+        orv = _deinterleave_re(old, Val(W))
+        oiv = _deinterleave_im(old, Val(W))
+        if isone(beta)
+            xr, xi = orv, oiv
+        else
+            # Base `*` again, on `beta * C_old`.
+            xr = br * orv - bi * oiv
+            xi = br * oiv + bi * orv
+        end
+        # Base `muladd(::Complex, ::Complex, ::Complex)`, transcribed.
+        newre = muladd(ar, rev, -muladd(ai, imv, -xr))
+        newim = muladd(ar, imv, muladd(ai, rev, xi))
+    end
+    vstore(_interleave_planes(newre, newim, Val(W)), sp + sizeof(R) * at)
+    return nothing
+end
+
+# Vectorized planar store. Structurally the same `@generated` unroll as the
+# real path's `_store_tile_vector!` (src/kernels/simd.jl) -- same `(v, j)`
+# unrolling for Cliff B (every `acc[...]` a literal tuple index), same
+# full-block vs. row-tail split, same `j < n` column guard -- differing only in
+# that a "row block" is `2W` reals rather than `W`, and that the arithmetic is
+# complex.
+#
+# `rows::AffineAxis` is pinned in the signature so an ineligible tile is a
+# MethodError rather than a wrong answer; the caller checks
+# `_complex_vector_eligible` first.
+#
+# GC.@preserve (proposal Section 6.3): the raw `Ptr{R}` is derived from
+# `storage` and every dereference of it happens inside the preserve block, the
+# same discipline `_pack_a_contiguous!`/`_pack_complex_contiguous!` already
+# follow. The scalar row tail goes through `storage` itself (via `_axpby_at!`),
+# not the pointer: simpler, and character-identical to the fallback's own tail
+# arithmetic -- though not therefore bit-identical to it, see the section
+# header on LLVM's context-dependent `contract` flag.
+@generated function _store_tile_planar_vector!(
+        destination::QSTile{S, <:AffineAxis}, acc::NTuple{NA, Vec{W, R}},
+        alpha::T, beta::T, kernel::PlanarKernel{MR, NR, T, W},
+        m::Int, n::Int
+    ) where {S, MR, NR, T, W, R, NA}
+    R === real(T) ||
+        throw(
+        ArgumentError(
+            "_store_tile_planar_vector!: accumulator lane type $R does not match " *
+                "real($T) = $(real(T))"
+        )
+    )
+    # The bitcast below is only sound on rank-1 dense storage of exactly `T`.
+    # Asserted at specialization time so an ineligible tile that somehow
+    # reached here is a hard error, not a wrong answer.
+    S <: DenseVector{T} ||
+        throw(
+        ArgumentError(
+            "_store_tile_planar_vector!: destination storage $S is not a DenseVector{$T}"
+        )
+    )
+    MV = MR ÷ W
+    NV = MV * NR
+    2NV == NA ||
+        throw(
+        ArgumentError(
+            "_store_tile_planar_vector!: accumulator length $NA does not match " *
+                "2*(mr÷W)*nr = $(2NV) for MR=$MR, NR=$NR, W=$W"
+        )
+    )
+
+    blocks = Any[]
+    for j in 0:(NR - 1)
+        vblocks = Any[]
+        for v in 0:(MV - 1)
+            idx = v + MV * j + 1
+            push!(
+                vblocks, quote
+                    revec = acc[$idx]
+                    imvec = acc[$(NV + idx)]
+                    if $((v + 1) * W) <= m
+                        # Rows v*W .. v*W+W-1 are all inside [0, m): one
+                        # 2W-real load/store at that block's first real.
+                        _planar_store_block!(
+                            sp, 2 * (colbase + $(v * W)), revec, imvec,
+                            ar, ai, br, bi, beta, Val($W)
+                        )
+                    elseif $(v * W) < m
+                        # Row tail: this vector straddles m, so store the valid
+                        # lanes one at a time, through the SAME `_axpby_at!`
+                        # the real path's tail uses -- bitwise the scalar path.
+                        for lane in 1:$W
+                            i = $(v * W) + lane - 1
+                            i < m || break
+                            _axpby_at!(
+                                storage, colbase + i + 1, alpha,
+                                Complex(revec[lane], imvec[lane]), beta
+                            )
+                        end
+                    end
+                end
+            )
+        end
+        push!(
+            blocks, quote
+                if $j < n
+                    colbase = rowbase0 + axis_offset(cols, $j)  # zero-based element address of (i=0, j)
+                    $(vblocks...)
+                end
+            end
+        )
+    end
+
+    return quote
+        storage = destination.storage
+        cols = destination.cols
+        # zero-based element address at (i=0, j=0)'s row contribution; rows are
+        # unit-stride, so row `i` is `rowbase0 + i`.
+        rowbase0 = destination.base + destination.rows.base
+        ar = Vec{$W, $R}(real(alpha))
+        ai = Vec{$W, $R}(imag(alpha))
+        br = Vec{$W, $R}(real(beta))
+        bi = Vec{$W, $R}(imag(beta))
+        GC.@preserve storage begin
+            sp = reinterpret(Ptr{$R}, pointer(storage))
+            @inbounds begin
+                $(blocks...)
+            end
+        end
+        return destination
+    end
+end
+
 """
     store_tile!(destination::QSTile, acc::NTuple{2NV,SIMD.Vec{W,real(T)}}, alpha::T, beta::T, kernel::PlanarKernel) -> destination
 
@@ -338,9 +623,26 @@ skips the multiplication; padding lanes (`i >= m`, `j >= n`) are never read, so
 nonfinite padding in `acc` cannot propagate; an empty destination is a no-op in
 every branch.
 
-Ships the scattered/scalar path only, recombining `Complex(re[lane], im[lane])`
-and delegating to the existing generic `_axpby_tile!` (src/kernel.jl), which is
-already generic in the value type and provides those `beta` shortcuts.
+Two paths, chosen by [`_complex_vector_eligible`](@ref):
+
+  * Fast path, `_store_tile_planar_vector!`: unit-stride `AffineAxis` rows into
+    rank-1 dense `Complex` storage on a shipped ISA. Whole `W`-row blocks get
+    one `2W`-real load (only when `beta != 0`), a plane-wise complex multiply-
+    add, an interleave shuffle and one `2W`-real store; a straddling row-vector
+    falls to the scalar tail.
+  * Fallback, `_store_tile_planar!`: everything else -- scattered or strided
+    rows, non-dense storage, an un-shipped ISA. Recombines
+    `Complex(re[lane], im[lane])` and delegates to the generic `_axpby_tile!`
+    (src/kernel.jl), which provides the `beta` shortcuts.
+
+The fast path is bitwise identical (`isequal`, so `-0.0`/NaN payloads count)
+to a from-scratch, optimization-barriered transcription of the expression
+tree documented above this function's implementation. Against the fallback
+specifically, it is exact at `beta == 0` and `beta == 1`, and within ~1 ULP
+in the general-`beta` regime -- the fallback itself is not bit-reproducible
+against ITSELF across call sites there (LLVM inconsistently fuses Base's
+`muladd(::Complex,::Complex,::Complex)`; see the divergence measurement
+above). Compare the general-`beta` case with a tolerance, never `==`.
 """
 function store_tile!(
         destination::QSTile, acc::NTuple{NA, Vec{W, R}},
@@ -348,6 +650,11 @@ function store_tile!(
     ) where {MR, NR, T, W, R, NA}
     m, n = _store_prologue!(destination, alpha, beta)
     (m == 0 || n == 0) && return destination
+
+    if _complex_vector_eligible(destination, T)
+        return _store_tile_planar_vector!(destination, acc, alpha, beta, kernel, m, n)
+    end
+
     return _store_tile_planar!(destination, acc, alpha, beta, kernel, m, n)
 end
 
