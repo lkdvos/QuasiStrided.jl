@@ -114,6 +114,36 @@ function ratio_for(rows, case_id, num, den)
     return t_num / t_den
 end
 
+# Whether `seq` can be split into the two given label sets with each set
+# occupying one contiguous run of `seq` (in either order) -- i.e. whether
+# `seq`'s own physical index order already groups the two sets without
+# interleaving them. This is the exact condition under which merging each
+# set into one composite index is a plain reshape (no data movement): the
+# labels do not need to already be sorted or in any canonical order *within*
+# a set, only the two sets must not interleave.
+function _contiguous_partition(seq::AbstractString, groupA::AbstractSet{Char})
+    length(seq) <= 1 && return true
+    tags = [c in groupA for c in seq]
+    transitions = count(i -> tags[i] != tags[i - 1], 2:length(tags))
+    return transitions <= 1
+end
+
+# "Permute-free" = the whole contraction reduces to a bare BLAS `gemm!` via
+# reshapes alone: A's M/K labels are each contiguous in IA, B's K/N labels
+# are each contiguous in IB, AND C's M/N labels are each contiguous in IC (a
+# permute-free A/B pack alone isn't enough if the output still needs
+# permuting into IC's label order). This is a property of the label ORDER
+# only -- true for every :pairwise case by construction (`_pairwise_cases`
+# always builds `IA = openA++contract`, `IB = contract++openB`,
+# `IC = openA++openB`), generally false for :tccg's realistic index orders.
+function is_permute_free(IA::AbstractString, IB::AbstractString, IC::AbstractString)
+    contracted = Set(IA) ∩ Set(IB)
+    _contiguous_partition(IA, contracted) || return false
+    _contiguous_partition(IB, contracted) || return false
+    openA = setdiff(Set(IA), contracted)
+    return _contiguous_partition(IC, openA)
+end
+
 # Shared by :pairwise and :tccg: an einsum-style index expression ("IA,IB->IC")
 # plus the case's arithmetic intensity (FLOP/byte moved), instead of the bare
 # `case_id` (e.g. "dim15_2_1_2"/"ccsd_6_dim16"). Intensity is
@@ -122,17 +152,19 @@ end
 # mirrors bench_to_suite.jl's own `flops(spec)`/`case_bytes(spec, T)`,
 # specialized to the case where every leg has the same dimension `dim` (true
 # for both categories) so element counts reduce to
-# `dim^(number of distinct letters)`.
+# `dim^(number of distinct letters)`. A leading "*" marks a permute-free case
+# (see `is_permute_free`).
 function shape_label(IA::AbstractString, IB::AbstractString, IC::AbstractString, dim::Int, dtype::String)
     contracted = intersect(Set(IA), Set(IB))
     nA_open, nB_open, nc = length(IA) - length(contracted), length(IB) - length(contracted), length(contracted)
     expr = isempty(contracted) ? "$IA,$IB->$IC (outer)" : "$IA,$IB->$IC"
+    star = is_permute_free(IA, IB, IC) ? "*" : ""
 
     flops = 2.0 * Float64(dim)^(nA_open + nc + nB_open)
     esz = ELSIZE[dtype]
     bytes = esz * (Float64(dim)^length(IA) + Float64(dim)^length(IB) + Float64(dim)^length(IC))
     intensity = flops / bytes
-    return @sprintf("%s  dim=%d  %.3g FLOP/B", expr, dim, intensity)
+    return @sprintf("%s%s  dim=%d  %.3g FLOP/B", star, expr, dim, intensity)
 end
 
 function pairwise_shape_label(dim::Int, params::Dict{String, String}, dtype::String)
@@ -183,7 +215,14 @@ for dtype in PLOTTED_DTYPES, category in unique(r.category for r in ROWS)
         ) for id in ids
     ]
 
-    fig = Figure(size = (1150, max(400, 26 * length(ids) + 150)))
+    fig = Figure(size = (1150, max(400, 26 * length(ids) + 150) + (labeler === nothing ? 0 : 24)))
+    if labeler !== nothing
+        Label(
+            fig[0, 1:2],
+            "* = permute-free (A/B pack and the C store all reduce to a bare BLAS gemm! via reshapes -- no permutation anywhere)";
+            fontsize = 12
+        )
+    end
 
     ax1 = Axis(
         fig[1, 1]; xscale = log10, yticks = (1:length(ids), labels),
@@ -211,7 +250,14 @@ for dtype in PLOTTED_DTYPES, category in unique(r.category for r in ROWS)
 
     HAS_SPREAD_COLUMNS || continue
 
-    vfig = Figure(size = (1150, max(400, 26 * length(ids) + 150)))
+    vfig = Figure(size = (1150, max(400, 26 * length(ids) + 150) + (labeler === nothing ? 0 : 24)))
+    if labeler !== nothing
+        Label(
+            vfig[0, 1],
+            "* = permute-free (A/B pack and the C store all reduce to a bare BLAS gemm! via reshapes -- no permutation anywhere)";
+            fontsize = 12
+        )
+    end
     vax = Axis(
         vfig[1, 1]; yticks = (1:length(ids), labels),
         xlabel = "GFLOP/s -- modeled from median/min/std (see file header)",
