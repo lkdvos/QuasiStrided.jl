@@ -1,3 +1,66 @@
+# Frozen coupling contract between packing (tiles.jl/packing.jl) and the
+# kernels (kernel.jl/kernels/simd.jl); do not redefine elsewhere.
+
+# Register-tile validation shared by `KernelDescriptor` and
+# `ComplexKernelDescriptor`. `name` only names the type in the message;
+# construction-time only, never hot.
+@inline function _check_reg_tile(name, MR, NR)
+    MR isa Int && NR isa Int ||
+        throw(ArgumentError("$name requires Int type parameters MR, NR"))
+    MR > 0 || throw(ArgumentError("$name requires MR > 0, got MR = $MR"))
+    NR > 0 || throw(ArgumentError("$name requires NR > 0, got NR = $NR"))
+    return nothing
+end
+
+"""
+    KernelDescriptor{MR,NR,T}
+
+A microkernel's register-tile shape (`MR`x`NR`, `Int` type params) and
+scalar type `T` (`Float32`/`Float64`). Stateless: exists to dispatch
+packed-offset formulas and name `T`; concrete kernels wrap or reference one.
+"""
+struct KernelDescriptor{MR, NR, T}
+    function KernelDescriptor{MR, NR, T}() where {MR, NR, T}
+        _check_reg_tile("KernelDescriptor", MR, NR)
+        T === Float32 || T === Float64 ||
+            throw(ArgumentError("KernelDescriptor requires T ∈ (Float32, Float64) for this milestone, got $T"))
+        return new{MR, NR, T}()
+    end
+end
+
+KernelDescriptor(::Val{MR}, ::Val{NR}, ::Type{T}) where {MR, NR, T} = KernelDescriptor{MR, NR, T}()
+
+mr(::KernelDescriptor{MR}) where {MR} = MR
+nr(::KernelDescriptor{MR, NR}) where {MR, NR} = NR
+scalartype(::KernelDescriptor{MR, NR, T}) where {MR, NR, T} = T
+
+"""
+    packed_a_offset(kernel::KernelDescriptor, i::Int, p::Int) -> Int
+
+Zero-based packed offset of A's entry `(row i, K-step p)` in an `(MR, kc)`
+panel: `i + MR*p`.
+"""
+packed_a_offset(kernel::KernelDescriptor{MR}, i::Int, p::Int) where {MR} = i + MR * p
+
+"""
+    packed_b_offset(kernel::KernelDescriptor, j::Int, p::Int) -> Int
+
+Zero-based packed offset of B's entry `(col j, K-step p)` in an `(NR, kc)`
+panel: `j + NR*p` (not column-major).
+"""
+packed_b_offset(kernel::KernelDescriptor{MR, NR}, j::Int, p::Int) where {MR, NR} = j + NR * p
+
+
+"""
+    packed_a_length(kernel, kc::Int) -> Int
+    packed_b_length(kernel, kc::Int) -> Int
+
+Minimum packed-buffer capacity (elements) for a full A/B panel at K-depth
+`kc` (`kc == 0` yields 0).
+"""
+packed_a_length(kernel::KernelDescriptor{MR}, kc::Int) where {MR} = MR * kc
+packed_b_length(kernel::KernelDescriptor{MR, NR}, kc::Int) where {MR, NR} = NR * kc
+
 # Packed-panel formats for complex element types, and the descriptor that names
 # them. Complex support is deliberately expressed as "N planes of the real
 # type": everything below this boundary -- packed buffers, `SIMD.Vec` lanes,
@@ -66,81 +129,6 @@ Reals emitted per source element per *logical* K step: 1, 2 and 4 for
 reals_per_element(::RealFormat) = 1
 reals_per_element(::PlanarFormat) = 2
 reals_per_element(::OneEFormat) = 4
-
-# ----------------------------------------------------------------------------
-# Complex methods
-# ----------------------------------------------------------------------------
-
-"""
-    ComplexMethod
-
-Which complex-arithmetic method a kernel implements. Singleton types, so
-`default_blocking` and the shape menus dispatch on them without a runtime
-branch.
-
-**No auto-dispatch rule is derived from any measurement**: the sibling project
-measured four different method orderings on four machines.
-[`PlanarMethod`](@ref) is the unconditional default; [`OneMMethod`](@ref) is
-selected only by naming the kernel (docs/decisions.md, "Method ranking does not
-transfer between machines").
-"""
-abstract type ComplexMethod end
-
-"""
-    RealMethod()
-
-Not a complex method: what `complex_method` reports for a real kernel, so that
-`default_blocking` and the shape menus are total without a `T <: Complex` guard
-at every call site.
-"""
-struct RealMethod <: ComplexMethod end
-
-"""
-    PlanarMethod()
-
-Split-complex: both operands [`PlanarFormat`](@ref), driven by a genuinely
-complex microkernel that issues four real FMAs per (A-vector, B-scalar) pair on
-data already in the right lanes -- no shuffles, no `fmaddsub`. The default.
-"""
-struct PlanarMethod <: ComplexMethod end
-
-"""
-    OneMMethod()
-
-Van Zee's induced 1m: one *real* microkernel of shape `2mr x nr` run over
-`2*kc` real steps, fed by [`OneEFormat`](@ref) A and [`PlanarFormat`](@ref) B.
-The kernel body is the real `SIMDKernel`'s, reused verbatim -- so a
-planar-vs-1m measurement compares two methods, not two hand-written kernels.
-"""
-struct OneMMethod <: ComplexMethod end
-
-"""
-    a_reals(::ComplexMethod) -> Int
-    b_reals(::ComplexMethod) -> Int
-
-Reals per element in the packed A / B panel under this method. These are what
-`default_blocking` divides the measured real `mc`/`nc` by, so every method gets
-the *same packed byte budget* rather than the same element count -- 1m's `mc`
-halving is derived from this, never tabulated.
-"""
-a_reals(::RealMethod) = 1
-b_reals(::RealMethod) = 1
-a_reals(::PlanarMethod) = 2
-b_reals(::PlanarMethod) = 2
-a_reals(::OneMMethod) = 4
-b_reals(::OneMMethod) = 2
-
-"""
-    accumulator_planes(::ComplexMethod) -> Int
-
-Accumulator planes the microkernel holds live. Planar keeps separate real and
-imaginary planes (so its register budget is twice a real kernel's at the same
-`(mr, nr)`); 1m keeps one plane over a doubled real row count. Used by the
-register-budget assertion, which must not assume the real kernel's shape.
-"""
-accumulator_planes(::RealMethod) = 1
-accumulator_planes(::PlanarMethod) = 2
-accumulator_planes(::OneMMethod) = 1
 
 # ----------------------------------------------------------------------------
 # The complex descriptor
@@ -259,22 +247,3 @@ through these, so the layout is written down once.
 @inline packed_b_plane_offset(
     d::ComplexKernelDescriptor{MR, NR}, plane::Int, j::Int, p::Int
 ) where {MR, NR} = p * packed_b_per_k(d) + plane * NR + j
-
-"""
-    complex_method(kernel) -> ComplexMethod
-
-Which complex method a kernel implements; [`RealMethod`](@ref) for every kernel
-that has not said otherwise, which keeps `default_blocking` and the shape menus
-total.
-"""
-complex_method(::Any) = RealMethod()
-
-# ----------------------------------------------------------------------------
-# DescriptorKernel forwarding, mirroring the block in src/kernel.jl
-# ----------------------------------------------------------------------------
-
-realtype(k::DescriptorKernel) = realtype(k.descriptor)
-packed_a_per_k(k::DescriptorKernel) = packed_a_per_k(k.descriptor)
-packed_b_per_k(k::DescriptorKernel) = packed_b_per_k(k.descriptor)
-a_format(k::DescriptorKernel) = a_format(k.descriptor)
-b_format(k::DescriptorKernel) = b_format(k.descriptor)

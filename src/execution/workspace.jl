@@ -313,3 +313,67 @@ end
 # empty `tw_packed_a` means -- and only means -- the workspace was built with
 # `oracle = false`.
 @inline _has_oracle(ws::ContractWorkspace) = !isempty(ws.tw_packed_a)
+
+# Build or reuse the plan's workspace. Dispatching on the allocator type (not
+# an `isa` branch on a value) keeps both paths concretely typed and makes the
+# unreachable one disappear at compile time. Default path: a plain, GC-owned
+# workspace, reused via `reserve!` when one is handed in -- the
+# zero-steady-state-allocation fast path (docs/decisions.md, Amendment 1).
+function _resolve_workspace(
+        ::Type{T}, workspace, kernel, blocking::Blocking, oracle::Bool,
+        allocator::TO.DefaultAllocator
+    ) where {T}
+    workspace === nothing &&
+        return ContractWorkspace(T, kernel, blocking, oracle, allocator)
+    return _reuse_workspace(T, workspace, kernel, blocking, oracle)
+end
+
+# Explicit-allocator path: sized exactly once from the effective blocking, no
+# `reserve!`, no resizing. The caller owns `release!`.
+function _resolve_workspace(
+        ::Type{T}, workspace, kernel, blocking::Blocking, oracle::Bool, allocator
+    ) where {T}
+    workspace === nothing || throw(
+        ArgumentError(
+            "plan_contract: `workspace` cannot be combined with a non-default " *
+                "`allocator` ($(typeof(allocator))); an allocator-provided workspace is " *
+                "sized once at construction and must not be resized or reused"
+        )
+    )
+    return ContractWorkspace(T, kernel, blocking, oracle, allocator)
+end
+
+# `R` is the PACKED element type, `real(T)` by `ContractWorkspace`'s own
+# invariant. The extra guard stops a pooled workspace of one precision serving
+# a plan of another: the pool is keyed by `eltype(C)` alone, so `T` matching is
+# not enough once the packed type is a separate notion. Both sides are
+# compile-time constants, so this folds away entirely.
+@inline function _reuse_workspace(
+        ::Type{T}, ws::ContractWorkspace{T, Vector{R}}, kernel, blocking::Blocking,
+        oracle::Bool
+    ) where {T, R}
+    R === realtype(kernel) || _throw_packed_eltype_mismatch(T, ws, kernel)
+    return reserve!(ws, kernel, blocking, oracle)
+end
+
+@noinline function _throw_packed_eltype_mismatch(::Type{T}, ws, kernel) where {T}
+    throw(
+        ArgumentError(
+            "plan_contract: cannot reuse a $(typeof(ws)) whose packed panels hold " *
+                "$(eltype(ws.packed_a)) for a kernel packing $(realtype(kernel))"
+        )
+    )
+end
+
+@noinline function _reuse_workspace(
+        ::Type{T}, ws::ContractWorkspace, kernel, blocking::Blocking, oracle::Bool
+    ) where {T}
+    throw(
+        ArgumentError(
+            "plan_contract: cannot reuse a $(typeof(ws)) for an eltype-$T contraction " *
+                "on the default allocator; only a " *
+                "ContractWorkspace{$T,Vector{$(realtype(kernel))}} -- storage element " *
+                "type $T, packed panels of $(realtype(kernel)) -- is `reserve!`-able"
+        )
+    )
+end
