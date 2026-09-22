@@ -27,7 +27,7 @@
 using Test
 using QuasiStrided
 using QuasiStrided: ComplexKernelDescriptor, PlanarFormat, OneEFormat, RealFormat,
-    AffineAxis, ScatterAxis, SourceTile, pack_a!, pack_b!,
+    AffineAxis, ScatterAxis, PtrScatterAxis, SourceTile, pack_a!, pack_b!,
     packed_a_length, packed_b_length, packed_panel, PackedPanel,
     target_profile, unknown_target, TargetProfile, CacheLevel,
     KERNEL_SHAPES_C64_PLANAR, KERNEL_SHAPES_C32_PLANAR,
@@ -292,8 +292,9 @@ end
     storage = fp_storage(T, 4000)
     rows = AffineAxis(0, 1, MR)
     buf = fill(R(0), packed_a_length(ComplexKernelDescriptor(Val(MR), Val(NR), T, fa, fa), kc))
+    ptr_scatter_offs = collect(0:(MR - 1))
 
-    GC.@preserve buf begin
+    GC.@preserve buf ptr_scatter_offs begin
         pk = packed_panel(buf, 1, length(buf))
         elig(; packed = pk, store = storage, ax = rows, tr = identity, fmt = fa,
             valid = MR, pd = Val(MR), et = T) =
@@ -310,6 +311,7 @@ end
         @test elig(ax = AffineAxis(0, 2, MR)) == false           # strided lanes
         @test elig(ax = AffineAxis(0, -1, MR)) == false          # negative unit stride
         @test elig(ax = ScatterAxis(collect(0:(MR - 1)), MR)) == false     # scattered lanes
+        @test elig(ax = PtrScatterAxis(pointer(ptr_scatter_offs), MR)) == false   # scattered lanes, `Ptr`-backed (`_axis_of`'s irregular-axis type)
         @test elig(valid = MR - 1) == false                      # tail sliver (padding)
         @test elig(valid = 0) == false
         @test elig(tr = (z -> 2z)) == false                      # transform not id/conj
@@ -382,7 +384,7 @@ end
     @test !QS._complex_fastpath_isa_eligible(unknown_target())
     # The live gate agrees with the live profile: this is what makes every
     # `== FASTPATH_ON` assertion above meaningful under forced_isa_runner.jl.
-    @test FASTPATH_ON == (target_profile().vector_bytes == 64)
+    @test FASTPATH_ON == (target_profile().vector_bytes == QS._isa_vector_bytes(Val(:avx512)))
 end
 
 # ---------------------------------------------------------------------------

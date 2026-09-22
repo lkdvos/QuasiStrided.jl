@@ -623,8 +623,7 @@ skips the multiplication; padding lanes (`i >= m`, `j >= n`) are never read, so
 nonfinite padding in `acc` cannot propagate; an empty destination is a no-op in
 every branch.
 
-Two paths, chosen by [`_complex_vector_eligible`](@ref) and producing
-**bitwise identical** results (not merely results within a tolerance):
+Two paths, chosen by [`_complex_vector_eligible`](@ref):
 
   * Fast path, `_store_tile_planar_vector!`: unit-stride `AffineAxis` rows into
     rank-1 dense `Complex` storage on a shipped ISA. Whole `W`-row blocks get
@@ -635,6 +634,15 @@ Two paths, chosen by [`_complex_vector_eligible`](@ref) and producing
     rows, non-dense storage, an un-shipped ISA. Recombines
     `Complex(re[lane], im[lane])` and delegates to the generic `_axpby_tile!`
     (src/kernel.jl), which provides the `beta` shortcuts.
+
+The fast path is bitwise identical (`isequal`, so `-0.0`/NaN payloads count)
+to a from-scratch, optimization-barriered transcription of the expression
+tree documented above this function's implementation. Against the fallback
+specifically, it is exact at `beta == 0` and `beta == 1`, and within ~1 ULP
+in the general-`beta` regime -- the fallback itself is not bit-reproducible
+against ITSELF across call sites there (LLVM inconsistently fuses Base's
+`muladd(::Complex,::Complex,::Complex)`; see the divergence measurement
+above). Compare the general-`beta` case with a tolerance, never `==`.
 """
 function store_tile!(
         destination::QSTile, acc::NTuple{NA, Vec{W, R}},

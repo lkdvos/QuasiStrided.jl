@@ -237,13 +237,20 @@ end
 # of the kernel each orientation would actually run (they differ only when the
 # default kernel's small-Qm demotion applies to one side).
 #
-# Callers must additionally restrict this to real dtypes -- `PlanarKernel`/
-# `OneMKernel` (complex) ship the scattered/scalar store unconditionally
-# (`src/kernels/planar.jl`, `src/kernels/onem.jl`), so this function's whole
-# rationale is moot for them; measured directly (`ccsd_t_3`, dim=16, both
-# complex dtypes): the swap is a ~2-4% regression there (loses the as-is
-# orientation's N-side locality for no store-side gain). See the `T <: Real`
-# guard at the call site.
+# Callers must additionally restrict this to real dtypes -- measured directly
+# (`ccsd_t_3`, dim=16, both complex dtypes): the swap is a ~2-4% regression
+# there (loses the as-is orientation's N-side locality for no store-side
+# gain), back when `PlanarKernel`/`OneMKernel` (complex) shipped only a
+# scattered/scalar store. As of the planar vectorized store fast path
+# (`_store_tile_planar_vector!`, `src/kernels/planar.jl`), that measurement is
+# STALE: there is now a vector store for the swap to potentially win on the
+# complex path too. The `T <: Real` guard below is a DELIBERATELY DEFERRED,
+# UNMEASURED follow-up, not a settled "moot" case -- per
+# docs/proposals/complex-fast-paths.md Decision 3, extending `_prefer_swap` to
+# complex was explicitly scoped out of this change to ship the store fast path
+# first and measure it, with any extension here to be a separate later change
+# with its own before/after measurement. See the `T <: Real` guard at the
+# call site.
 function _prefer_swap(
         morder::Vector{Int}, norder::Vector{Int}, indC::NTuple{NC, Int}, C::StridedView,
         mr_asis::Int, mr_swapped::Int = mr_asis
@@ -264,9 +271,27 @@ end
 # the slow scattered store; demoting to the LARGEST menu shape whose `mr`
 # satisfies it (not the smallest -- measured: at run=16 for Float32, `(16,6,8)`
 # beats `(8,6,8)`) reuses an already-compiled specialization from
-# `kernel_shapes(T)`. Real dtypes only: complex kernels scatter-store
-# unconditionally, so the predicate is moot for them (the generic fallback
-# method below is a no-op).
+# `kernel_shapes(T)`. Real dtypes only, currently: this was written back when
+# complex kernels scatter-stored unconditionally, making the predicate moot
+# for them. As of the planar vectorized store fast path
+# (`_store_tile_planar_vector!`, `src/kernels/planar.jl`), that is no longer
+# true, and this `T <: Real` bound is a DELIBERATELY DEFERRED, UNMEASURED
+# follow-up (docs/proposals/complex-fast-paths.md Decision 3: ship the store
+# fast path first, measure it, extend this guard as a separate later change),
+# not a settled "moot" case -- the generic fallback method below is currently
+# a no-op for complex, but need not stay one.
+#
+# LANDMINE for whoever picks this up: naively widening the bound to `T <:
+# Number`/dropping `<: Real` here is NOT sufficient by itself. The loop below
+# calls the single-argument `kernel_shapes(T)`, whose generic fallback for
+# complex types returns only `_legacy_shape(T)` -- register pressure 30,
+# explicitly warned against elsewhere in this file (~line 631-633, over
+# AVX2's 16 ymm). The real complex kernel menus live behind the two-argument
+# `kernel_shapes(T, method::ComplexMethod)` and `_complex_kernel_from_shape`,
+# a different construction path entirely (see `_default_kernel(::Type{T})
+# where {T<:Complex}` above). A correct fix must route the demotion search
+# through `kernel_shapes(T, method)`/`_complex_kernel_from_shape`, not just
+# relax this type bound.
 function _demote_for_run(::Type{T}, kernel, run::Int, Qm::Int) where {T <: Real}
     Qm == run && return kernel
     run % mr(kernel) == 0 && return kernel
@@ -1045,12 +1070,16 @@ function plan_contract(
     kernel_asis = kernel === nothing ? _default_kernel(T, Qm, Qn) : kernel
     kernel_swapped = kernel === nothing ? _default_kernel(T, Qn, Qm) : kernel
 
-    # Complex kernels (`PlanarKernel`/`OneMKernel`) always scatter-store --
-    # `_vector_store_eligible` only exists on the real path -- so there is
-    # nothing for the swap to win there, and it measurably loses the as-is
-    # orientation's N-side locality instead (~2-4%, `ccsd_t_3`, ComplexF64/32).
-    # Real kernels (`SIMDKernel` and, for this run-length rule, `ScalarKernel`
-    # too) keep the swap.
+    # Complex kernels (`PlanarKernel`/`OneMKernel`) once always scatter-stored
+    # unconditionally, and back then the swap measurably lost the as-is
+    # orientation's N-side locality for no store-side gain (~2-4%, `ccsd_t_3`,
+    # ComplexF64/32). `PlanarKernel` now has a vectorized store fast path
+    # (`_store_tile_planar_vector!`, `src/kernels/planar.jl`), so there IS
+    # potentially something for the swap to win on the complex path -- this
+    # `T <: Real` guard is a deliberately deferred, unmeasured follow-up
+    # (docs/proposals/complex-fast-paths.md Decision 3), not a settled case of
+    # nothing to gain. Real kernels (`SIMDKernel` and, for this run-length
+    # rule, `ScalarKernel` too) keep the swap.
     if T <: Real && _prefer_swap(morder, norder, indC, C, mr(kernel_asis), mr(kernel_swapped))
         # B takes the M role and A the N role. Everything operand-bound moves
         # together: the groups (each already carries its own C map), the K

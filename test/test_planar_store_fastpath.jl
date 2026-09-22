@@ -55,7 +55,7 @@
 using Test
 using Random
 using QuasiStrided
-using QuasiStrided: PlanarKernel, AffineAxis, ScatterAxis, DestinationTile, QSTile,
+using QuasiStrided: PlanarKernel, AffineAxis, ScatterAxis, PtrScatterAxis, DestinationTile, QSTile,
     store_tile!, target_profile, unknown_target, TargetProfile, CacheLevel,
     KERNEL_SHAPES_C64_PLANAR, KERNEL_SHAPES_C32_PLANAR
 using SIMD: Vec
@@ -308,6 +308,10 @@ end
     @test !QSS._complex_vector_eligible(
         DestinationTile(storage, 0, ScatterAxis(collect(0:(m - 1)), m), AffineAxis(0, m, n)), T
     )                                                         # scattered rows
+    ptr_scatter_rows = collect(0:(m - 1))
+    @test !QSS._complex_vector_eligible(
+        DestinationTile(storage, 0, PtrScatterAxis(pointer(ptr_scatter_rows), m), AffineAxis(0, m, n)), T
+    )                                                         # scattered rows, `Ptr`-backed (`_axis_of`'s irregular-axis type)
     @test !QSS._complex_vector_eligible(
         DestinationTile(view(storage, 1:(m * n)), 0, AffineAxis(0, 1, m), AffineAxis(0, m, n)), T
     )                                                         # non-dense storage
@@ -384,7 +388,7 @@ end
     @test !QSS._complex_fastpath_isa_eligible(unknown_target())
     # The live gate agrees with the live profile: this is what makes every
     # `== STORE_FASTPATH_ON` assertion above meaningful under forced_isa_runner.jl.
-    @test STORE_FASTPATH_ON == (target_profile().vector_bytes == 64)
+    @test STORE_FASTPATH_ON == (target_profile().vector_bytes == QSS._isa_vector_bytes(Val(:avx512)))
 end
 
 # ---------------------------------------------------------------------------
