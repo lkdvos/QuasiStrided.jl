@@ -59,8 +59,8 @@ const _INDC = (1, 4, 3)
 using QuasiStrided: TargetProfile, CacheLevel
 
 const VALID_ISAS = (:avx512, :avx2, :neon, :unknown)
-# `nregisters` defaults to 32 so every pre-existing caller is unchanged; the
-# complex shape-fitting tests pass the real per-ISA count.
+# `nregisters` defaults to 32; the complex shape-fitting tests pass the real
+# per-ISA count.
 synthetic(isakey, vb; nregisters::Int = 32) = TargetProfile(
     isakey, Sys.ARCH, "synthetic", vb, nregisters,
     CacheLevel(), CacheLevel(), CacheLevel()

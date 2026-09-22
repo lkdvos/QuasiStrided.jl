@@ -25,7 +25,7 @@ end
 # ----------------------------------------------------------------------------
 # Shared argument validation for all four pack_a!/pack_b! methods
 # ----------------------------------------------------------------------------
-# Extent bound, nonnegative `kc`, packed capacity, then (Phase 2b) the
+# Extent bound, nonnegative `kc`, packed capacity, then the
 # one-time storage-bounds check before any `@inbounds` loop. Returns
 # `(valid, kc)`; `kc == 0` is the no-op the caller returns from. One bound type
 # parameter per argument, as at `pack_a!` in src/microkernels/interface.jl.
@@ -35,8 +35,8 @@ end
 # serves both without knowing which it has.
 
 # `BOUNDS` is a compile-time flag, not a runtime one: at `Val(true)` the body
-# below is the code this function has always generated, and at `Val(false)`
-# the `checked_tile_storage_bounds` call is folded away entirely. Only
+# below runs every check, and at `Val(false)` the `checked_tile_storage_bounds`
+# call is folded away entirely. Only
 # `unsafe_pack_a!`/`unsafe_pack_b!` ever pass `Val(false)`, and only from a
 # caller that has already validated the WHOLE macro block this sliver belongs
 # to (src/execution/execute.jl, `_execute_nest!`). Every other check -- extents, the
@@ -299,7 +299,7 @@ end
 # Complex packing
 #
 # Everything below writes `real(T)` into the packed buffer. The `transform`
-# contract, frozen format-independently in that section:
+# contract, which holds for every format:
 #
 #   `transform` is applied to each loaded *source element* before it is
 #   committed, in whatever physical format the buffer uses. A packer that

@@ -1,5 +1,5 @@
 # StridedViews integration, plus a test-only packing/contraction consumer,
-# written against the frozen spec without reading src/layout/axis_group.jl's internals.
+# written against the spec rather than src/layout/axis_group.jl's internals.
 
 using Test
 using StridedViews: StridedView, offset
@@ -12,8 +12,7 @@ using QuasiStrided: AxisGroup, axis_length, offsets, fill_offsets!, BlockDescrip
 # Uses only documented StridedViews accessors: `size`, `strides` (both
 # generic AbstractArray/Base methods that StridedView supports), and the
 # exported `offset(::StridedView)` giving the zero-based base offset into
-# the parent storage (verified against the installed StridedViews v0.5.2
-# source, stridedview.jl:115,120).
+# the parent storage.
 
 """
     group_from_views(views, axeslist) -> AxisGroup
@@ -194,9 +193,8 @@ end
 # =====================================================================
 # Test-only packer (spec section 10) -- NOT a production packing format.
 # This is deliberately a simple, explicit rectangle packer to exercise the
-# indexing interface end to end; it must not be confused with the separate,
-# later, production packer described in
-# Julia-Microkernel-Tile-Interface-Design.md.
+# indexing interface end to end; it must not be confused with the production
+# packer in src/packing/.
 # =====================================================================
 
 """

@@ -24,8 +24,8 @@
 #   Cliff A (architectural register spill) by `onem_register_pressure`, whose
 #   docstring carries the measured `%rsp` traffic. 1m holds `MV*NR`
 #   accumulators against planar's `2*MV*NR`, so it should be comfortable -- but
-#   Phase C found the freeze's register arithmetic optimistic once, so the
-#   numbers there are measured, not derived.
+#   derived register arithmetic has proved optimistic for complex kernels, so
+#   the numbers there are measured, not derived.
 
 using Test
 using Random
@@ -274,21 +274,21 @@ const _QS = QuasiStrided
         end
         # 1m holds one accumulator plane where planar holds two, so at an
         # identical (MR, NR, W) it needs strictly fewer registers -- the reason
-        # the freeze calls 1m "comfortable" where planar at (16,6,8) is not.
+        # 1m is "comfortable" where planar at (16,6,8) is not.
         for (MR, NR, W) in ((16, 6, 8), (8, 8, 8))
             km = OneMKernel(Val(MR), Val(NR), ComplexF64, Val(W))
             kp = PlanarKernel(Val(MR), Val(NR), ComplexF64, Val(W))
             @test onem_register_pressure(km) < planar_register_pressure(kp)
         end
-        # The worst shipped 1m shape sits at 29, one below the 29/30 transition
-        # Phase C measured for planar. (Recorded, not a throughput claim.)
+        # The worst shipped 1m shape sits at 29, one below the 29/30 spill
+        # transition measured for planar. (Recorded, not a throughput claim.)
         @test maximum(
             onem_register_pressure(OneMKernel(Val(MR), Val(NR), ComplexF64, Val(W)))
                 for (MR, NR, W) in MENU64
         ) == 29
         # `skip`ped when detection came up empty (the `:unknown` case the
         # engine tolerates) rather than asserted, so this tests the kernel and
-        # not the host. See Amendment 5.
+        # not the host.
         @test target_profile().nregisters > 0 skip = (target_profile().nregisters == 0)
     end
 
@@ -638,15 +638,9 @@ const _QS = QuasiStrided
 
                 # Julia 1.10 (LTS) cannot keep an NTuple{NV,Vec} accumulator
                 # register-resident; a compiler capability gap, kept visible as
-                # a skip rather than hidden by a weaker assertion. Measured on
-                # 1.10.11, same scattered fixture, ccqlin038:
-                #   1m (12,8,8) CF64 / (24,8,16) CF32  accumulate 1632 B
-                #   1m (16,6,8) CF64 / (32,6,16) CF32  accumulate 1632 B
-                #   1m ( 8,8,8) CF64 / (16,8,16) CF32  accumulate 1088 B
-                #   1m ( 8,4,4) CF64                   accumulate  544 B
-                # with `execute_tile!` at 0 B on 1.10 for every one of them
-                # (planar's 1.10 row is 128/96 B there), and 0 B throughout on
-                # 1.12.6.
+                # a skip rather than hidden by a weaker assertion (on 1.10 this
+                # fixture allocates ~0.5-1.6 KB per accumulate; execute_tile!
+                # stays at 0 B).
                 @test bytes_acc == 0 skip = (VERSION < v"1.11")
                 @test bytes_exec == 0 skip = (VERSION < v"1.11")
                 if VERSION >= v"1.11" && (bytes_acc != 0 || bytes_exec != 0)
@@ -711,9 +705,9 @@ const _QS = QuasiStrided
             @test_throws ArgumentError _kernel_from_shape((7, 7, 7), T, OneMMethod())
         end
 
-        # 1m is NOT the default and no rule may make it one: the reference
-        # measured four method orderings on four machines and the freeze
-        # forbids deriving a rule from any sweep.
+        # 1m is NOT the default and no rule may make it one: method ranking
+        # does not transfer between machines (docs/decisions.md, "Method
+        # ranking does not transfer between machines").
         @test _default_method(ComplexF64) === PlanarMethod()
         @test _default_method(ComplexF32) === PlanarMethod()
         for T in (ComplexF64, ComplexF32)

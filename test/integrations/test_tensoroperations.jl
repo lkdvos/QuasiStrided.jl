@@ -1,6 +1,7 @@
-# TO-comparison test suite for `QuasiStrided.QuasiStridedBackend`, authored
-# blind against the frozen spec per docs/decisions.md's "Correctness oracle"
-# section. Included by `test/runtests.jl`, which already provides
+# TO-comparison test suite for `QuasiStrided.QuasiStridedBackend`, written
+# against the documented adapter contract rather than its implementation
+# (docs/decisions.md, "Correctness oracle: cross-package, one deliberate
+# deviation from precedent"). Included by `test/runtests.jl`, which already provides
 # `Test`/`Random`/`QuasiStrided`.
 
 # Standalone-run support: `runtests.jl` supplies `Test`/`Random`/`QuasiStrided`
@@ -32,10 +33,10 @@ const to_blas = StridedBLAS()
 poison!(C) = fill!(C, convert(eltype(C), NaN))
 
 const eltypes = (Float32, Float64)
-# Complex element-type milestone, "Eligibility": the frozen predicate widens to
-# `_QS_ELTYPES = (Float32, Float64, ComplexF32, ComplexF64)`. `eltypes` is kept
-# verbatim so that every real-only assertion below keeps its original meaning,
-# and the complex types are added alongside rather than folded in.
+# The eligible eltypes are `_QS_ELTYPES = (Float32, Float64, ComplexF32,
+# ComplexF64)`. `eltypes` holds the real ones only, so that real-only
+# assertions below stay real-only; the complex types are kept alongside
+# rather than folded in.
 const complex_eltypes = (ComplexF32, ComplexF64)
 const all_eltypes = (eltypes..., complex_eltypes...)
 
@@ -111,14 +112,12 @@ end
 end
 
 @testset "conj is real conjugation for complex eltype, and still a no-op for real (eltype = $T)" for T in all_eltypes
-    # Real half: the LOAD-BEARING INVARIANT pin required by the original freeze
-    # and *kept, textually unchanged*, by Amendment 3 ("that test stays,
-    # textually unchanged, as the real-path-unchanged guard"). Real operands
-    # with conjA/conjB set true must still agree with StridedNative(), which
-    # itself treats conj as a no-op on reals.
+    # Real half: the load-bearing real-path guard. Real operands with
+    # conjA/conjB set true must still agree with StridedNative(), which itself
+    # treats conj as a no-op on reals.
     #
-    # Complex half: the same loop, now non-trivial. `conjA`/`conjB` are no
-    # longer ignored -- they select `conj` as the operand transform -- and the
+    # Complex half: the same loop, non-trivial. `conjA`/`conjB` select `conj`
+    # as the operand transform, and the
     # result is checked against StridedNative() *and* against an explicitly
     # conjugated matmul, so the oracle does not rest on TO alone.
     Random.seed!(2468)
@@ -135,8 +134,8 @@ end
         if T <: Complex
             @test Rq ≈ (conjA ? conj(A) : A) * (conjB ? conj(B) : B)
             # ... and the flags must actually *do* something: silently dropping
-            # them (the pre-milestone behaviour) would still pass `Rq ≈ Rn`
-            # above if `Rn` were computed the same wrong way.
+            # them would still pass `Rq ≈ Rn` above if `Rn` were computed the
+            # same wrong way.
             if conjA || conjB
                 @test !isapprox(Rq, A * B)
             end
@@ -224,10 +223,10 @@ end
     end
 
     @testset "α and β are not conjugated" begin
-        # The table in the freeze is explicit: "`alpha`, `beta` -- **not**
-        # conjugated", because `conjA` applies to A's *data* only. With a
-        # complex α/β and a conjugated operand, a scalar that was wrongly
-        # conjugated along with the data is visible here and nowhere else.
+        # `alpha` and `beta` are **not** conjugated, because `conjA` applies to
+        # A's *data* only. With a complex α/β and a conjugated operand, a scalar
+        # that was wrongly conjugated along with the data is visible here and
+        # nowhere else.
         α = convert(T, 0.75 - 1.25im)
         β = convert(T, -0.5 + 2.0im)
         Ac = conj(StridedView(M))
@@ -240,7 +239,7 @@ end
 
 @testset "conjugation: _op_conjugates is the frozen table, with a throwing fallback" begin
     # The table as a pure function, checked on its own so that it is exercised
-    # independently of whether a complex *kernel* exists yet. An `op` that is
+    # independently of any complex kernel. An `op` that is
     # not one of the four must throw rather than be silently treated as
     # unconjugated ("Hard-reject, never fall back"); TBLIS's `A.op === conj`
     # test is what this replaces.
@@ -256,8 +255,8 @@ end
     # constructible for every `op` in `Union{identity, conj, adjoint,
     # transpose}`, including the two that `StridedViews`' own arithmetic never
     # produces for a `Number` eltype. TBLIS's `A.op === conj` test would treat
-    # a directly-constructed `adjoint` view as unconjugated -- silently. The
-    # frozen `_op_conjugates` is a total table precisely to close that.
+    # a directly-constructed `adjoint` view as unconjugated -- silently.
+    # `_op_conjugates` is a total table precisely to close that.
     Random.seed!(161803)
     pA, pB, pAB = _MATMUL_PAB
     M = randn(T, (4, 4))
@@ -284,12 +283,13 @@ end
 end
 
 @testset "hard-reject: conjugated output view (eltype = $T)" for T in complex_eltypes
-    # "A conjugated output `C` is rejected this milestone", matching TO's own
-    # TBLIS extension (`isconj(SV(C), false) && throw_conj_output(f)`). Per the
-    # second addendum to the frozen argument-checking order the rejection lives
-    # in `plan_contract` rather than in the adapter, so that a caller reaching
-    # the engine directly is protected too -- but it must still surface as an
-    # `ArgumentError` from `tensorcontract!`.
+    # A conjugated output `C` is rejected, matching TO's own TBLIS extension
+    # (`isconj(SV(C), false) && throw_conj_output(f)`). The rejection lives in
+    # `plan_contract` rather than in the adapter (docs/decisions.md, 'Second
+    # addendum to "Required argument-checking order in the adapter
+    # (frozen)"'), so that a caller reaching the engine directly is protected
+    # too -- but it must still surface as an `ArgumentError` from
+    # `tensorcontract!`.
     Random.seed!(271828)
     pA, pB, pAB = _MATMUL_PAB
     A = randn(T, (4, 4))
@@ -420,11 +420,9 @@ end
 end
 
 @testset "accepts complex eltypes" begin
-    # Replaces the former "hard-reject: ComplexF64 input" testset. Amendment 3
-    # widens the frozen eligibility predicate to
-    # `_QS_ELTYPES = (Float32, Float64, ComplexF32, ComplexF64)`, so a complex
-    # contraction must now be *served*, not rejected -- and the rejection must
-    # not survive anywhere as a silent fallback either.
+    # ComplexF32/ComplexF64 are in `_QS_ELTYPES`, so a complex contraction
+    # must be *served* by this engine, neither rejected nor silently handed to
+    # a fallback.
     pA, pB, pAB = _MATMUL_PAB
     @testset "eltype = $T" for T in complex_eltypes
         Random.seed!(31415)
@@ -442,8 +440,8 @@ end
 end
 
 @testset "hard-reject: residual complex eltypes" begin
-    # "Also rejected, and newly so: `Complex{Float16}`, `Complex{Int}`,
-    # `Complex{BigFloat}` (not in the tuple)". These are the eltypes that
+    # `Complex{Float16}`, `Complex{Int}` and `Complex{BigFloat}` are rejected
+    # (not in the tuple). These are the eltypes that
     # *look* complex but are outside `_QS_ELTYPES`; a widened check that tested
     # `T <: Complex` instead of membership would wrongly accept them.
     pA, pB, pAB = _MATMUL_PAB
@@ -477,8 +475,8 @@ end
 end
 
 @testset "hard-reject: mixed complex precisions (ComplexF32 A, ComplexF64 B)" begin
-    # The eltype predicate is `eltype(A) === eltype(B) === eltype(C)`; widening
-    # it to complex must not weaken the *shared*-eltype half of it.
+    # The eltype predicate is `eltype(A) === eltype(B) === eltype(C)`; admitting
+    # complex eltypes must not weaken the *shared*-eltype half of it.
     A = randn(ComplexF32, (3, 4))
     B = randn(ComplexF64, (4, 5))
     C = zeros(ComplexF64, (3, 5))
@@ -521,9 +519,8 @@ end
 end
 
 @testset "hard-reject: Float16 input" begin
-    # Per the frozen eligibility predicate, only Float32/Float64 are
-    # eligible; every other eltype (real or complex) must be rejected the
-    # same way, not just ComplexF64.
+    # Only the `_QS_ELTYPES` are eligible; every other eltype, real ones
+    # included, must be rejected the same way.
     A = randn(Float16, (3, 4))
     B = randn(Float16, (4, 5))
     C = zeros(Float16, (3, 5))
@@ -610,13 +607,13 @@ end
     end
 
     @testset "complex output aliasing an input through a wrapper (eltype = $T)" for T in complex_eltypes
-        # The aliasing check runs on the `StridedView`-wrapped operands (T11
-        # addendum), which unwrap `PermutedDimsArray`/`Adjoint` down to the
-        # shared parent. That must hold for complex operands too -- the
-        # conjugation work added a step *after* aliasing in the frozen order
-        # (eligibility -> argcheck -> dimcheck -> wrap -> aliasing ->
-        # conjugated-C rejection), and reordering it away would let a
-        # conjugated-but-aliased call through with the wrong error, or none.
+        # The aliasing check runs on the `StridedView`-wrapped operands, which
+        # unwrap `PermutedDimsArray`/`Adjoint` down to the shared parent. That
+        # must hold for complex operands too -- conjugated-C rejection comes
+        # *after* aliasing in the frozen order (eligibility -> argcheck ->
+        # dimcheck -> wrap -> aliasing -> conjugated-C rejection), and
+        # reordering it away would let a conjugated-but-aliased call through
+        # with the wrong error, or none.
         P = randn(T, (5, 5))
         B = randn(T, (5, 5))
 
@@ -645,9 +642,8 @@ end
     @tensor backend = StridedNative() C2[j, i] = A[i, j]
     @test C1 == C2
 
-    # A network mixing a contraction with an add/trace step -- this is
-    # exactly the scope limitation the fallback amendment removes; it must
-    # run wholesale under `qsbackend` now, not throw.
+    # A network mixing a contraction with an add/trace step must run
+    # wholesale under `qsbackend`, not throw.
     B = randn(Float64, (4, 5))
     D1 = zeros(Float64, (3, 5))
     @tensor backend = qsbackend D1[i, k] = A[i, j] * B[j, k]
@@ -719,7 +715,7 @@ end
         # build for the same shape/kernel (measured just below, outside the
         # pool-cleaning block since it must NOT populate the pool); the
         # SIMDKernel accumulator is not kept register-resident by Julia
-        # 1.10's compiler (docs/decisions.md, Amendment 2's caveat), so this
+        # 1.10's compiler, so this
         # needs the same skip execution/test_execute.jl/microkernels/test_simd_kernel.jl use.
         steady1 = @allocated run_once()
         steady2 = @allocated run_once()
@@ -731,7 +727,7 @@ end
 
     # A cold, unpooled `plan_contract` call for the same shape/kernel
     # allocates its own fresh `ContractWorkspace` from scratch, well above the
-    # pooled steady state above (docs/decisions.md, Amendment 1's motivation).
+    # pooled steady state above.
     Cv, Av, Bv = StridedView(zeros(Float64, (20, 25))), StridedView(A), StridedView(Bm)
     cold_allocs = @allocated plan_contract(Cv, Av, (1, -1), Bv, (-1, 2), (1, 2); oracle = false)
     @test cold_allocs > steady2 skip = (VERSION < v"1.11")
@@ -855,12 +851,11 @@ end
 
 @testset "workspace pooling: real and complex eltypes share one task-local pool" begin
     # The complex round of the testset above. Per "Buffer element type: the
-    # `VT` bound relaxes, the arity does not": the pool stays keyed by
+    # `VT` bound relaxes, the arity does not": the pool is keyed by
     # `eltype(C)` (so `Float64` and `ComplexF64` get *distinct* workspaces and
     # cannot couple each other's grow-only `reserve!` footprints), while the
-    # buffer element type is `real(T)` -- i.e. the new instance is
-    # `ContractWorkspace{ComplexF64, Vector{Float64}}`, and the existing
-    # `ContractWorkspace{Float64, Vector{Float64}}` spelling stays valid.
+    # buffer element type is `real(T)` -- i.e. the complex workspace is
+    # `ContractWorkspace{ComplexF64, Vector{Float64}}`.
     Random.seed!(8675309)
     _qs_with_clean_pool() do
         for T in (Float64, ComplexF64, Float64, ComplexF64, ComplexF32, Float64)

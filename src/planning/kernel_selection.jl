@@ -37,7 +37,9 @@ _fallback_shape(::Type{T}) where {T} = (8, NR_DEFAULT, _default_lanewidth(real(T
 # Menus. Complex `MR` counts logical (complex) rows and `W` real lanes. The 1m
 # menus look "unaligned" (MR = 12 at W = 8) only because 1m runs a real
 # microkernel of `2MR` rows, so it is `2MR` that must be a multiple of `W`.
-# Each menu starts with the shape `_derived_shape` resolves to on `:avx512`.
+# Each complex menu starts with the shape `_derived_shape` resolves to on
+# `:avx512`; each real menu contains `_fallback_shape` and the AVX-512/AVX2
+# rule shapes.
 #
 # The last three entries of each planar menu are an `MV = 1` tile at each lane
 # width the package compiles, so that `_fitted_shape` finds a fitting entry for
@@ -267,7 +269,7 @@ end
 #
 # Real element types only. Complex kernels now have a vectorized store too, so
 # extending this is a deliberately deferred, unmeasured follow-up
-# (docs/proposals/complex-fast-paths.md, Decision 3); the search below already
+# (docs/proposals/complex-fast-paths.md, Section 6.1); the search below already
 # goes through the kernel's own method's menu, so lifting the guard is all it
 # would take.
 #

@@ -1,5 +1,5 @@
-# Independent oracle/property tests for the macro-blocking `execute!`
-# (docs/decisions.md, "Macro-blocking milestone"). Nothing under test is
+# Independent oracle/property tests for the macro-blocking `execute!`.
+# Nothing under test is
 # exported, and helpers.jl introduces unqualified `plan_contract`/
 # `execute!` bindings into the same top-level scope, so every use here is
 # written as `QuasiStrided.<name>` to avoid colliding with those.
@@ -12,7 +12,7 @@ using StridedViews: StridedView, offset
 # including scope, so the names below are already bound when this file is
 # `include`d from there. Guarded so the file also runs standalone
 # (`julia test/execution/test_macro_blocking.jl`-style) without shadowing or re-binding
-# anything when it does not. Everything added for the complex element type is
+# anything when it does not. The complex-element-type helpers below are
 # written `QuasiStrided.<name>` regardless, per the header comment.
 using QuasiStrided
 if !@isdefined(ScalarKernel)
@@ -210,8 +210,8 @@ end
 end
 
 # =====================================================================
-# 5. Staleness: packed-panel reuse is the macro-blocking-specific risk (the
-# old driver packed one sliver per tile and reused nothing across tiles).
+# 5. Staleness: packed-panel reuse across tiles and blocks is the
+# macro-blocking-specific risk.
 # Buffers are discovered by name/eltype rather than hardcoded: only
 # Vector{<:Integer} fields and "pack"-named float vectors are poisoned, so
 # nothing that could alias C's own storage is ever touched.
@@ -332,8 +332,8 @@ end
 end
 
 # =====================================================================
-# 8. Irregular (ScatterAxis) sliver at nonzero offset within a macro block
-# (Phase D review, should-fix 1). Every other testset here uses a
+# 8. Irregular (ScatterAxis) sliver at nonzero offset within a macro block.
+# Every other testset here uses a
 # single-label M/N/K group, which `describe_block` always classifies
 # regular -- one dimension has no internal carry boundary to break the
 # constant stride. This fixture uses a 2-label M group (a,q) where A's map
@@ -394,18 +394,12 @@ end
 end
 
 # =====================================================================
-# Complex element type (docs/decisions.md, "Complex element-type milestone:
-# Phase A direction freeze", "Verification contract" layer 4).
-#
-# Everything below is an *addition*: the real-eltype helpers and testsets
-# above are textually unchanged, which is half the proof that the real path
-# is untouched (the freeze's proof (1), "git diff shows additions, not
-# edits").
+# Complex element type (docs/decisions.md, "Verification contract", layer 4).
 #
 # The oracle stays independent of the engine. In particular it does NOT call
 # `QuasiStrided._qs_isconj` or `QuasiStrided._op_conjugates`: the
 # conjugation table and the XOR rule are both re-derived here from the
-# freeze's prose, so that an engine that folds `conjA` with `op` using `||`
+# documented rule, so that an engine that folds `conjA` with `op` using `||`
 # instead of `⊻`, or that mistakes `adjoint` for a non-conjugating `op`,
 # fails these tests rather than agreeing with them.
 # =====================================================================
@@ -422,22 +416,20 @@ const _MACRO_OPS = (identity, conj, adjoint, transpose)
 # `Number`. Deliberately not `QuasiStrided._op_conjugates`.
 _macro_op_conjugates(op) = op === conj || op === adjoint
 
-# The frozen combining rule, re-derived here: the TO flag and the view's `op`
+# The combining rule, re-derived here: the TO flag and the view's `op`
 # are independent sources of conjugation and compose with XOR, so a
 # `conj`-op'd view with the flag set is *unconjugated*. Real eltypes are never
 # conjugated, whatever the flag says.
 _macro_conjugated(::Type{T}, flag::Bool, op) where {T} =
     (T <: Complex) && (flag ⊻ _macro_op_conjugates(op))
 
-# Same tolerance as the real path at the same precision -- the freeze makes
-# this an acceptance criterion: "If a complex test needs a looser tolerance
-# than its real counterpart, that is a bug signal". A new method, so the real
-# `_macro_rtol` above is untouched (`eps` is undefined on a Complex type, so
-# the generic method cannot serve both).
+# Same tolerance as the real path at the same precision: if a complex test
+# needs a looser tolerance than its real counterpart, that is a bug signal. A
+# separate method because `eps` is undefined on a Complex type, so the
+# generic method cannot serve both.
 _macro_rtol(::Type{Complex{R}}, Ka::Integer) where {R} = _macro_rtol(R, Ka)
 
-# Complex kernel constructors. `OneMKernel` is landing concurrently, so it is
-# picked up only if it exists; this file is green either way.
+# Complex kernel constructors, each picked up only if it is defined.
 function _macro_complex_kernel_ctors()
     isdefined(QuasiStrided, :OneMKernel) &&
         return (QuasiStrided.PlanarKernel, QuasiStrided.OneMKernel)
@@ -448,9 +440,8 @@ end
 # `_default_lanewidth(real(T))`) and both constrain MR against W: planar needs
 # `MR % W == 0` (one accumulator plane pair per W logical rows) and 1m needs
 # `2MR % W == 0` (its inner real kernel is `SIMDKernel{2MR,NR,real(T),W}`).
-# Rather than encode either rule here -- one of the two constructors is being
-# written by another worker as this is written -- ask the constructor and skip
-# the combos it rejects, exactly as `_valid_shapes` does for `SIMDKernel`.
+# Rather than encode either rule here, ask the constructor and skip the combos
+# it rejects, exactly as `_valid_shapes` does for `SIMDKernel`.
 function _macro_complex_kernel(ctor, shape, ::Type{T}) where {T}
     return try
         ctor(shape[1], shape[2], T)
@@ -566,8 +557,8 @@ const _MACRO_COMPLEX_SEED = 0xC047_EE01
 const _MACRO_COMPLEX_TW_SEED = 0xC047_EE02
 
 # ~300 ComplexF64 cases and ~200 ComplexF32 ones (the reference project's
-# scale), spread evenly over whichever (method, shape) combos exist on this
-# machine -- so the totals stay put whether or not `OneMKernel` has landed.
+# scale), spread evenly over whichever (method, shape) combos are
+# constructible -- so the totals do not depend on how many there are.
 function _macro_complex_random_cases(
         seed::Integer; c64_total::Int = 300, c32_total::Int = 200, force_conj::Bool = false
     )
@@ -626,12 +617,11 @@ end
 # =====================================================================
 # 10. execute! vs execute_tilewise!, WITH CONJUGATION SET.
 #
-# Mandatory, not optional (the freeze, "Where conjugation is applied"):
-# `_pack_sliver!` has three call sites and the third is `execute_tilewise!`'s.
-# If that one were left hardcoded to `identity`, the *oracle* would be
-# silently wrong for conjugated inputs and the disagreement would present as
-# an engine bug. Every case here has at least one genuinely conjugated
-# operand, so a missed transform cannot pass.
+# Mandatory, not optional: `_pack_sliver!` has three call sites and the third is
+# `execute_tilewise!`'s. If that one were left hardcoded to `identity`, the
+# *oracle* would be silently wrong for conjugated inputs and the disagreement
+# would present as an engine bug. Every case here has at least one genuinely
+# conjugated operand, so a missed transform cannot pass.
 # =====================================================================
 
 @testset "macro driver: complex execute! agrees with execute_tilewise! (conjugation set)" begin
@@ -775,7 +765,7 @@ end
 #
 # Testset 9 covers this statistically (it draws the cancelling combination),
 # but the two discriminating cases are worth pinning by name, because each
-# distinguishes the frozen rule from a plausible wrong one:
+# distinguishes the XOR rule from a plausible wrong one:
 #
 #   * `conjA = true` on a `conj`-op'd view must CANCEL to the unconjugated
 #     operand. An engine combining the two sources with `||` (or applying

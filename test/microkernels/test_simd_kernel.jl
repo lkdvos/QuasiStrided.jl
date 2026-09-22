@@ -356,12 +356,10 @@ using StridedViews: StridedView
     end
 
     # ------------------------------------------------------------------------
-    # Vectorized store path (docs/decisions.md, "Store fast-path
-    # investigation: Phase A"). Its guard used to demand `Vector{T}` exactly,
-    # which no real driver destination satisfies on Julia >= 1.11 (`parent` of
-    # an Array-backed StridedView is `Memory{T}` there); it now admits any
-    # concrete `DenseVector{T}`, which is exactly what SIMD.jl's array
-    # `vload`/`vstore` methods accept.
+    # Vectorized store path. Its guard admits any concrete `DenseVector{T}`
+    # (exactly what SIMD.jl's array `vload`/`vstore` methods accept), not just
+    # `Vector{T}`: `parent` of an Array-backed StridedView is `Memory{T}` on
+    # Julia >= 1.11, so a `Vector{T}`-only guard would never fire.
     # ------------------------------------------------------------------------
 
     @testset "_vector_store_eligible: any 1-D dense storage, unit-stride rows only" begin
@@ -374,7 +372,7 @@ using StridedViews: StridedView
             # >= 1.11, `Vector{T}` on 1.10. Either way, eligible.
             mem = parent(StridedView(zeros(T, m, n)))
             @test _vector_store_eligible(DestinationTile(mem, 0, unit_rows, cols), T)
-            # A plain `Vector{T}` -- the only storage the old guard accepted.
+            # A plain `Vector{T}`.
             @test _vector_store_eligible(DestinationTile(zeros(T, m * n), 0, unit_rows, cols), T)
 
             # Excluded, and so still on the scalar fallback: a `SubArray` (a
@@ -486,8 +484,7 @@ using StridedViews: StridedView
             # _vector_store_eligible only inspects `tile.rows`/`tile.storage`
             # -- a ScatterAxis on the COLUMN side is untouched by the guard
             # and still takes the vectorized path (axis_offset dispatches on
-            # the axis type generically). Found as an untested combination at
-            # milestone review (T8): this is the case QuasiStrided exists
+            # the axis type generically). This is the case QuasiStrided exists
             # for (irregular/permuted output axes), and it depends on
             # `colbase` being computed from `axis_offset(cols, j)` only
             # inside the `j < n` guard (src/microkernels/simd.jl).
@@ -513,10 +510,10 @@ using StridedViews: StridedView
     end
 
     @testset "allocation: execute_tile! on dense 1-D storage WITH TAIL ROWS is allocation-free" begin
-        # The reason the vectorized store's tail had to become statically
-        # indexed: a dynamically indexed accumulator tuple heap-allocates
-        # above NV = 16 (GUARDRAIL, src/microkernels/simd.jl), and widening the
-        # guard made that branch reachable on Julia >= 1.11. Covers every
+        # The vectorized store's tail must be statically indexed: a
+        # dynamically indexed accumulator tuple heap-allocates above NV = 16
+        # (GUARDRAIL, src/microkernels/simd.jl), and the vectorized branch is
+        # reachable for real destinations on Julia >= 1.11. Covers every
         # shipped register shape plus NV = 24 and NV = 28, i.e. past the
         # cliff and up to the register budget planning/test_kernel_selection.jl allows.
         function run_execute(k, dst, pa, pb, kc)

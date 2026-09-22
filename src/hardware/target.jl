@@ -1,16 +1,16 @@
-# Runtime hardware detection, no external dependency (docs/decisions.md,
-# Phase G). Two rules are load-bearing: detection happens once per *process*
-# in `__init__`, never at precompile time (a .ji cached on one node class of a
-# shared depot must not carry another node's features), and every failure path
-# resolves to `:unknown`, which maps back to the constants this package
-# shipped before detection existed.
+# Runtime hardware detection, no external dependency. Two rules are
+# load-bearing: detection happens once per *process* in `__init__`, never at
+# precompile time (a .ji cached on one node class of a shared depot must not
+# carry another node's features), and every failure path resolves to
+# `:unknown`, which selects the fixed fallback shapes (`_fitted_shape`,
+# src/planning/kernel_selection.jl).
 
 """
     CacheLevel(bytes, ways, line, sharing)
 
 One detected cache level; any field may be `0` for "not detected". `sharing`
 is the number of logical CPUs sharing this level -- *detected*, never assumed,
-since assuming L2 is private is what the recorded A57 refutation was about.
+since L2 is not private on every machine (e.g. Apple Silicon).
 """
 struct CacheLevel
     bytes::Int
@@ -88,7 +88,7 @@ end
 
 # Register *count* is set by the ISA, not the lane width in use: (16,6,4) has
 # 24 live 256-bit accumulators and does not spill on AVX-512, because AVX512VL
-# supplies 32 ymm registers (measured 2026-09-11, ccqlin038).
+# supplies 32 ymm registers.
 _isa_vector_bytes(::Val{K}) where {K} = K === :avx512 ? 64 : K === :avx2 ? 32 : K === :neon ? 16 : 0
 _isa_nregisters(::Val{K}) where {K} = K === :avx512 ? 32 : K === :avx2 ? 16 : K === :neon ? 32 : 0
 
@@ -151,7 +151,7 @@ function _cache_topology_linux()
 end
 
 # macOS exposes no associativity, but does expose `hw.perflevel0.cpusperl2` --
-# how many cores share one L2, which is the A57 datum on Apple Silicon.
+# how many cores share one L2, the sharing datum `CacheLevel` records.
 _sysctl_int(name) = try
     something(tryparse(Int, chomp(read(`sysctl -n $name`, String))), 0)
 catch

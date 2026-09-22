@@ -35,7 +35,7 @@ are allocated only under `oracle = true`. The four register-tile-sized
 `tile_*` offset buffers are always allocated: the beta-only pass of both
 drivers uses them, and so does the oracle's tile loop.
 
-Field layout is an implementation detail, not part of the frozen interface.
+Field layout is an implementation detail, not part of the public interface.
 """
 struct ContractWorkspace{T, VT <: AbstractVector}
     # Macro-block-sized offset buffers: one fill_offsets! per jc/pc/ic block,
@@ -74,7 +74,7 @@ struct ContractWorkspace{T, VT <: AbstractVector}
     tw_packed_a::VT
     tw_packed_b::VT
 
-    # GUARDRAIL, the one invariant the relaxed `VT` bound needs: the packed
+    # GUARDRAIL, the one invariant the loose `VT` bound needs: the packed
     # panels hold `real(T)`, NEVER `T`. Enforced here so a mis-paired (T, VT)
     # cannot be constructed at all, rather than failing later inside a packer.
     function ContractWorkspace{T, VT}(
@@ -109,11 +109,11 @@ end
 # (the rounded/clamped one `plan_contract` stores on the plan). Shared by the
 # constructors and by `reserve!` so the two can never disagree.
 #
-# GUARDRAIL: complex-correct as written and deliberately unchanged. The packed
-# lengths come from `packed_a_length`/`packed_b_length`, which already return a
-# count of REALS at the logical `kc` once the descriptor is complex, while the
-# sliver counts use the LOGICAL register extents `mr`/`nr`, which is what
-# `mc`/`nc` are expressed in. Do not mix them: `m_slivers` counts register
+# GUARDRAIL: complex-correct as written; do not rescale either count. The
+# packed lengths come from `packed_a_length`/`packed_b_length`, which already
+# return a count of REALS at the logical `kc` once the descriptor is complex,
+# while the sliver counts use the LOGICAL register extents `mr`/`nr`, which is
+# what `mc`/`nc` are expressed in. Do not mix them: `m_slivers` counts register
 # tiles, `packed_a` counts reals.
 @inline function _workspace_sizes(kernel, blocking::Blocking)
     MRk = mr(kernel)
@@ -139,8 +139,7 @@ end
 end
 
 # `Val(false)`: a non-temporary, which every allocator serves as a plain,
-# GC-owned `Vector{Int}` -- the frozen requirement for the offset buffers. The
-# assertion makes a hypothetical violation fail loudly here rather than
+# GC-owned `Vector{Int}`, as the offset buffers require. The assertion makes a hypothetical violation fail loudly here rather than
 # silently inside `fill_offsets!`.
 @inline function _alloc_offsets(n::Int, allocator)
     return TO.tensoralloc(Vector{Int}, (n,), Val(false), allocator)::Vector{Int}
@@ -190,7 +189,7 @@ allocator the packed panels are acquired once via
 and must be handed back with [`release!`](@ref).
 
 Buffers are `undef`-initialized, not zeroed: the packers (`src/packing/pack.jl`)
-writes every slot of a panel it is given, padding included, and the offset
+write every slot of a panel it is given, padding included, and the offset
 buffers are fully rewritten by `fill_offsets!` before each block is read.
 """
 function ContractWorkspace(

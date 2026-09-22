@@ -25,7 +25,7 @@
     @test_throws ArgumentError contract!(Cv, 1.0, Av, (1, 2), Bv, (5, 3), 0.0, (1, 3))
     @test_throws ArgumentError contract!(Cv, 1.0, Av, (1, 2), Bv, (2, 9), 0.0, (1, 3))
 
-    # Label present in all three (batch-like), unsupported this milestone.
+    # Label present in all three (batch-like), unsupported.
     @test_throws ArgumentError contract!(Cv, 1.0, Av, (1, 2), Bv, (2, 3), 0.0, (2, 3))
 end
 
@@ -76,9 +76,8 @@ end
 
 # =====================================================================
 # Conjugation plumbing (docs/decisions.md, "Conjugation: semantics, and where
-# each piece is absorbed"). No complex kernel exists yet, so what is testable
-# here -- and what matters most for this worker -- is the *real-path-unchanged*
-# half of that section, plus the predicates themselves.
+# each piece is absorbed"): the predicates themselves, that the real path is
+# unaffected by them, and rejection of a conjugated output.
 # =====================================================================
 
 @testset "_op_conjugates is a total table with a throwing fallback" begin
@@ -159,8 +158,7 @@ end
 
     # A conjugated COMPLEX output is rejected at the engine boundary, not in
     # the adapter, so `plan_contract`/`contract!` are protected too. Checked by
-    # message: a complex plan would otherwise also throw ArgumentError from the
-    # not-yet-wired kernel seam, which is a different failure.
+    # message, so an unrelated ArgumentError cannot satisfy it.
     Ac, Bc = randn(ComplexF64, 6, 5), randn(ComplexF64, 5, 4)
     Cc = zeros(ComplexF64, 24)
     for op in (conj, adjoint)
@@ -173,13 +171,12 @@ end
         @test err isa ArgumentError
         @test occursin("conjugated", err.msg)
     end
-    # An unrecognized op is hard-rejected rather than silently mishandled --
-    # and, stronger than the freeze assumed, StridedViews makes one
-    # unconstructible in the first place: its own `F` parameter is bounded by
-    # exactly the four functions `_op_conjugates` tabulates. That bound is what
-    # this asserts, so the throwing fallback stays correct-by-construction
-    # rather than merely untested; if StridedViews ever widens it, this fails
-    # here rather than silently somewhere in packing.
+    # An unrecognized op is hard-rejected rather than silently mishandled -- and
+    # StridedViews makes one unconstructible in the first place: its own `F`
+    # parameter is bounded by exactly the four functions `_op_conjugates`
+    # tabulates. That bound is what this asserts, so the throwing fallback stays
+    # correct-by-construction rather than merely untested; if StridedViews ever
+    # widens it, this fails here rather than silently somewhere in packing.
     @test_throws TypeError StridedView(Cc, (6, 4), (1, 6), 0, sin)
     Fbound = fieldtype(typeof(StridedView(Cc, (6, 4), (1, 6), 0, conj)), :op)
     @test Fbound === typeof(conj)
@@ -193,8 +190,7 @@ end
 # Label order within M/N and the M/N orientation swap (docs/decisions.md,
 # "Label-order milestone"). `_classify_labels` lists free labels in A's/B's
 # own axis order; `plan_contract` then sorts each list by |C-stride| and may
-# swap the operand roles. These are the FIRST tests that pin the composite
-# order at all -- there was none before this milestone.
+# swap the operand roles. These tests pin that composite order.
 # =====================================================================
 
 const _lo_order = QuasiStrided._order_free_labels
@@ -743,19 +739,14 @@ end
 
 @testset "label order: the swap never fires for complex kernels (guarded by T <: Real, deliberately deferred)" begin
     # Same shape/kernel that would trigger the swap for a real dtype at this
-    # mr (ccsd_t_3, d=4: sorted N run 16 >= mr, sorted M run 1). Historically
-    # PlanarKernel/OneMKernel (complex) always scatter-stored, so the swap had
-    # nothing to win and measurably cost the as-is orientation's N-side
-    # locality (~2-4%). PlanarKernel now has a vectorized store fast path
-    # (src/microkernels/planar.jl), so that rationale is stale, but the guard
-    # itself (`_prefer_swap`'s call site, `T <: Real` in src/planning/plan.jl) has NOT
-    # been re-evaluated for the complex path yet -- extending it is a
-    # deliberately deferred, unmeasured follow-up
-    # (docs/proposals/complex-fast-paths.md Decision 3). This test only
-    # confirms the current (unchanged) behavior: the swap still doesn't fire
-    # for complex dtypes today. Also re-confirms conjugation is still correct
-    # on the (now guaranteed unswapped) complex path -- an `op`-carrying A,
-    # both flags exercised, checked against the loop reference.
+    # mr (ccsd_t_3, d=4: sorted N run 16 >= mr, sorted M run 1). The swap is
+    # guarded by `T <: Real` (`_prefer_swap`'s call site, src/planning/plan.jl);
+    # extending it to complex kernels is a deliberately deferred, unmeasured
+    # follow-up (docs/proposals/complex-fast-paths.md, Section 6.1). This test
+    # pins that the swap does not fire for complex dtypes, and that
+    # conjugation is correct on the unswapped complex path -- an
+    # `op`-carrying A, both flags exercised, checked against the loop
+    # reference.
     d = 4
     for T in (ComplexF64, ComplexF32)
         W = QuasiStrided._default_lanewidth(real(T))
@@ -793,9 +784,8 @@ end
     # keep direct test coverage of "transforms travel with the operands
     # under a swap" without relying solely on the code-reading argument,
     # exercise the swap on a REAL shape (conj is `identity` there, so this
-    # checks storage/base/strides swap correctness, not conj folding -- the
-    # conj-folding logic itself is dtype-independent and was covered by the
-    # complex swap tests before this guard landed; see docs/decisions.md).
+    # checks storage/base/strides swap correctness, not conj folding; the
+    # conj-folding logic itself is dtype-independent).
     d = 5
     (name, IA, IB) = _LO_CASES[3]  # ccsd_t_3: swaps at mr=8 (SIMDKernel(8,6))
     (indA, indB, indC), _ = _lo_labels(IA, IB)

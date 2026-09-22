@@ -6,22 +6,20 @@
 #     accumulate(kernel.inner, acc, packed_a, packed_b, 2 * kc)
 #
 # i.e. one kernel body written once and parameterised, so that a planar-vs-1m
-# measurement compares two *methods* rather than two hand-tunings. If a future
-# edit finds itself writing an inner loop here, the comparison has already been
-# invalidated.
+# measurement compares two *methods* rather than two hand-tunings. Writing an
+# inner loop here would invalidate that comparison.
 #
 # Why the real kernel computes the right thing -- the `Ar`/`Br` product
 # derivation, and why accumulator real row `2i` is the real part of complex row
-# `i` -- is in docs/decisions.md, "why the induced method works". The `2*kc`
-# doubling is confined to this file's own delegation and never appears in a
-# length, an offset or a driver loop bound.
+# `i` -- is in docs/decisions.md, "Transcribed from `src/microkernels/onem.jl`:
+# why the induced method works". The `2*kc` doubling is confined to this
+# file's own delegation and never appears in a length, an offset or a driver
+# loop bound.
 #
 # Cliff B (Julia heap-allocating a dynamically indexed `NTuple` above NV = 16;
-# see src/microkernels/simd.jl for the measured number) applies here exactly as it
-# does to planar: the store below is `@generated` with literal tuple indices
-# including the lane tail, and the real path's runtime-indexed `_acc_lane`
-# helper is not used. `accumulate` inherits the real kernel's already-
-# `@generated` body.
+# see src/microkernels/simd.jl) applies here exactly as it does to planar: the
+# store below is `@generated` with literal tuple indices including the lane
+# tail. `accumulate` inherits the real kernel's already-`@generated` body.
 
 using SIMD: Vec
 
@@ -44,12 +42,12 @@ constructor).
 
 The field is named `descriptor`, so `mr`/`nr`/`scalartype`/`packed_a_length`/
 `packed_b_length`/`realtype`/`packed_a_per_k`/`packed_b_per_k`/`a_format`/
-`b_format` all forward through the existing `DescriptorKernel` methods in
-src/microkernels/interface.jl and src/microkernels/interface.jl.
+`b_format` all forward through the `DescriptorKernel` methods in
+src/microkernels/interface.jl.
 
 `KI` exists only because Julia cannot compute a field type from type
-parameters: the freeze spells the field `inner::SIMDKernel{2MR,NR,real(T),W}`,
-which is not a legal struct field type (`2MR` and `real(T)` are computations on
+parameters: the intended field `inner::SIMDKernel{2MR,NR,real(T),W}` is
+not a legal struct field type (`2MR` and `real(T)` are computations on
 `TypeVar`s). `KI` carries that computed type instead, and the inner constructor
 pins it to exactly `SIMDKernel{2MR,NR,real(T),W}`, so nothing else can be
 stored there. `OneMKernel{MR,NR,T,W}` remains a usable (partially applied)
@@ -142,13 +140,12 @@ needs a little over half of planar's registers. **Cliff A**: it must be `<=`
 the architectural register count (`target_profile().nregisters`; 32 zmm under
 AVX-512).
 
-**Measured, not assumed**: every shipped 1m shape is spill-free -- 0 stack
-stores and 0 reloads at `(12,8,8)`, `(16,6,8)`, `(8,8,8)` and `(8,4,4)`, at
-exactly `MV*NR` FMAs per *real* K step. Measured on `kernel.inner`, because the
-code running 1m's K loop **is** the real path's `accumulate`, byte for byte --
-which is the reuse confirmed as an executed fact. Numbers, instruments and the
-planar comparison: docs/decisions.md, "Every shipped 1m shape is spill-free".
-Spill counts are not timings; ranking is Phase F's, on measured throughput.
+Every shipped 1m shape is spill-free -- 0 stack stores and 0 reloads at
+`(12,8,8)`, `(16,6,8)`, `(8,8,8)` and `(8,4,4)`, at exactly `MV*NR` FMAs per
+*real* K step -- as checked on `kernel.inner`, because the code running 1m's K
+loop **is** the real path's `accumulate`, byte for byte (docs/decisions.md,
+"Every shipped 1m shape is spill-free"). Spill counts are not timings; shapes
+are ranked on measured throughput.
 """
 onem_register_pressure(::OneMKernel{MR, NR, T, W}) where {MR, NR, T, W} =
     ((2 * MR) ÷ W) * NR + ((2 * MR) ÷ W) + 1
@@ -196,7 +193,7 @@ function Base.accumulate(
 end
 
 # ----------------------------------------------------------------------------
-# store_tile! -- the one genuinely new piece
+# store_tile! -- the one 1m-specific piece
 # ----------------------------------------------------------------------------
 
 # The `OneM` tile reader. The accumulator is the inner real kernel's, holding a
@@ -212,9 +209,9 @@ end
 #
 # `@generated` with literal tuple indices (Cliff B), unrolled over `(v, j)`
 # exactly as `_store_tile_scattered!` (src/microkernels/simd.jl) and
-# `_store_tile_planar!` (src/microkernels/planar.jl). Scattered/scalar path only;
-# the unit-stride interleaved store is the same deliberately deferred,
-# measurement-gated follow-on it is for planar.
+# `_store_tile_planar!` (src/microkernels/planar.jl). Scattered/scalar path
+# only: 1m has no unit-stride vector store counterpart to planar's
+# `_store_tile_planar_vector!`.
 @generated function _store_tile_onem!(
         destination::QSTile, acc::NTuple{NV, Vec{W, R}},
         alpha::T, beta::T, kernel::OneMKernel{MR, NR, T, W},
@@ -283,8 +280,8 @@ even real rows, those two halves are always **adjacent lanes of the same
 `Vec`**: complex row `i = v*(W÷2) + u` is `Complex(acc[v + MV*j + 1][2u+1],
 acc[v + MV*j + 1][2u+2])` with `MV = 2MR÷W`. No shuffle, no second load.
 
-Ships the scattered/scalar path only, delegating to the existing generic
-`_axpby_tile!` (src/microkernels/interface.jl).
+Scattered/scalar path only, delegating to the generic `_axpby_tile!`
+(src/microkernels/interface.jl).
 """
 function store_tile!(
         destination::QSTile, acc::NTuple{NV, Vec{W, R}},

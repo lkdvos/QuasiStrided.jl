@@ -2,13 +2,12 @@
 # against test-local, independently written reference layouts (never against
 # the implementation's own offset helpers for the value expectations).
 #
-# The highest-risk item this file pins is the `transform` contract frozen in
-# docs/decisions.md ("Complex element-type milestone"): `transform` applies to
-# the loaded *complex* element and the result is split afterwards, never per
-# real half -- where `conj` would be a silent no-op. The pin is bitwise:
-# `pack_*!(..., conj)` equals `pack_*!(..., identity)` on a pre-conjugated
-# source, in every format. Bitwise `==` is correct here because these are
-# exact (a sign flip and a copy); it remains wrong for SIMD-vs-scalar
+# The highest-risk item this file pins is the `transform` contract: `transform`
+# applies to the loaded *complex* element and the result is split afterwards,
+# never per real half -- where `conj` would be a silent no-op. The pin is
+# bitwise: `pack_*!(..., conj)` equals `pack_*!(..., identity)` on a
+# pre-conjugated source, in every format. Bitwise `==` is correct here because
+# these are exact (a sign flip and a copy); it remains wrong for SIMD-vs-scalar
 # comparisons elsewhere in this suite.
 
 using Test
@@ -79,7 +78,7 @@ resized(ax::AffineAxis, count::Int) = AffineAxis(ax.base, ax.stride, count)
 resized(ax::ScatterAxis, count::Int) = ScatterAxis(ax.offsets, count)
 
 # Irregular offsets: the scattered case is this engine's reason to exist, and
-# regular-only fixtures have hidden a real bug in this project before.
+# regular-only fixtures can hide bugs that only scattered addressing exposes.
 scatter_lane_offsets(n) = [(t * 7) % 11 + 13 * (t % 3) for t in 0:(n - 1)]
 scatter_step_offsets(k, span) = [((p * 5) % 7) * span + 3 * p for p in 0:(k - 1)]
 
@@ -432,7 +431,7 @@ end
     src = SourceTile(storage, 0, AffineAxis(0, 1, 4), AffineAxis(0, 8, 2))
 
     # The buffer holds realtype(kernel), NOT scalartype(kernel): a complex
-    # buffer is the conflation this milestone is most exposed to.
+    # buffer is the easiest conflation to make.
     @test_throws ArgumentError pack_a!(zeros(ComplexF64, 1000), src, kernel, identity)
     @test_throws ArgumentError pack_b!(zeros(ComplexF64, 1000), src, kernel, identity)
     @test_throws ArgumentError pack_a!(zeros(Float32, 1000), src, kernel, identity)
@@ -537,7 +536,7 @@ probe_b(packed, src, kernel, f) =
     # `skip` on Julia 1.10 for the same documented reason the SIMD kernel's
     # allocation assertions carry it: the older compiler does not keep this
     # code allocation-free. Marked rather than weakened, so the gap stays
-    # visible -- CI on 1.10 LTS is what found these were missing it.
+    # visible.
     sk = VERSION < v"1.11"
     @test all(iszero, run(ComplexF64, PlanarFormat(), PlanarFormat())) skip = sk
     @test all(iszero, run(ComplexF64, OneEFormat(), PlanarFormat())) skip = sk

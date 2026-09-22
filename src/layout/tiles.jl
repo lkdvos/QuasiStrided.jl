@@ -47,11 +47,12 @@ end
 
 Like [`ScatterAxis`](@ref) but over borrowed offsets held as a raw pointer, so
 that it is `isbits` and `Union{AffineAxis,PtrScatterAxis}` needs no heap box.
-`ScatterAxis` holds an `AbstractVector`, which made that union non-isbits and
-cost 4-7 KB per `execute!` on irregular destinations whenever Julia could not
-union-split it (docs/decisions.md, Phase H). Used by the driver; `ScatterAxis`
-remains the vector-backed, bounds-checkable form everywhere else. The pointer
-is borrowed -- `execute!` holds the `GC.@preserve`.
+`ScatterAxis` holds an `AbstractVector`, which would make that union
+non-isbits and heap-allocate per `execute!` on irregular destinations whenever
+Julia cannot union-split it. Used by the driver (`_axis_of`,
+src/execution/macrokernel.jl); `ScatterAxis` remains the vector-backed,
+bounds-checkable form everywhere else. The pointer is borrowed -- `execute!`
+holds the `GC.@preserve`.
 """
 struct PtrScatterAxis
     offsets::Ptr{Int}
@@ -218,8 +219,8 @@ function checked_tile_store!(tile::QSTile, i::Int, j::Int, v)
     return tile
 end
 
-# One-time-per-tile storage-bounds check (Phase 2b review finding), called
-# from the packers and microkernels before the unchecked @inbounds hot paths run.
+# One-time-per-tile storage-bounds check, called from the packers and
+# microkernels before the unchecked @inbounds hot paths run.
 
 """
     axis_offset_range(ax::Union{AffineAxis,ScatterAxis}) -> (lo::Int, hi::Int)

@@ -1,9 +1,8 @@
 """
     execute_tilewise!(plan::ContractPlan, alpha::Number, beta::Number)
 
-Unexported. The pre-macro-blocking driver, kept as the independent
-correctness oracle for [`execute!`](@ref) (docs/decisions.md,
-"Macro-blocking milestone", item 5): tiles M/N in steps of
+Unexported. The independent tile-by-tile correctness oracle for
+[`execute!`](@ref): tiles M/N in steps of
 `mr(plan.kernel)`/`nr(plan.kernel)` and, per output tile, K in
 `plan.blocking.kc`-sized panels, packing one sliver per tile and calling
 `execute_tile!` with `beta` on the first panel and `one(T)` on later ones.

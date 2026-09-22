@@ -11,9 +11,9 @@
 # Two independent cliffs are covered:
 #   Cliff A (architectural register spill) by `planar_register_pressure`;
 #   Cliff B (Julia heap-allocating a dynamically indexed NTuple above NV = 16)
-#   by an `@allocated == 0` assertion on a *scattered* fixture -- the specific
-#   fixture shape that hid the 24576 B Phase H regression, since every existing
-#   allocation assertion in the suite used regular destinations.
+#   by an `@allocated == 0` assertion on a *scattered* fixture, since a
+#   regular destination can stay allocation-free while the scattered path
+#   allocates.
 
 using Test
 using Random
@@ -157,7 +157,7 @@ using SIMD: Vec
         # What the detected machine offers -- `skip`ped rather than asserted
         # when detection came up empty, which is exactly the `:unknown` case
         # the engine is built to tolerate. Asserting it unconditionally makes
-        # this a test of the host rather than of the kernel (Amendment 5).
+        # this a test of the host rather than of the kernel.
         @test target_profile().nregisters > 0 skip = (target_profile().nregisters == 0)
     end
 
@@ -447,9 +447,8 @@ using SIMD: Vec
                 Bmat = rand(rng, T, kc, NR)
                 pa, pb = planar_pack(k, Amat, Bmat, kc)
 
-                # SCATTERED destination: the fixture shape that hid the 24576 B
-                # Phase H regression, because every pre-existing allocation
-                # assertion in this suite used a regular one.
+                # SCATTERED destination: a regular one can stay allocation-free
+                # while the scattered path allocates.
                 offs = collect(0:(MR - 1))
                 storage = zeros(T, MR * NR)
                 dst = DestinationTile(
@@ -465,12 +464,9 @@ using SIMD: Vec
 
                 # Julia 1.10 (LTS) cannot keep an NTuple{NV,Vec} accumulator
                 # register-resident; that is a compiler capability gap, kept
-                # visible as a skip rather than hidden by a weaker assertion.
-                # Measured on 1.10.11, same scattered fixture, ccqlin038:
-                #   (16,6,8)/(32,6,16)  accumulate 1632 B, execute_tile! 128/96 B
-                #   (24,3,8)/(48,3,16)  accumulate 1168 B, execute_tile! 128/96 B
-                #   ( 8,8,8)/(16,8,16)  accumulate 1088 B, execute_tile! 128/96 B
-                # against 0 B for all of them on 1.12.6.
+                # visible as a skip rather than hidden by a weaker assertion
+                # (on 1.10 this fixture allocates ~1-1.6 KB per accumulate and
+                # ~100 B per execute_tile!).
                 @test bytes_acc == 0 skip = (VERSION < v"1.11")
                 @test bytes_exec == 0 skip = (VERSION < v"1.11")
                 if VERSION >= v"1.11" && (bytes_acc != 0 || bytes_exec != 0)

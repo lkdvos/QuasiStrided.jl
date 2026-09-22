@@ -1,11 +1,10 @@
-# TensorOperations adapter: `QuasiStridedBackend`. Frozen contract:
-# docs/decisions.md, "TensorOperations integration milestone: Phase A direction
-# freeze". This is the whole TensorOperations-facing surface; the engine
-# (src/execution/execute.jl and everything it includes) knows nothing about TO.
+# TensorOperations adapter: `QuasiStridedBackend`. This is the whole
+# TensorOperations-facing surface; the engine (src/execution/execute.jl and
+# everything it includes) knows nothing about TO.
 #
-# Frozen import convention: every TensorOperations name is written `TO.<name>`
-# (a bare `using TensorOperations` would collide on `scalartype`), except the
-# TO-exported `Index2Tuple` and `linearize`.
+# Import convention, not to be changed: every TensorOperations name is written
+# `TO.<name>` (a bare `using TensorOperations` would collide on `scalartype`),
+# except the TO-exported `Index2Tuple` and `linearize`.
 import TensorOperations as TO
 using TensorOperations: Index2Tuple, linearize
 import TupleTools
@@ -33,10 +32,9 @@ throws an `ArgumentError` from `TensorOperations.tensorcontract!`.
 `TensorOperations.tensoradd!`/`TensorOperations.tensortrace!` fall back to
 `TO.StridedNative()` (QuasiStrided has no analog of either): a timing taken
 on those two operations under this backend measures `StridedNative`, not
-this engine -- this is the one exception to the "never falls back" rule
-below, added 2026-09-16 so a `@tensor` network mixing a contraction with an
-add/trace step can run wholesale under this backend (see docs/decisions.md,
-"Amendment: tensoradd!/tensortrace! fall back").
+this engine. This is the one exception to the "never falls back" rule below,
+so that a `@tensor` network mixing a contraction with an add/trace step can
+run wholesale under this backend.
 
 TensorOperations' `conjA`/`conjB` flags are honored for complex eltypes: they
 are forwarded to `plan_contract`, which folds each with the corresponding
@@ -46,9 +44,7 @@ conjugated *output* `C` is rejected rather than supported.
 It is not registered with `TensorOperations.select_backend`, and
 `tensorcontract!` never falls back to another backend for any ineligible
 input, so a timing taken on a *contraction* with this backend always
-measures this engine. Rationale is frozen in docs/decisions.md,
-"TensorOperations integration milestone: Phase A direction freeze" and
-"Complex element-type milestone: Phase A direction freeze".
+measures this engine.
 """
 struct QuasiStridedBackend <: TO.AbstractBackend end
 
@@ -58,8 +54,8 @@ struct QuasiStridedBackend <: TO.AbstractBackend end
 
 # One `task_local_storage` slot (not `threadid()`) holding a
 # `Dict{DataType,ContractWorkspace}` keyed by scalar type; see
-# docs/decisions.md, Amendment 1 and its workspace/allocator design-constraints
-# section.
+# docs/decisions.md, "Amendment 1: `ContractWorkspace` and the `allocator`
+# keyword".
 const _QS_WORKSPACE_KEY = :quasistrided_contract_workspaces
 
 @inline function _qs_workspace_pool()
@@ -76,7 +72,8 @@ end
 # The key is `eltype(C)` alone, with **no method component**: planar and 1m
 # pack into the same `Vector{real(T)}` and `reserve!` is grow-only, so a
 # workspace pooled under one complex method serves the other after at most a
-# grow (docs/decisions.md, "Buffer element type: the `VT` bound relaxes").
+# grow (docs/decisions.md, "Buffer element type: the `VT` bound relaxes, the
+# arity does not").
 # Keying on the storage type rather than the packed type is what keeps a
 # `Float64` and a `ComplexF64` contraction from colliding on one workspace.
 @inline function _qs_task_workspace(::Type{T}) where {T}
@@ -108,7 +105,7 @@ matched `pA[2]`/`pB[1]` order). `indC` is `linearize(pAB)` verbatim: the
 intermediate tensor's slot `j` carries label `j` by construction, and
 `permutedims`' convention is "output axis `c` takes input axis `perm[c]`".
 
-Worked example (frozen in docs/decisions.md, verified numerically):
+Worked example (verified numerically):
 
 ```
 pA  = ((3,1,4),(2,5))  ->  indA = ( 2, -1,  1,  3, -2)
@@ -133,7 +130,7 @@ end
 # Eligibility and argument checking
 # ----------------------------------------------------------------------------
 
-# The two clauses of the frozen eligibility predicate, split out only so the
+# The two clauses of the eligibility predicate, split out only so the
 # rejection message can name the one that failed. `_qs_eligible` below is the
 # predicate itself; nothing else in this file re-states it.
 const _QS_ELTYPES = (Float32, Float64, ComplexF32, ComplexF64)
@@ -155,7 +152,7 @@ _qs_eligible(C, A, B) = _qs_eltype_ok(C, A, B) && _qs_strided_ok(C, A, B)
 
 @noinline _qs_throw(msg::AbstractString) = throw(ArgumentError(msg))
 
-# Step 1 of the frozen argument-checking order: hard-reject every ineligible
+# Step 1 of the required argument-checking order: hard-reject every ineligible
 # input class before any TensorOperations check runs. `_qs_eligible` is the
 # gate; the clause checks below it only exist to name the failure.
 @noinline function _qs_check_eligible(f, C, A, B)
@@ -178,7 +175,7 @@ end
 
 # ----------------------------------------------------------------------------
 # Conjugation (docs/decisions.md, "Conjugation: semantics, and where each piece
-# is absorbed", and Amendment 3, which discharges the former invariant)
+# is absorbed")
 # ----------------------------------------------------------------------------
 #
 # `conjA`/`conjB` are NOT dropped: both are forwarded to `plan_contract`, which
@@ -222,9 +219,9 @@ end
 # short-circuits on `T <: Complex` regardless, so `conjA = true` on a real
 # eltype cannot even create a new `execute!` specialisation.
 
-# Shared prefix of both `tensorcontract!` methods below, in the frozen order
-# (docs/decisions.md, "Required argument-checking order in the adapter" and its
-# two addenda):
+# Shared prefix of both `tensorcontract!` methods below, in the required order
+# (docs/decisions.md, "Required argument-checking order in the adapter
+# (frozen)"):
 #
 #     eligibility -> argcheck -> dimcheck -> wrap -> aliasing
 #         -> conjugated-C rejection
@@ -238,7 +235,7 @@ end
 # an allocator checkpoint) as an *argument* to `plan_contract`, and Julia
 # evaluates arguments first -- so deferring to the engine would acquire and
 # possibly `reserve!`-grow a pooled workspace on behalf of a call that is about
-# to be rejected, at a point the frozen order does not mention. Both sites call
+# to be rejected, at a point the required order does not mention. Both sites call
 # the identical `_qs_isconj(Cv, false)`, and each has its own pinning test.
 #
 # `conjA`/`conjB` deliberately do not flow through here: no step of this prefix
@@ -324,11 +321,10 @@ end
 
 # NOT merged with the method above, although the two differ only in allocator
 # handling. Merging them into one method over a dispatched `_qs_run!` helper
-# reads better and saves a duplicated 10-line signature, but MEASURES WORSE:
-# +32 B/call (`Float64`) and +64 B/call (`ComplexF64`) against this form, on
-# both allocator regimes, reproducibly. The extra frame changes what escapes,
-# so the `ContractPlan` stops being elided. Left as two methods deliberately;
-# see docs/decisions.md, "Comment/structure cleanup pass".
+# would read better and save a duplicated 10-line signature, but costs an
+# extra allocation per call (`Float64` and `ComplexF64`, both allocator
+# regimes): the extra frame changes what escapes, so the
+# `ContractPlan` stops being elided. Two methods, deliberately.
 function TO.tensorcontract!(
         C::AbstractArray,
         A::AbstractArray, pA::Index2Tuple, conjA::Bool,
@@ -359,11 +355,9 @@ end
 # `tensoradd!`/`tensortrace!` fall back to `TO.StridedNative()`: QuasiStrided
 # has no analog of either (no standalone add/permute step, and no trace/
 # diagonal support at all -- `_classify_labels` in `src/planning/labels.jl` rejects
-# repeated labels), so there is nothing of this engine's own to run. Amended
-# 2026-09-16 (docs/decisions.md, "Amendment: tensoradd!/tensortrace! fall
-# back") to fall back rather than hard-reject, reversing the original Phase A
-# freeze's clause 1 -- clause 2 (`tensorcontract!` hard-rejects every
-# ineligible input) is UNCHANGED and still throws, never falls back.
+# repeated labels), so there is nothing of this engine's own to run. This
+# fallback is confined to these two operations: `tensorcontract!` still
+# hard-rejects every ineligible input and never falls back.
 
 """
     TensorOperations.tensoradd!(C, A, pA, conjA, α, β, ::QuasiStridedBackend, allocator)

@@ -1,5 +1,5 @@
-# Explicit-SIMD execute_tile! candidate (SIMD.jl's Vec{N,T}), matching
-# ScalarKernel's packed-format contract and API. Accumulator is an immutable
+# Explicit-SIMD microkernel (SIMD.jl's Vec{N,T}), matching ScalarKernel's
+# packed-format contract and API. Accumulator is an immutable
 # tuple of Vec{W,T} (not a heap array) for register residency; the K-step
 # body is a @generated, closure-free function so `acc = _accumulate_step(...)`
 # is a plain reassignment that never boxes.
@@ -55,8 +55,8 @@ avecs_per_column(::SIMDKernel{MR, NR, T, W}) where {MR, NR, T, W} = MR ÷ W
     zero_accumulator(kernel::SIMDKernel{MR,NR,T,W}) -> NTuple{NV,SIMD.Vec{W,T}}
 
 Return a logical `MR`-by-`NR` zero accumulator, represented as an immutable
-tuple of `NV = (MR÷W)*NR` zero `Vec{W,T}` values (design doc section 8: "an
-ordinary heap array of accumulators is not the intended fast path"). Entry
+tuple of `NV = (MR÷W)*NR` zero `Vec{W,T}` values (an ordinary heap array of
+accumulators would not stay in registers). Entry
 `(v, j)` (`v` the row-vector index in `0:MR÷W-1`, `j` the output column in
 `0:NR-1`) lives at 1-based tuple position `v + (MR÷W)*j + 1`; physical row
 `i` of that vector is lane `i - v*W + 1` (1-based `SIMD.Vec` indexing).
@@ -144,10 +144,9 @@ predicate folds to `_unit_stride_rows` or to `false` at each specialization.
 
 Rank-2 storage (`Matrix`) and non-`DenseArray` storage (`SubArray`, even a
 contiguous one) are excluded and keep taking the scalar fallback, as do
-non-unit-stride affine rows and scattered rows. Widened from the original
-`isa Vector{T}` check, which was unsatisfiable on the real driver path on
-Julia >= 1.11 (`parent` of an `Array`-backed `StridedView` is `Memory{T}`
-there; docs/decisions.md, "Store fast-path investigation: Phase A").
+non-unit-stride affine rows and scattered rows. The check must admit
+`Memory{T}`, not just `Vector{T}`: on Julia >= 1.11 the `parent` of an
+`Array`-backed `StridedView`, and hence the driver's storage, is `Memory{T}`.
 """
 @inline _vector_store_eligible(tile::QSTile, ::Type{T}) where {T} =
     _unit_stride_rows(tile.rows) && tile.storage isa DenseVector{T}
@@ -157,12 +156,11 @@ there; docs/decisions.md, "Store fast-path investigation: Phase A").
 # GUARDRAIL (Cliff B): every `acc[...]` here must be a *literal* tuple index,
 # which is why this is `@generated` and unrolled over `(v, j)` rather than a
 # plain `for j, i` loop. Indexing an `NTuple` dynamically forces the whole
-# tuple to memory, and above NV = 16 the compiler heap-allocates it: measured
-# 24576 B per `execute!` on the 3-index scattered fixture at
-# (MR,NR,W) = (32,6,8), against 0 B at (16,6,8) (docs/decisions.md, Phase H).
-# Scattered destinations are this engine's reason to exist, so that silently
-# capped the usable register tile on exactly the workload that matters. Only
-# the lane index inside a single `Vec` may be a runtime value.
+# tuple to memory, and above NV = 16 the compiler heap-allocates it on every
+# call (e.g. at (MR,NR,W) = (32,6,8), but not at (16,6,8)). Scattered
+# destinations are this engine's reason to exist, so a dynamic index here
+# silently caps the usable register tile on exactly the workload that matters.
+# Only the lane index inside a single `Vec` may be a runtime value.
 @generated function _store_tile_scattered!(
         destination::QSTile, acc::NTuple{NV, Vec{W, T}},
         alpha::T, beta::T, kernel::SIMDKernel{MR, NR, T, W},
@@ -202,13 +200,10 @@ end
 # reason this is `@generated` too. Both the whole-block stores and the lane
 # tail must index `acc` with a *literal* tuple position, so the unrolling over
 # `(v, j)` happens here at compile time rather than in a runtime loop; only the
-# lane index inside a single `Vec` may be a runtime value. Before this was
-# generated the body looped over `v`/`j` with `acc[v + NVECA * j + 1]` and an
-# `_acc_lane(acc, i ÷ W, j, ...)` tail, which is precisely the dynamic-index
-# pattern that heap-allocates the accumulator above NV = 16 -- harmless only
-# while the branch was dead (unreachable on Julia >= 1.11, where the driver's
-# storage is `Memory{T}`), and a live allocation cliff the moment the guard was
-# widened (docs/decisions.md, Phase A, E6).
+# lane index inside a single `Vec` may be a runtime value. A runtime loop over
+# `v`/`j` indexing `acc[v + NVECA * j + 1]` is precisely the dynamic-index
+# pattern that heap-allocates the accumulator above NV = 16, and this is the
+# path the driver takes for every unit-stride destination.
 #
 # `m`/`n` stay runtime values, compared against literal row/column positions:
 # nothing outside the valid rectangle is loaded or stored, so a partial tile

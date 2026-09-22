@@ -399,29 +399,14 @@ end
 end
 
 # =====================================================================
-# Steady-state allocation (Phase 2b Fable review finding 5, deferred;
-# root-caused and fixed by whoever next reads this): pack_a!/pack_b!
-# called directly against a bare KernelDescriptor must allocate zero
-# bytes once warmed, for both affine and scattered sources, kc=0, and a
-# nontrivial (non-identity) transform. Root cause was that `transform`
-# (and `_pack_panel!`'s `transform`/`load`/`packed_offset`) had no type
-# parameter in the signature: a `Function`-typed argument that a method
-# only *forwards* (never calls directly) gets compiled against a
-# widened/abstract type unless bound by an explicit `where` clause, which
-# forced a dynamic call and heap-allocated the `load` closure passed
-# alongside it. Fixed by giving each of those parameters its own free
-# type parameter (`transform::F where {F}`, etc.) so the compiler is
-# forced to specialize per concrete callable type.
-#
-# NOTE: this test only covers pack_a!/pack_b! called directly against a
-# `KernelDescriptor`, matching this file's ownership scope. Calling
-# through the `ScalarKernel`/`SIMDKernel` forwarding one-liners in
-# src/microkernels/scalar.jl / src/microkernels/simd.jl still allocates (confirmed
-# separately): those forwarding methods declare `kernel::ScalarKernel`
-# (resp. `SIMDKernel`) and `transform` with no `where` clause of their
-# own, so the same widening happens one layer up, in files this task
-# does not own and must not edit. That is a distinct, currently
-# unresolved allocation and is intentionally not asserted here.
+# Steady-state allocation: pack_a!/pack_b! called directly against a bare
+# KernelDescriptor must allocate zero bytes once warmed, for both affine and
+# scattered sources, kc=0, and a nontrivial (non-identity) transform. This
+# pins that every forwarded callable (`transform`, and `_pack_panel!`'s
+# `transform`/`load`/`packed_offset`) has its own free type parameter
+# (`transform::F where {F}`): a `Function`-typed argument that a method only
+# *forwards* (never calls directly) is otherwise compiled against a widened
+# type, forcing a dynamic call and a heap-allocated `load` closure.
 @testset "pack_a!/pack_b!: zero steady-state allocation (direct KernelDescriptor)" begin
     nontrivial(x) = 2.0 * x + 1.0
 
@@ -482,13 +467,10 @@ end
     @test all(iszero, run())
 end
 
-# Main-process follow-up: the diagnosis above fixed pack_a!/pack_b! called
-# with a bare KernelDescriptor, but the identical missing-`where`-clause bug
-# recurred one layer up in ScalarKernel's and SIMDKernel's own pack_a!/
-# pack_b! forwarding methods (src/microkernels/interface.jl, src/microkernels/simd.jl) — fixed
-# there too (same pattern: bind the kernel's type parameters and give
-# `transform` its own free type parameter). Regression-test both forwarding
-# paths, not just the direct-KernelDescriptor path above.
+# The same missing-`where`-clause widening can occur one layer up, in
+# ScalarKernel's and SIMDKernel's own pack_a!/pack_b! forwarding methods, so
+# both forwarding paths are pinned too, not just the direct-KernelDescriptor
+# path above.
 @testset "pack_a!/pack_b!: zero steady-state allocation (ScalarKernel/SIMDKernel forwarding)" begin
     function run_forwarding(kernel)
         packed_a = zeros(scalartype(kernel), mr(kernel) * 4)
@@ -508,8 +490,8 @@ end
 end
 
 # =====================================================================
-# Macro-blocking milestone: pack_a!/pack_b! widened to AbstractVector,
-# packing into a panel-sliver view of a larger buffer.
+# pack_a!/pack_b! into an AbstractVector: packing into a panel-sliver view of
+# a larger buffer.
 # =====================================================================
 
 @testset "pack_a!/pack_b!: packing into a SubArray view matches a fresh Vector" begin
@@ -609,14 +591,12 @@ end
     # Direct KernelDescriptor.
     @test run_view(KernelDescriptor) == (0, 0, 0, 0)
 
-    # Via ScalarKernel/SIMDKernel forwarding (the exact site of the Phase 2b
-    # finding-5 recurrence, now widened to AbstractVector).
+    # Via the ScalarKernel/SIMDKernel forwarding methods.
     @test run_view(ScalarKernel) == (0, 0, 0, 0)
     @test run_view(SIMDKernel) == (0, 0, 0, 0)
 end
 
 # =====================================================================
-# Packing speed: the restructured
 # `_pack_panel!` (full-sliver branch / valid+zero split for tails) and the
 # `pack_a!` contiguous vector fast path (PackedPanel destination, dense
 # storage, unit-stride rows filling the whole tile, identity-like transform).

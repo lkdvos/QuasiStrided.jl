@@ -111,8 +111,8 @@ end
     @test axis_offset(ax1, 0) == 42
 
     # Nonzero interval start feeding a BlockDescriptor via AxisGroup, to
-    # confirm the whole Phase 1 -> Phase 2 handoff (not just describe_block
-    # in isolation).
+    # confirm the whole AxisGroup -> tile-axis handoff (not just
+    # describe_block in isolation).
     g = AxisGroup((3, 2), ((1, 15),))
     buf3 = zeros(Int, 3)
     fillbuf = QuasiStrided.fill_offsets!((buf3,), g, 3, 3) # second "row": 15,16,17

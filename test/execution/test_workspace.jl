@@ -1,6 +1,6 @@
 # =====================================================================
 # ContractWorkspace, the `workspace`/`allocator`/`oracle` keywords, and the
-# SIMDKernel default (docs/decisions.md, "Amendment 1"/"Amendment 2").
+# SIMDKernel default.
 # =====================================================================
 
 _ws_lengths(ws) = map(f -> length(getfield(ws, f)), fieldnames(typeof(ws)))
@@ -12,11 +12,11 @@ _ws_lengths(ws) = map(f -> length(getfield(ws, f)), fieldnames(typeof(ws)))
         Cmat = zeros(T, 9, 8)
         plan = _mm_plan(Cmat, Amat, Bmat)
 
-        # Amendment 2: a SIMDKernel, not a ScalarKernel. The shape itself is
-        # hardware-derived (docs/decisions.md, Phase G) and demoted when M
-        # cannot fill a register tile, so pin the *resolution* rather than a
-        # literal shape -- `{8, 6, T}` held here only because Qm = 9 happens
-        # to trigger the demotion on x86, and broke on aarch64.
+        # A SIMDKernel, not a ScalarKernel. The shape itself is
+        # hardware-derived and demoted when M cannot fill a register tile, so
+        # pin the *resolution* rather than a literal shape: a literal would
+        # hold only on hosts where Qm = 9 happens to trigger the same
+        # demotion.
         @test plan.kernel isa QuasiStrided.SIMDKernel
         @test QuasiStrided.scalartype(plan.kernel) === T
         @test plan.kernel === QuasiStrided._default_kernel(T, size(Amat, 1), size(Bmat, 2))
@@ -240,15 +240,14 @@ end
     k32 = SIMDKernel(Val(8), Val(6), Float32)
     b = Blocking(16, 8, 12)
 
-    # Every existing spelling stays valid, unedited -- the whole point of
-    # relaxing the bound rather than adding a parameter.
+    # Real storage: the plain `ContractWorkspace{T, Vector{T}}` form.
     ws = QuasiStrided.ContractWorkspace(Float64, k64, b; oracle = true)
     @test ws isa QuasiStrided.ContractWorkspace{Float64, Vector{Float64}}
     @test eltype(ws.packed_a) === Float64
 
     # `T` is the STORAGE element type and the packed panels hold `real(T)`: a
-    # complex storage type over Float64-packing is the new instance the relaxed
-    # bound admits, at the SAME arity.
+    # complex storage type over Float64 packing is admitted at the SAME
+    # arity.
     wsc = QuasiStrided.ContractWorkspace(ComplexF64, k64, b; oracle = true)
     @test wsc isa QuasiStrided.ContractWorkspace{ComplexF64, Vector{Float64}}
     @test eltype(wsc.packed_a) === Float64 === eltype(wsc.tw_packed_b)

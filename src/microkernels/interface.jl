@@ -1,6 +1,8 @@
 # What every microkernel shares: the `DescriptorKernel` supertype and its
 # forwarding, the complex-method traits, constructor checks, the axpby element
-# helpers, and the validation prologues of `execute_tile!`/`store_tile!`.
+# helpers, the validation prologues of `execute_tile!`/`store_tile!`, and the
+# one generic `execute_tile!`. Each kernel file implements only
+# `zero_accumulator`, `accumulate` and `store_tile!`.
 
 # Shared supertype for kernels wrapping a KernelDescriptor as `.descriptor`;
 # lets mr/nr/scalartype/packed_*/pack_a!/pack_b! forward once for all of them.
@@ -17,8 +19,8 @@ Which complex-arithmetic method a kernel implements. Singleton types, so
 `default_blocking` and the shape menus dispatch on them without a runtime
 branch.
 
-**No auto-dispatch rule is derived from any measurement**: the sibling project
-measured four different method orderings on four machines.
+**No auto-dispatch rule is derived from any measurement**: the ranking of
+methods differs from machine to machine.
 [`PlanarMethod`](@ref) is the unconditional default; [`OneMMethod`](@ref) is
 selected only by naming the kernel (docs/decisions.md, "Method ranking does not
 transfer between machines").
@@ -91,7 +93,7 @@ total.
 complex_method(::Any) = RealMethod()
 
 # ----------------------------------------------------------------------------
-# DescriptorKernel forwarding, mirroring the block in src/microkernels/interface.jl
+# DescriptorKernel forwarding to the wrapped `Descriptor` (src/packing/format.jl)
 # ----------------------------------------------------------------------------
 
 realtype(k::DescriptorKernel) = realtype(k.descriptor)
@@ -120,8 +122,8 @@ packed_b_length(k::DescriptorKernel, kc::Int) = packed_b_length(k.descriptor, kc
 # pack_a!/pack_b! dispatch on a bare `Descriptor`; forward any wrapper.
 #
 # GUARDRAIL: every forwarded argument needs its OWN bound type parameter (`V`,
-# `K`, `F`). Leaving one unbound here reintroduces Phase 2b finding 5's
-# ~80 B/call of dynamic dispatch. `V` is unconstrained rather than
+# `K`, `F`). Leaving one unbound makes the call dynamically dispatched and
+# allocating on every pack. `V` is unconstrained rather than
 # `<: AbstractVector{T}` so that a `PackedPanel` (src/packing/panel.jl) forwards too;
 # `T` comes from `K` instead.
 pack_a!(
@@ -203,7 +205,7 @@ end
     muladd(alpha, r, beta * storage[idx])
 
 # ----------------------------------------------------------------------------
-# Validation prologues shared by all four kernels' store_tile!/execute_tile!
+# Validation prologues of store_tile! and execute_tile!
 # ----------------------------------------------------------------------------
 
 # `store_tile!`'s alpha/beta preamble: an empty destination is a no-op, and
@@ -228,9 +230,9 @@ end
     )
 )
 
-# `execute_tile!`'s validation sequence, in the order all four kernels share:
+# `execute_tile!`'s validation sequence, in this order:
 # destination extent vs. kernel shape, `kc >= 0`, the alpha/beta converts, the
-# empty short-circuit, storage bounds BEFORE any `@inbounds` path (Phase 2b),
+# empty short-circuit, storage bounds BEFORE any `@inbounds` path,
 # the `kc == 0 || alpha == 0` beta-only branch, then both packed capacities.
 # Returns `(run, alphaT, betaT)`; `run == false` means the call is finished and
 # the caller returns `destination` untouched.
@@ -245,8 +247,7 @@ end
     kernel, destination, packed_a, packed_b, kc, alpha, beta, Val(true)
 )
 
-# `BOUNDS` is a compile-time flag: at `Val(true)` this generates exactly the
-# code the six-argument form always did, and at `Val(false)` the
+# `BOUNDS` is a compile-time flag: at `Val(false)` the
 # `checked_tile_storage_bounds` call folds away. Only `unsafe_execute_tile!`
 # passes `Val(false)`.
 @inline function _execute_tile_prologue!(

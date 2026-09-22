@@ -4,15 +4,13 @@
 # Raises DimensionMismatch on a matched-label length mismatch.
 #
 # `D = length(labels)` is a RUNTIME value (which labels are shared is a
-# property of the label values, not of their tuple types), so the three
-# `ntuple`s this used to build were runtime-length -- inferred as
-# `Tuple{Vararg{Int}}`, heap-boxed, and each element read back through a
-# dynamic `getindex`. That cost 656 B and 0.75 us per group even at `D == 1`
-# (measured, ccqlin038 / Julia 1.13). `D` is bounded above by `N1` (every
-# label here occurs in `ind1`), which IS compile-time known, so the rank is
-# resolved once through the unrolled `_pair_group_rank` ladder below and the
-# body then runs at a literal `Val{D}` with statically sized tuples
-# throughout. Same groups, same errors, same order of checks.
+# property of the label values, not of their tuple types), so `ntuple`s built
+# directly from it are runtime-length -- inferred as `Tuple{Vararg{Int}}`,
+# heap-boxed, and read back through a dynamic `getindex`, allocating per group
+# even at `D == 1`. `D` is bounded above by `N1` (every label here occurs in
+# `ind1`), which IS compile-time known, so the rank is resolved once through
+# the unrolled `_pair_group_rank` ladder below and the body then runs at a
+# literal `Val{D}` with statically sized tuples throughout.
 function _build_pair_group(
         labels::Vector{Int},
         ind1::NTuple{N1, Int}, v1::StridedView,
@@ -41,7 +39,7 @@ end
         ind2::NTuple{N2, Int}, v2::StridedView
     ) where {D, N1, N2}
     # Hoisted out of the per-dimension closures: `Base.strides` on a
-    # `StridedView` rebuilds a tuple, and the old body called it once per `d`.
+    # `StridedView` rebuilds a tuple, so call it once, not once per `d`.
     st1 = Base.strides(v1)
     st2 = Base.strides(v2)
     pos1 = ntuple(d -> findfirst(==(@inbounds labels[d]), ind1)::Int, Val(D))

@@ -1,15 +1,13 @@
 # Label planning: classify every label into M/N/K, order the free labels
 # by their stride in C, and decide the M/N operand orientation.
 
-# Membership test against a statically-sized label tuple. Replaces the three
-# `Set`s `_classify_labels` used to build: the label tuples have a
-# compile-time-known LENGTH (the `NA`/`NB`/`NC` parameters, one specialization
-# per arity), so this unrolls into a chain of integer compares and allocates
-# nothing, where each `Set` cost a `Dict`'s slot/key arrays. Measured on
-# ccqlin038 / Julia 1.13: `_classify_labels` 1232 -> 224 B and 0.73 -> 0.25 us
-# on a 2-label plain GEMM (docs/decisions.md, "Per-call floor"). The tuples are
-# `allunique` by the checks at the top of `_classify_labels`, so a linear scan
-# is also the whole of the membership question.
+# Membership test against a statically-sized label tuple, used instead of a
+# `Set`: the label tuples have a compile-time-known LENGTH (the `NA`/`NB`/`NC`
+# parameters, one specialization per arity), so this unrolls into a chain of
+# integer compares and allocates nothing, where each `Set` would cost a
+# `Dict`'s slot/key arrays on every plan. The tuples are `allunique` by the
+# checks at the top of `_classify_labels`, so a linear scan is also the whole
+# of the membership question.
 @inline _label_in(lbl::Int, t::NTuple{N, Int}) where {N} = any(==(lbl), t)
 
 # Classify every label in indA ∪ indB ∪ indC into M/N/K. Returns
@@ -99,8 +97,8 @@ end
 )
 
 # ----------------------------------------------------------------------------
-# Free-label order and M/N orientation (docs/decisions.md, "Label-order
-# milestone"). `_classify_labels` lists free labels in A's/B's own axis order,
+# Free-label order and M/N orientation. `_classify_labels` lists free labels
+# in A's/B's own axis order,
 # which is incidental to C: `fill_offsets!` enumerates a composite with its
 # FIRST label fastest, so that order fixes the store loop's walk through C.
 # Both helpers below are pure planning-time functions of (labels, indC, C).
@@ -110,12 +108,11 @@ end
 # ascending; ties keep input order, so a single label or an already-sorted list
 # comes back unchanged. Every label must occur in `indC` (the M/N lists from
 # `_classify_labels` do by construction; K labels never come here).
-# Insertion sort rather than `sortperm` + permuted copy: the old body
-# allocated the key vector, the permutation and the result (three `Vector`s
-# where one is needed), and these lists have at most `ndims(C)` entries, so an
-# O(n^2) sort with n <= 6 is not a cost. Strict `>` in the shift test keeps it
-# STABLE, which is the contract (ties keep input order) that
-# `alg = DEFAULT_STABLE` supplied before. A fresh vector is still returned:
+# Insertion sort rather than `sortperm` + permuted copy: the latter allocates
+# the key vector, the permutation and the result (three `Vector`s where one is
+# needed), and these lists have at most `ndims(C)` entries, so an O(n^2) sort
+# with n <= 6 is not a cost. Strict `>` in the shift test keeps it STABLE,
+# which is the contract (ties keep input order). A fresh vector is returned:
 # sorting `labels` in place would mutate `_classify_labels`'s output, which
 # callers (and test/planning/test_plan_contract.jl's label-order pinning) read afterwards.
 function _order_free_labels(
@@ -161,10 +158,9 @@ function _leading_unit_run(
 end
 
 # Whether to swap the operand roles (B feeds M, A feeds N), given the two
-# composites' OWN leading unit-stride run lengths (`_leading_unit_run` above
-# -- the one and only place that quantity is computed; `plan_contract` derives
-# `run_m`/`run_n` once and reuses them here and at both `_demote_for_run` call
-# sites, rather than recomputing per call site as an earlier revision did).
+# composites' OWN leading unit-stride run lengths (`_leading_unit_run` above;
+# `plan_contract` computes `run_m`/`run_n` once and reuses them here and at
+# both `_demote_for_run` call sites).
 # The vectorized store (`_vector_store_eligible`) needs a register sliver --
 # `mr(kernel)` consecutive M coordinates -- to be unit-stride in C, so a
 # leading run shorter than `mr` buys nothing (measured: swapping onto a
@@ -174,28 +170,22 @@ end
 # (they differ only when the default kernel's small-Qm demotion applies to one
 # side).
 #
-# Callers must additionally restrict this to real dtypes -- measured directly
-# (`ccsd_t_3`, dim=16, both complex dtypes): the swap is a ~2-4% regression
-# there (loses the as-is orientation's N-side locality for no store-side
-# gain), back when `PlanarKernel`/`OneMKernel` (complex) shipped only a
-# scattered/scalar store. As of the planar vectorized store fast path
-# (`_store_tile_planar_vector!`, `src/microkernels/planar.jl`), that measurement is
-# STALE: there is now a vector store for the swap to potentially win on the
-# complex path too. The `T <: Real` guard below is a DELIBERATELY DEFERRED,
-# UNMEASURED follow-up, not a settled "moot" case -- per
-# docs/proposals/complex-fast-paths.md Decision 3, extending `_prefer_swap` to
-# complex was explicitly scoped out of this change to ship the store fast path
-# first and measure it, with any extension here to be a separate later change
-# with its own before/after measurement. See the `T <: Real` guard at the
-# call site.
+# Callers additionally restrict this to real dtypes. That restriction was
+# measured (a ~2-4% regression on `ccsd_t_3`, dim=16, both complex dtypes:
+# the swap loses the as-is orientation's N-side locality for no store-side
+# gain) only against a scattered/scalar complex store; the planar vectorized
+# store (`_store_tile_planar_vector!`, `src/microkernels/planar.jl`) gives the
+# swap something to win on the complex path too. The `T <: Real` guard is
+# therefore an UNMEASURED, DELIBERATELY DEFERRED question, not a settled case:
+# lifting it needs its own before/after measurement
+# (docs/proposals/complex-fast-paths.md, Section 6.1). See the `T <: Real`
+# guard at the call site.
 function _prefer_swap(run_m::Int, run_n::Int, mr_asis::Int, mr_swapped::Int = mr_asis)
     return run_m < mr_asis && run_n >= mr_swapped
 end
 
-# Label-list form, kept for its existing external test coverage and for any
-# caller that has `morder`/`norder` but not their run lengths in hand; derives
-# the same two run lengths `plan_contract` itself now derives once and passes
-# to the method above directly.
+# Label-list form, for callers that have `morder`/`norder` but not their run
+# lengths; derives the same two run lengths `plan_contract` computes once.
 function _prefer_swap(
         morder::Vector{Int}, norder::Vector{Int}, indC::NTuple{NC, Int}, C::StridedView,
         mr_asis::Int, mr_swapped::Int = mr_asis

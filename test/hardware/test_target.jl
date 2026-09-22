@@ -1,6 +1,6 @@
 # Hardware detection (src/hardware/target.jl) and the register shape / blocking it
 # selects. Two properties matter most: detection never throws, and every
-# failure path resolves to exactly the pre-detection constants.
+# failure path resolves to exactly the fallback constants.
 
 using StridedViews: StridedView
 using QuasiStrided: TargetProfile, CacheLevel, target_profile, cache_topology,
@@ -67,7 +67,7 @@ using QuasiStrided: TargetProfile, CacheLevel, target_profile, cache_topology,
             )
             @test _parse_size(str) == want
         end
-        # "0,16" is this machine's L2 (SMT pair); "0-7,16-23" its shared L3.
+        # "0,16" is a typical SMT-pair L2 list; "0-7,16-23" a shared L3.
         for (str, want) in ("0,16" => 2, "0-7,16-23" => 16, "3" => 1, "" => 0, "0-3" => 4)
             @test _count_cpu_list(str) == want
         end

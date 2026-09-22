@@ -158,17 +158,12 @@ function plan_contract(
     morder = _order_free_labels(mlabels, indC, C)
     norder = _order_free_labels(nlabels, indC, C)
 
-    # Each composite's own leading unit-stride run length, derived ONCE here
-    # (not per call site): both the swap decision and the F2 demotion below
-    # consume these same two values, keyed on the composite (M or N), not on
-    # which orientation ends up feeding the driver's own M role. Computed
-    # only for real `T` (T5 review, S4): the swap decision below is already
-    # `T <: Real`-gated, and `_demote_for_run`'s generic complex method
-    # ignores `run`/`Qm` entirely, so a complex plan pays for neither
-    # `_leading_unit_run` call -- unlike before item 3, when `_prefer_swap`'s
-    # short-circuit already skipped both for complex; the placeholder `0`
-    # keeps this genuinely a no-added-cost refactor for complex, not merely
-    # "unused but computed".
+    # Each composite's own leading unit-stride run length, computed once: the
+    # swap decision and the run-length demotion below both consume these two
+    # values, keyed on the composite (M or N), not on which orientation ends
+    # up feeding M. Real `T` only: both consumers are `T <: Real`-gated, so a
+    # complex plan skips the two `_leading_unit_run` calls (`0` is a
+    # placeholder).
     run_m = T <: Real ? _leading_unit_run(morder, indC, C) : 0
     run_n = T <: Real ? _leading_unit_run(norder, indC, C) : 0
 
@@ -189,7 +184,7 @@ function plan_contract(
     # The swap is for real element types only. Extending it to complex
     # kernels, which now also have a vectorized store, is a deliberately
     # deferred, unmeasured follow-up (docs/proposals/complex-fast-paths.md,
-    # Decision 3). Real kernels (`SIMDKernel` and `ScalarKernel`) keep it.
+    # Section 6.1). Real kernels (`SIMDKernel` and `ScalarKernel`) keep it.
     # Uses the precomputed `run_m`/`run_n` directly.
     if T <: Real && _prefer_swap(run_m, run_n, mr(kernel_asis), mr(kernel_swapped))
         # B takes the M role and A the N role. Everything operand-bound moves

@@ -13,9 +13,9 @@
 
 # Gate for `_pack_a_contiguous!`, kept as its own function so a test can
 # assert it fires for the driver's argument types and stays off for every
-# ineligible shape (test/layout/test_tiles.jl). All but `m == MR` and the stride
+# ineligible shape (test/packing/test_pack_real.jl). All but `m == MR` and the stride
 # test fold at compile time (they inspect types only). `_unit_stride_rows`
-# (src/microkernels/simd.jl) has methods for exactly the three `Axis` kinds and
+# (src/layout/tiles.jl) has methods for exactly the three `Axis` kinds and
 # deliberately NO fallback: an unknown axis type must be a MethodError here,
 # never a silent `true`/`false`.
 @inline function _pack_a_contiguous_eligible(
@@ -27,17 +27,14 @@ end
 
 # Fast path for the common A sliver: unit-stride rows filling the whole
 # register tile, straight copy, `PackedPanel` destination, dense storage --
-# every M-sliver of every column-major (or unit-stride-fastest multi-index) A
-# in the profiling pass. Each K step is then `MR` contiguous source elements
+# every M-sliver of every column-major (or unit-stride-fastest multi-index) A.
+# Each K step is then `MR` contiguous source elements
 # landing at `MR` contiguous packed offsets (`i + MR*p`), i.e. one
 # `Vec{MR,T}` load/store per K step. Padding never arises here (`m == MR`),
 # and `_check_pack_a` has already validated every address `base + rows.base +
 # i + col_offset(p)`, `0 <= i < MR`, against `length(storage)` -- exactly the
 # span each `vload` reads -- so nothing is read that the scalar path would not
-# have read. Measured 2-2.6x (Float64) / 4-7x (Float32) over the scalar loop
-# on the driver's argument types (ccqlin038 / Julia 1.13; `smallN_256x256x12`
-# went from 62% to 33% packing share and 16 to 35 GFLOP/s; docs/decisions.md,
-# "Packing speed"). Same eligibility shape as `_vector_store_eligible`
+# have read. Same eligibility shape as `_vector_store_eligible`
 # (src/microkernels/simd.jl).
 @inline function _pack_a_contiguous!(
         packed::PackedPanel{T}, storage::DenseVector{T}, rowbase::Int, cols::C,
@@ -57,16 +54,13 @@ end
 # ---------------------------------------------------------------------------
 # Complex packing fast path (deinterleave-and-copy)
 #
-# Phase 1 of docs/proposals/complex-fast-paths.md, Sections 4.3 (PlanarFormat)
+# Design: docs/proposals/complex-fast-paths.md, Sections 4.3 (PlanarFormat)
 # and 4.4 (OneEFormat's A panel). It is the complex counterpart of
 # `_pack_a_contiguous!` above and nothing more: a leaf-level alternative inside
 # `_pack_a!`/`_pack_b!` for the ONE sliver shape it can serve, with the shared
-# `_pack_panel!` loop above (reconciled from this section's original
-# `_pack_panel_complex!` fallback during the tensorcontract-rs-comparison /
-# complex-fast-paths merge -- both landed independently around the same
-# complex packing path and both are kept) as the fallback for everything
-# else. No format, offset formula or transform contract changes; the fast
-# path is required to produce the same bytes the scalar loop would have.
+# `_pack_panel!` loop (src/packing/pack.jl) as the fallback for everything
+# else. It uses the same format, offset formula and transform contract, and
+# must produce the same bytes the scalar loop would.
 #
 # Why this is the easy half of the complex round trip (proposal Section 4.3):
 # packing applies no `alpha`/`beta`, never reads its destination, and its only
@@ -112,9 +106,9 @@ specialization.
 columns). It must be unit-stride `AffineAxis`, because that is what makes `PD`
 consecutive source elements `PD` consecutive `Complex{T}` values in storage and
 hence `2PD` consecutive `real(T)`s -- the bitcast the fast path performs is
-sound for exactly that case and for no other (proposal Section 3.3; the scalar
-loop's own header comment at the top of this section says why a `QSTile` is
-never `reinterpret`ed in general).
+sound for exactly that case and for no other (proposal Section 3.3; the
+"Complex packing" header in src/packing/pack.jl says why a `QSTile` is never
+`reinterpret`ed in general).
 
 `valid == PD` excludes every partial sliver, so the fast path never has to
 write a padding lane and the "padding is a literal zero, never `-0.0`" contract
@@ -150,8 +144,7 @@ end
 # --- shuffle primitives ----------------------------------------------------
 #
 # GUARDRAIL: every index tuple below is built HERE, from `PD`, at specialization
-# time -- never hardcoded to the AVX-512 shape this was written against, and
-# never a runtime gather. `PD` is `mr(kernel)`/`nr(kernel)`, which the driver
+# time -- never hardcoded to one register shape, and never a runtime gather. `PD` is `mr(kernel)`/`nr(kernel)`, which the driver
 # derives from `kernel_shapes`; the patterns therefore follow the shipped menus
 # automatically (proposal Section 6.2). These are `@generated` for the same
 # reason the store paths in src/microkernels/simd.jl are: `shufflevector` needs a
@@ -179,8 +172,7 @@ end
 # (`plane_offset(0, ..)`): `[re_0, s*im_0, re_1, s*im_1, ...]`, with `s = +1`
 # under `identity` and `-1` under `conj`. At `identity` this is a pure copy of
 # `src` -- the pattern is the identity permutation over the first source -- and
-# LLVM folds the shuffle away entirely, which is the "literally a memory copy"
-# case the proposal's Section 4.4 predicts.
+# LLVM folds the shuffle away entirely, leaving a plain memory copy.
 @generated function _onee_pack_shuffle_a(
         src::Vec{N, R}, alt::Vec{N, R}, ::Val{PD}
     ) where {N, R, PD}

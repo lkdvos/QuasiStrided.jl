@@ -7,8 +7,7 @@ using QuasiStrided
 # (stale/undeclared deps, missing [compat] bounds, method ambiguities,
 # undefined exports, type piracy, etc.) rather than behavior.
 #
-# Context (docs/decisions.md, "TensorOperations integration milestone:
-# Phase A direction freeze"): QuasiStrided takes a hard dependency on
+# QuasiStrided takes a hard dependency on
 # TensorOperations and adds methods to TO's own generic functions
 # (`TO.tensorcontract!`, `TO.tensoradd!`, `TO.tensortrace!`) dispatching on
 # a QuasiStrided-owned type (`QuasiStridedBackend`). That is not type

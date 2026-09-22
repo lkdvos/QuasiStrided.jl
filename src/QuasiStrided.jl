@@ -3,8 +3,8 @@ module QuasiStrided
 using LinearAlgebra
 using StridedViews: StridedView, offset
 
-# Frozen module-import convention (docs/decisions.md): TensorOperations names
-# are always qualified; a bare `using TensorOperations` would collide on
+# Module-import convention, not to be changed: TensorOperations names are
+# always qualified; a bare `using TensorOperations` would collide on
 # `scalartype`.
 import TensorOperations as TO
 
@@ -71,7 +71,7 @@ end
             :public, :contract!, :plan_contract, :execute!, :ContractPlan,
             :ContractWorkspace, :Blocking, :default_blocking,
             :ScalarKernel, :SIMDKernel,
-            # Complex milestone. `PlanarKernel` is the default for a complex
+            # `PlanarKernel` is the default for a complex
             # element type, and `OneMKernel` is reachable ONLY by naming it in
             # `plan_contract(...; kernel = ...)` -- the engine never picks it,
             # deliberately. A selection mechanism whose only handle is an

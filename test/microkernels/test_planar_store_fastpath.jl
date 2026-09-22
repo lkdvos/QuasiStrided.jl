@@ -1,5 +1,5 @@
 # The vectorized planar complex store fast path (src/microkernels/planar.jl,
-# `_store_tile_planar_vector!`): Phase 2 of docs/proposals/complex-fast-paths.md,
+# `_store_tile_planar_vector!`), designed in docs/proposals/complex-fast-paths.md,
 # Section 3.3.
 #
 # Four separable things are pinned here, deliberately not mixed:
@@ -30,23 +30,20 @@
 #           inside `_store_tile_planar_vector!` and `_store_tile_planar!` run
 #           character-identical source and still disagree on a handful of
 #           elements. Requiring bitwise agreement here would be requiring
-#           agreement with an LLVM heuristic. The proposal's Section 6.4
-#           anticipated exactly this ("compare with a tolerance, never `==`").
+#           agreement with an LLVM heuristic.
 #
 #  2. CONTRACT PRESERVATION on the fast path specifically: `beta == 0` never
 #     reads old `C`, `alpha == 0` never reads `acc`, nothing outside the valid
 #     `m x n` rectangle is written, and `beta` is applied exactly once. These
-#     mirror test_planar_kernel.jl's existing assertions, which were written
-#     when only the scalar path existed and (for a dense destination) now
-#     exercise the fast path instead -- so they are repeated here with the
-#     path-firing assertion attached, rather than trusted to still mean what
-#     they meant.
+#     mirror test_planar_kernel.jl's assertions, which (for a dense
+#     destination) may or may not take the fast path depending on the ISA --
+#     so they are repeated here with the path-firing assertion attached.
 #
-#  3. GATE FIRING (the dispatch-tiers.md D3 lesson, proposal Section 7 item 1):
-#     assert the predicate is TRUE on a fixture that should fast-path and FALSE
-#     for each single violated condition on its own.
+#  3. GATE FIRING: assert the predicate is TRUE on a fixture that should
+#     fast-path and FALSE for each single violated condition on its own, so a
+#     gate that never opens cannot pass unnoticed.
 #
-#  4. ISA PORTABILITY. Decision 5 of the proposal ships this for AVX-512 only.
+#  4. ISA PORTABILITY. The fast path ships for AVX-512 only.
 #     Every expectation is derived from `target_profile()` at run time, never
 #     written as a literal, so `test/forced_isa_runner.jl` under
 #     `avx2`/`neon`/`unknown` asserts the fast path is OFF and the outputs are
@@ -125,7 +122,7 @@ store_fp_cold(::Type{T}, len::Int, seed::Int) where {T} =
 )
 
 # The alpha/beta regimes: all three `_axpby_tile!` branches, plus the
-# alpha == 1 / beta == 0 sub-case the proposal calls out, plus a purely
+# alpha == 1 / beta == 0 sub-case, plus a purely
 # imaginary beta (which zeroes one of the two cross terms) and a real beta
 # (`isone` false, so still the general branch).
 store_fp_ab(::Type{T}) where {T} = (
@@ -375,7 +372,7 @@ end
 end
 
 # ---------------------------------------------------------------------------
-# 4. ISA portability (proposal Decision 5 / Section 7 item 5)
+# 4. ISA portability
 # ---------------------------------------------------------------------------
 
 @testset "planar store fast path: ISA gate is a register-width question" begin

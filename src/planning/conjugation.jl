@@ -12,8 +12,8 @@
 # GUARDRAIL: a TOTAL table with a throwing fallback, NOT TensorOperations'
 # TBLIS extension's `A.op === conj` test. `StridedView(p, sz, st, off,
 # adjoint)` is directly constructible, and `=== conj` classifies it as
-# *unconjugated* -- the silent-wrong-answer class this milestone exists to
-# close. The fallback is `@noinline` and unreachable for every `op`
+# *unconjugated* -- exactly the silent wrong answer this table exists to
+# prevent. The fallback is `@noinline` and unreachable for every `op`
 # `StridedViews` itself constructs, so totality costs nothing.
 _op_conjugates(::typeof(identity)) = false
 _op_conjugates(::typeof(conj)) = true

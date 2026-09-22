@@ -177,9 +177,9 @@ end
 end
 
 @testset "driver: execution allocation through SIMDKernel is not worse than ScalarKernel" begin
-    # The SIMD kernel was originally benchmarked only through a bare
-    # execute_tile! call; assert that driving it through execute!'s own
-    # dispatch loop adds no SIMD-specific allocation over the scalar path.
+    # Driving the SIMD kernel through execute!'s own dispatch loop (not just a
+    # bare execute_tile! call) adds no SIMD-specific allocation over the
+    # scalar path.
     Random.seed!(99)
     Ma, Ka, Na = 9, 10, 8
     Amat = randn(Ma, Ka)
@@ -292,8 +292,9 @@ end
 end
 
 # =====================================================================
-# Allocation targets (docs/decisions.md, Phase A binding requirement): the
-# macro-blocking execute! must close the QSTile-UnionAll boxing bug.
+# Allocation targets: the macro-blocking execute! must not box a QSTile
+# UnionAll (docs/decisions.md, "Phase A findings (scouting + allocation
+# root-cause)").
 # SIMDKernel: 0 B on Julia >= 1.11 (older Julia doesn't keep the Vec-tuple
 # accumulator register-resident; see test_simd_kernel.jl's own skip).
 # ScalarKernel: bounded, not zero -- its zero_accumulator is a spec-accepted
@@ -331,8 +332,8 @@ end
 
 
 # =====================================================================
-# Type-stability regression: `ContractWorkspace`'s `VT` parameter must not
-# reintroduce the boxing bug of docs/decisions.md's "Phase A findings".
+# Type stability: `ContractWorkspace`'s `VT` parameter must not reintroduce
+# the QSTile-UnionAll boxing described above.
 # =====================================================================
 
 _ws_union_members(t) = t isa Union ?
@@ -392,7 +393,7 @@ end
 # =====================================================================
 # Zero steady-state allocation on the default (DefaultAllocator) path, with
 # the default kernel. SIMDKernel's accumulator is not kept register-resident
-# by Julia 1.10's compiler (docs/decisions.md, Amendment 2's caveat), so this
+# by Julia 1.10's compiler, so this
 # is skipped there exactly as test/microkernels/test_simd_kernel.jl skips its own -- never
 # weakened or deleted.
 # =====================================================================
@@ -421,12 +422,12 @@ end
 
 @testset "a non-identity pack transform crosses _pack_sliver! without allocating" begin
     # The real path never builds this plan -- `_qs_isconj` is false for a real
-    # eltype, which is the point -- but the Phase 2b finding-5 failure mode (a
+    # eltype, which is the point -- but the failure mode pinned here (a
     # transform reaching `_pack_sliver!` as a Union, ~80 B/call of dynamic
     # dispatch) is a property of the `TF`/`TA`/`TB` type parameters, not of
     # complex arithmetic. Building the plan directly exercises a genuine second
-    # specialization now, rather than discovering it in Phase C. `conj` is the
-    # elementwise identity on a real, so the result must be unchanged.
+    # specialization on the real path. `conj` is the elementwise identity on a
+    # real, so the result must be unchanged.
     Random.seed!(8642)
     Ma, Ka, Na = 19, 23, 17
     Amat, Bmat = randn(Ma, Ka), randn(Ka, Na)
@@ -452,11 +453,10 @@ end
 end
 
 # =====================================================================
-# Store fast path (docs/decisions.md, "Store fast-path investigation:
-# Phase A"). `store_tile!`'s vectorized path is only reachable from the
-# real driver now that its guard admits any `DenseVector{T}`: the driver's
+# Store fast path. `store_tile!`'s vectorized path is reachable from the real
+# driver because its guard admits any `DenseVector{T}`: the driver's
 # destination storage is `parent(C)`, i.e. `Memory{T}` on Julia >= 1.11.
-# That made the path's row tail a live allocation risk (a dynamically
+# That makes the path's row tail a live allocation risk (a dynamically
 # indexed accumulator heap-allocates above NV = 16), so the driver-level
 # assertion below deliberately uses M and N extents that are NOT multiples
 # of the kernel's MR/NR -- every other allocation testset in this file
@@ -475,7 +475,7 @@ end
         kernel = kernel, mc = 2 * MRk, kc = 5, nc = NRk + 2
     )
 
-    # The destination really is the widened guard's case, and its micro-tile
+    # The destination really is the guard's `DenseVector` case, and its micro-tile
     # rows really are unit-stride (C is column-major and M is its first index),
     # so `execute!` below takes the vectorized store, tail rows included.
     Cstorage = parent(StridedView(Cmat))

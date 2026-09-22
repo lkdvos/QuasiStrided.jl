@@ -1,8 +1,8 @@
 # GUARDRAIL: packed micro-panels are handed to the kernel as borrowed
 # POINTERS, never `view`s. A `SubArray`'s address arithmetic evicts the
-# accumulator above NV = 16: measured ~4x slower and 24 KB heap-allocated per
-# `execute!` (docs/decisions.md, Phase H). `SIMD.vload` already accepts a
-# `Ptr{T}`, so this needs no dependency.
+# accumulator above NV = 16, several times slower and heap-allocating per
+# `execute!`. `SIMD.vload` already accepts a `Ptr{T}`, so this needs no
+# dependency.
 
 using SIMD: Vec, vload, vstore
 

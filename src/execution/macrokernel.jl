@@ -1,8 +1,7 @@
 # Macro-kernel helpers for the five-loop nest: function barriers over the
 # tile axis types, packed-sliver addressing, and sliver classification.
 
-# GUARDRAIL, load-bearing (docs/decisions.md, macro-blocking Phase A
-# findings): `_axis_of` returns a `Union{AffineAxis,PtrScatterAxis}`, and each
+# GUARDRAIL, load-bearing: `_axis_of` returns a `Union{AffineAxis,PtrScatterAxis}`, and each
 # consumer below is a `where {R<:Axis, C<:Axis}` barrier method that Julia
 # specializes per concrete (R,C), so no partially-applied -- heap-boxed --
 # `QSTile` is ever built. **Do not** collapse these helpers into their call
@@ -25,8 +24,8 @@ end
 # that name out rather than hiding it behind a flag.
 #
 # GUARDRAIL: every argument here has its OWN bound type parameter, `transform`
-# included. Leaving `TF` unbound reintroduces the Phase 2b finding-5 ~80 B/call
-# dynamic dispatch, for the reason spelled out at `pack_a!` in src/microkernels/interface.jl.
+# included. Leaving `TF` unbound costs a dynamic dispatch (~80 B/call), for the
+# reason spelled out at `pack_a!` in src/microkernels/interface.jl.
 # And all THREE call sites -- `_execute_nest!`'s two and `execute_tilewise!`'s
 # one -- must pass the matching operand's transform: missing the third makes
 # the in-tree ORACLE silently wrong for conjugated inputs.
@@ -51,7 +50,7 @@ end
 # (src/microkernels/interface.jl) instead of `execute_tile!`: the destination's storage-bounds
 # check has already been made ONCE for the whole (ic, jc) macro block this tile
 # belongs to. `unsafe_` is in the name at every call site precisely because the
-# precondition now lives at the caller.
+# precondition lives at the caller.
 @inline function unsafe_execute_micro_tile!(
         kernel, storage::S, base::Int, rows::R, cols::C,
         packed_a::PA, packed_b::PB, kc_len::Int, alpha, beta
@@ -90,7 +89,7 @@ end
 # Also returns the two maps' BLOCK offset ranges, `((lo1, hi1), (lo2, hi2))`,
 # accumulated from the sliver descriptors as they are produced rather than in a
 # second pass -- `O(1)` per regular sliver, and for an irregular one exactly
-# the scan the per-sliver `checked_tile_storage_bounds` used to do anyway.
+# the scan a per-sliver `checked_tile_storage_bounds` would do.
 # Because the slivers partition `buf[1:blocklen]`, this union IS the range of
 # the whole block, which is what `_execute_nest!`'s hoisted
 # `checked_span_bounds` calls need.
@@ -123,8 +122,8 @@ end
 end
 
 # ----------------------------------------------------------------------------
-# Closed-form block description for an affine-ramp composite
-# (docs/decisions.md, "Per-call floor"). When `affine_ramp(g)` holds, logical
+# Closed-form block description for an affine-ramp composite. When
+# `affine_ramp(g)` holds, logical
 # coordinate `q` maps to offset `q * step[p]` for every map `p`, so a block's
 # whole sliver structure follows from arithmetic and neither the offset buffer
 # nor `describe_block`'s scan is needed. `fill_offsets!` + `_classify_slivers!`

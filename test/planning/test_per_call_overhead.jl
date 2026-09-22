@@ -1,16 +1,17 @@
-# Per-call-floor milestone (docs/decisions.md, "Per-call floor: cheaper
-# planning, once-per-block bounds validation, closed-form affine blocks").
+# Per-call planning cost and bounds-check placement (docs/decisions.md,
+# "Per-call floor: cheaper planning, once-per-block bounds validation,
+# closed-form affine blocks").
 #
 # Three things are pinned here, each of which the rest of the suite would only
 # catch indirectly:
 #
-#   1. the rewritten planning helpers (`_classify_labels`, `_order_free_labels`,
+#   1. the planning helpers (`_classify_labels`, `_order_free_labels`,
 #      `_build_pair_group`) against straightforward reference implementations,
-#   2. the once-per-macro-block storage-bounds check: that it still REJECTS
-#      what the per-sliver checks rejected, that it accepts exactly what they
-#      accepted, and that the check really did move (counted, not assumed),
+#   2. the once-per-macro-block storage-bounds check: that it REJECTS exactly
+#      what per-sliver checks would reject, accepts exactly what they would
+#      accept, and runs once per block (counted, not assumed),
 #   3. `affine_ramp` and the closed-form block description built on it, against
-#      the buffer-materializing path it replaces -- descriptor by descriptor.
+#      the buffer-materializing path -- descriptor by descriptor.
 
 using Test
 using Random
@@ -27,8 +28,7 @@ const _pcf_Plan = QuasiStrided.ContractPlan
 # 1. Planning helpers
 # ===========================================================================
 
-# Reference `_classify_labels`, written the obvious way (Sets + push!), i.e.
-# what the function used to be.
+# Reference `_classify_labels`, written the obvious way (Sets + push!).
 function _ref_classify(indA, indB, indC)
     setA, setB, setC = Set(indA), Set(indB), Set(indC)
     m = Int[]; k = Int[]; n = Int[]
@@ -62,7 +62,7 @@ end
         @test length(got[2]) + length(got[3]) == length(indB)
     end
 
-    # Rejections are unchanged.
+    # Rejections.
     @test_throws ArgumentError QS._classify_labels((1, 1), (1, 2), (1, 2))
     @test_throws ArgumentError QS._classify_labels((1, 2), (2, 3), (1, 2, 3))  # all three
     @test_throws ArgumentError QS._classify_labels((1, 2), (3, 4), (1, 3))     # dangling in A
@@ -136,12 +136,10 @@ end
 end
 
 @testset "per-call floor: plan_contract allocation stays well under the old floor" begin
-    # The old planner allocated 4976-7040 B per call on these shapes
-    # (docs/decisions.md, "Per-call floor"); a full allocation-free planner is
-    # out of reach because each composite's RANK is a value property, so this
-    # pins a generous ceiling rather than zero. It exists to catch a
-    # regression back to the Set/`ntuple(f, ::Int)` construction, which would
-    # blow through it by 2-3x.
+    # A fully allocation-free planner is out of reach because each
+    # composite's RANK is a value property, so this pins a generous ceiling
+    # rather than zero. It catches a Set/`ntuple(f, ::Int)`-style planner
+    # (~5-7 KB per call on these shapes), which would blow through it by 2-3x.
     A = randn(64, 64); B = randn(64, 64); C = zeros(64, 64)
     Av, Bv, Cv = StridedView(A), StridedView(B), StridedView(C)
     p = _pcf_plan(Cv, Av, (1, 2), Bv, (2, 3), (1, 3))
@@ -272,8 +270,8 @@ end
 
 # A storage wrapper that counts `length` calls. `checked_span_bounds` is
 # reached from `_execute_nest!` through exactly one `length(plan.Xstorage)`
-# per `execute!`, where the per-sliver/per-tile checks it replaced each did
-# their own. Not a `DenseVector`, so the vectorized pack/store fast paths stay
+# per `execute!`, where a per-sliver/per-tile check would call it once per
+# sliver/tile. Not a `DenseVector`, so the vectorized pack/store fast paths stay
 # off -- which is fine: the question here is how many times the bounds check
 # runs, not which inner loop does.
 mutable struct CountingStorage{T} <: AbstractVector{T}
@@ -442,12 +440,11 @@ end
     @test all(iszero, short_C)                            # nothing written before the throw
 
     # That this fixture DISCRIMINATES -- i.e. that a first-sliver-only or
-    # last-sliver-only aggregate range would have accepted the short
-    # destination and written out of bounds -- is asserted directly rather
-    # than by mutating the driver, because a driver with that bug really does
-    # perform the out-of-bounds write (verified once, out of tree: it
-    # corrupted the heap and hung). Feeding `checked_span_bounds` the three
-    # candidate ranges settles the same question deterministically and
+    # last-sliver-only aggregate range would have accepted the short destination
+    # and written out of bounds -- is asserted directly rather than by mutating
+    # the driver, because a driver with that bug really does perform the
+    # out-of-bounds write (corrupting the heap). Feeding `checked_span_bounds`
+    # the three candidate ranges settles the same question deterministically and
     # without executing anything.
     moffs = [offsets(base.mgroup, q)[2] for q in 0:(axis_length(base.mgroup) - 1)]
     mrange = (minimum(moffs), maximum(moffs))
@@ -473,9 +470,9 @@ end
     # It does NOT leave the destination untouched, and that difference is
     # pinned here on purpose: `execute_tilewise!` validates each tile as it
     # reaches it, so it writes every tile that precedes the offending one,
-    # whereas hoisting turned `execute!`'s rejection into a fail-before-write
-    # for the whole block. That is the hoist making the failure mode STRICTER,
-    # not weaker -- but only per block: with several macro blocks, earlier
+    # whereas `execute!`'s once-per-block check fails before writing anything
+    # in the block. That makes the failure mode STRICTER, not weaker -- but
+    # only per block: with several macro blocks, earlier
     # blocks can still have been written before a later block's check throws,
     # so "atomic" is a claim about one block, not about `execute!`.
     fill!(short_C, 0.0)
@@ -505,7 +502,8 @@ end
     QS.unsafe_pack_a!(packed, src, kernel, identity)
     @test packed == ref
 
-    # Capacity, extent and eltype checks are NOT what moved.
+    # Capacity, extent and eltype checks are kept; only bounds checks are
+    # skipped.
     @test_throws DimensionMismatch QS.unsafe_pack_a!(zeros(3), src, kernel, identity)
     @test_throws ArgumentError QS.unsafe_pack_a!(zeros(Float32, 64), src, kernel, identity)
     toowide = SourceTile(collect(1.0:200.0), 0, AffineAxis(0, 1, 9), AffineAxis(0, 16, 4))

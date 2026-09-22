@@ -1,5 +1,5 @@
 # The vectorized complex packing fast path (src/packing/pack_contiguous.jl,
-# `_pack_complex_contiguous!`): Phase 1 of docs/proposals/complex-fast-paths.md,
+# `_pack_complex_contiguous!`), designed in docs/proposals/complex-fast-paths.md,
 # Sections 4.3 (PlanarFormat) / 4.4 (OneEFormat A) / 4.5 (1m's B is planar's).
 #
 # Three separable things are pinned here, deliberately not mixed:
@@ -8,17 +8,17 @@
 #     `_pack_panel_complex!` loop produces -- not "within a tolerance". There is
 #     no arithmetic on this path beyond a sign flip, so bitwise `isequal` (which
 #     also separates `+0.0` from `-0.0`) is the right comparison, matching
-#     test_packing_complex.jl's own justification for using `==` there. Each
+#     test_pack_complex.jl's own justification for using `==` there. Each
 #     case is checked against BOTH the scalar path (run on the same fixture with
 #     a plain `Vector` destination, which the gate excludes) and an
 #     independently written reference layout, so the test is not vacuous when
 #     the ISA gate is closed and the "fast" call is itself the scalar path.
 #
-#  2. GATE FIRING (the dispatch-tiers.md D3 lesson quoted by the proposal's
-#     Section 7 item 1): assert the predicate is TRUE on a fixture that should
-#     fast-path, and FALSE for each single violated condition on its own.
+#  2. GATE FIRING: assert the predicate is TRUE on a fixture that should
+#     fast-path, and FALSE for each single violated condition on its own, so
+#     a gate that never opens cannot pass unnoticed.
 #
-#  3. ISA PORTABILITY. Decision 5 of the proposal ships this for AVX-512 only.
+#  3. ISA PORTABILITY. The fast path ships for AVX-512 only.
 #     The expectation is derived from `target_profile()` at run time, never
 #     written as a literal, so `test/forced_isa_runner.jl` under
 #     `avx2`/`neon`/`unknown` asserts the fast path is OFF and the outputs are
@@ -41,7 +41,7 @@ const FASTPATH_ON = QS._complex_fastpath_isa_eligible()
 
 # ---------------------------------------------------------------------------
 # Independently written reference layouts (same shape as the ones in
-# test_packing_complex.jl, repeated rather than imported so this file does not
+# test_pack_complex.jl, repeated rather than imported so this file does not
 # depend on that file's include order).
 # ---------------------------------------------------------------------------
 
@@ -259,7 +259,7 @@ end
     @test all(isequal.(buf, fill(real(T)(-777), 8)))   # kc == 0 writes nothing
 end
 
-# The frozen transform contract, re-pinned THROUGH the fast path: `conj`
+# The transform contract, re-pinned THROUGH the fast path: `conj`
 # applies to the complex element and the split happens afterwards. A packer
 # that conjugated per real half (or that used a `*(-1.0)` sign vector and got
 # `-0.0` wrong) fails here.
@@ -371,7 +371,7 @@ end
 end
 
 # ---------------------------------------------------------------------------
-# 3. ISA portability (proposal Decision 5 / Section 7 item 5)
+# 3. ISA portability
 # ---------------------------------------------------------------------------
 
 @testset "complex pack fast path: ISA gate is a register-width question" begin

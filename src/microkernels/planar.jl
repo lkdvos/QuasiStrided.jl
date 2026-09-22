@@ -14,12 +14,11 @@
 #   `planar_register_pressure`.
 #
 #   Cliff B -- Julia's tuple lowering. Dynamic `NTuple` indexing above NV = 16
-#   makes the compiler heap-allocate the accumulator: 24576 B per `execute!`,
-#   measured in Phase H. Planar at 16x6 is NV_total = 24, so the cliff is live
-#   from the first line of code. Therefore *every* accumulate and store here is
-#   `@generated` with literal tuple indices, including the lane tail -- the real
-#   path's runtime-indexed `_acc_lane` helper (src/microkernels/simd.jl) must not be
-#   used here.
+#   makes the compiler heap-allocate the accumulator on every call. Planar at
+#   16x6 is NV_total = 24, so the cliff is live at ordinary shapes. Therefore
+#   *every* accumulate and store here is `@generated` with literal tuple
+#   indices, including the lane tail; no runtime tuple index may be
+#   introduced.
 
 using SIMD: Vec, vload, vstore, shufflevector
 
@@ -36,9 +35,9 @@ extents and `T` is the **storage** element type (`ComplexF32`/`ComplexF64`);
 per column per K step.
 
 The field is named `descriptor`, so `mr`/`nr`/`scalartype`/`packed_a_length`/
-`packed_b_length`/`realtype`/`packed_a_per_k` all forward through the existing
-`DescriptorKernel` methods in src/microkernels/interface.jl and src/microkernels/interface.jl; this
-kernel adds no forwarding of its own beyond the two plane-offset accessors.
+`packed_b_length`/`realtype`/`packed_a_per_k`, and the two plane-offset
+accessors, all forward through the `DescriptorKernel` methods in
+src/microkernels/interface.jl; this kernel adds no forwarding of its own.
 
 The 3-argument form defaults `W` via `_default_lanewidth(real(T))`.
 """
@@ -94,16 +93,14 @@ with `MV = mr(kernel) ÷ lanewidth(kernel)`. **Cliff A**: this must be `<=` the
 architectural register count (`target_profile().nregisters`; 32 zmm under
 AVX-512, 16 ymm under AVX2) or the microkernel spills, costing 30-50%.
 
-**The `<= nregisters` bound is measured to be optimistic, and is not a
-predictor.** At the reference shape `(MV, NR) = (2, 6)` it is `24 + 4 + 2 = 30`
-and that shape *does* spill (26 stack stores per K step against 48 FMAs, mostly
-store-port traffic rather than a load-use chain), while `(24,3,8)` at pressure
-26 is clean and `(8,8,8)` at pressure 20 is not -- so spilling is not monotone
-in this number and aspect ratio matters independently. Full tables, both
-instruments, and the Phase D correction: docs/decisions.md, "Cliff A bites at
-the shipped shape" and "Correcting the Phase C planar spill table". Treat this
-as a necessary condition, never a ranking; shapes are ranked on measured
-throughput (Phase F) or not at all.
+**The `<= nregisters` bound is optimistic, and is not a predictor.** At the
+reference shape `(MV, NR) = (2, 6)` it is `24 + 4 + 2 = 30` and that shape
+*does* spill (mostly store-port traffic rather than a load-use chain), while
+`(24,3,8)` at pressure 26 is clean and `(8,8,8)` at pressure 20 is not -- so
+spilling is not monotone in this number and aspect ratio matters
+independently (docs/decisions.md, "Correcting the Phase C planar spill
+table"). Treat this as a necessary condition, never a ranking; shapes are
+ranked on measured throughput or not at all.
 """
 planar_register_pressure(::PlanarKernel{MR, NR, T, W}) where {MR, NR, T, W} =
     2 * (MR ÷ W) * NR + 2 * (MR ÷ W) + 2
@@ -122,8 +119,7 @@ path's `(v, j) -> v + (MR÷W)*j + 1` convention. Physical row `i` of vector `v`
 is lane `i - v*W + 1` (1-based `SIMD.Vec` indexing).
 
 Flat rather than nested: it keeps every signature the same *shape* as the real
-path, which is the pattern Phase H proved keeps the accumulator
-register-resident.
+path, which is the pattern known to keep the accumulator register-resident.
 """
 function zero_accumulator(kernel::PlanarKernel{MR, NR, T, W}) where {MR, NR, T, W}
     z = zero(Vec{W, real(T)})
@@ -143,8 +139,7 @@ end
 # `nai_v = -ai_v` is hoisted out of the `j` loop so a declined fold would cost
 # MV extra ops per K step rather than MV*NR. Verified by `@code_native` at
 # every menu shape: exactly `MV*NR` `vfnmadd231` + `3*MV*NR` `vfmadd231` and
-# ZERO separate negations, so the hoist is free rather than merely cheap
-# (per-shape table in docs/decisions.md, "the per-shape `vfnmadd` count").
+# ZERO separate negations, so the hoist is free rather than merely cheap.
 @generated function _accumulate_step_planar(
         kernel::PlanarKernel{MR, NR, T, W}, acc::NTuple{NA, Vec{W, R}},
         packed_a::PA, packed_b::PB, p::Int
@@ -258,20 +253,16 @@ end
 # ----------------------------------------------------------------------------
 
 # Scattered/scalar store, `@generated` so every `acc[...]` is a compile-time
-# index (Cliff B; see src/microkernels/simd.jl's `_store_tile_scattered!` for the
-# measured number). Only the lane index inside a single `Vec` is a runtime
-# value.
+# index (Cliff B; see src/microkernels/simd.jl's `_store_tile_scattered!`).
+# Only the lane index inside a single `Vec` is a runtime value.
 #
 # The fused form is kept deliberately: `store_tile!` is already specialised per
-# `(QSTile{S,R,C}, kernel)` by dispatch, so the reference project's
-# kernel-writes-a-stack-tile / separate-writeback split would buy nothing and
-# would re-introduce the memory round-trip Phase H removed at ~4x
-# (docs/decisions.md, "The fused `store_tile!` is kept").
+# `(QSTile{S,R,C}, kernel)` by dispatch, so a kernel-writes-a-stack-tile /
+# separate-writeback split would buy nothing and would add a memory round-trip
+# costing ~4x.
 #
-# This remains the FALLBACK and the reference. The unit-stride
-# plane-to-interleave fast path that used to be described here as "deliberately
-# deferred" now exists as `_store_tile_planar_vector!` below; this function is
-# unchanged, still serves every ineligible destination, and is what the fast
+# This is the FALLBACK and the reference: it serves every destination
+# `_store_tile_planar_vector!` below is ineligible for, and is what that fast
 # path is tested against (test/microkernels/test_planar_store_fastpath.jl).
 @generated function _store_tile_planar!(
         destination::QSTile, acc::NTuple{NA, Vec{W, R}},
@@ -324,10 +315,9 @@ end
 end
 
 # ----------------------------------------------------------------------------
-# Vectorized unit-stride store fast path (Phase 2 of
-# docs/proposals/complex-fast-paths.md, Section 3.3)
+# Vectorized unit-stride store fast path
 #
-# The mirror image of the complex PACK fast path (src/packing/pack.jl, Phase 1):
+# The mirror image of the complex PACK fast path (src/packing/pack_contiguous.jl):
 # packing deinterleaves `Complex{T}`'s native `[re,im,re,im,...]` layout into
 # two planes, and this interleaves two planes back into it. Unlike packing,
 # this also has to do real arithmetic -- `alpha*r + beta*C_old` with COMPLEX
@@ -336,11 +326,10 @@ end
 #
 # ARITHMETIC: this reproduces the expression tree Base's own `Complex`
 # arithmetic specifies -- the same tree `_axpby_tile!` reaches through --
-# operand for operand, with the scalars broadcast to `Vec`. Section 3.3 of the
-# proposal suggested reusing `_accumulate_step_planar`'s four-real-FMA
-# grouping instead; that would have been *a* correct grouping, but a
-# deliberately different one, and there is no reason to accept a second
-# grouping when the scalar path's own is expressible verbatim in lanes.
+# operand for operand, with the scalars broadcast to `Vec`. It deliberately
+# does NOT reuse `_accumulate_step_planar`'s four-real-FMA grouping: that is
+# *a* correct grouping but a different one, and there is no reason to accept a
+# second grouping when the scalar path's own is expressible verbatim in lanes.
 #
 # The three `beta` regimes, identical to `_axpby_tile!`'s:
 #
@@ -358,9 +347,9 @@ end
 #                 Complex(muladd(zr, wr, -muladd(zi, wi, -xr)),
 #                         muladd(zr, wi, muladd(zi, wr, xi)))
 #
-# HOW CLOSE THE TWO PATHS ACTUALLY AGREE, measured rather than assumed
-# (16205 elements over every shipped shape, both dtypes, seven alpha/beta
-# regimes; test/microkernels/test_planar_store_fastpath.jl re-runs the measurement):
+# HOW CLOSE THE TWO PATHS AGREE (over every shipped shape, both dtypes and
+# seven alpha/beta regimes; test/microkernels/test_planar_store_fastpath.jl
+# checks this):
 #
 #   * Every VECTORIZED FULL BLOCK is bit-exact to the tree above -- zero
 #     misses against an independently written, optimization-barriered
@@ -375,12 +364,11 @@ end
 #     `muladd(a, r, b*c)` at `ComplexF64`: `fmul contract` / `fsub contract`),
 #     letting the backend fuse a multiply the source text rounds separately.
 #     Whether it fires depends on inlining context, so the scalar path is not
-#     bit-reproducible even against ITSELF across call sites -- measured: 6 of
-#     the 16205 elements differ between this function's own scalar row tail and
+#     bit-reproducible even against ITSELF across call sites: a few elements
+#     differ between this function's own scalar row tail and
 #     `_store_tile_planar!`, running character-identical source. Requiring the
 #     fast path to match it bitwise would be requiring it to match an LLVM
-#     heuristic. This is the situation the proposal's Section 6.4 anticipated
-#     ("compare with a tolerance, never `==`"), with the cause now identified.
+#     heuristic; compare with a tolerance, never `==`.
 #
 # The `beta` regimes are the SAME three `_axpby_tile!` has, chosen by the same
 # `iszero`/`isone` tests on the same per-call scalar: the beta-applied-once
@@ -401,18 +389,17 @@ end
 Whether `tile` can take a vectorized complex store/load: unit-stride
 `AffineAxis` rows into rank-1 dense `Complex` storage, on an ISA this ships
 for. The complex counterpart of [`_vector_store_eligible`](@ref)
-(src/microkernels/simd.jl) and, per the proposal's Section 5, deliberately ONE
-predicate -- the same shape question asked of a destination tile here and
-(through `_pack_complex_contiguous_eligible`'s clauses) of a source tile in
-src/hardware/target.jl, sharing the ISA half literally via
-`_complex_fastpath_isa_eligible`.
+(src/microkernels/simd.jl) and deliberately the same shape question that
+`_pack_complex_contiguous_eligible` (src/packing/pack_contiguous.jl) asks of a
+source tile, sharing the ISA half literally via `_complex_fastpath_isa_eligible`
+(src/hardware/target.jl).
 
 Unit stride plus rank-1 dense storage is what makes `reinterpret`ing the
 storage pointer from `Ptr{Complex{R}}` to `Ptr{R}` a sound bitcast: `W`
 consecutive rows are then `W` consecutive `Complex{R}` values and hence `2W`
 consecutive `R`s. It is unsound for a `ScatterAxis`/`PtrScatterAxis` row, for
 a strided `AffineAxis`, and for non-`DenseArray` storage, and all three are
-excluded here (proposal Section 3.3).
+excluded here.
 
 The storage clause inspects types only, so at each specialization the whole
 predicate folds to `_unit_stride_rows(tile.rows) && <isa check>` or to `false`.
@@ -423,12 +410,12 @@ predicate folds to `_unit_stride_rows(tile.rows) && <isa check>` or to `false`.
 
 # --- interleave / deinterleave ---------------------------------------------
 #
-# GUARDRAIL, the same one src/packing/pack.jl's shuffle primitives carry: every
-# index tuple is built HERE from `W` at specialization time, never hardcoded to
-# the AVX-512 shape this was written against. `W` is `lanewidth(kernel)`, which
-# the driver derives from `kernel_shapes`, so the patterns follow the shipped
-# menus automatically (proposal Section 6.2). `@generated` because
-# `shufflevector` needs a literal `Val` index tuple.
+# GUARDRAIL, the same one src/packing/pack_contiguous.jl's shuffle primitives
+# carry: every index tuple is built HERE from `W` at specialization time, never
+# hardcoded to one ISA's shape. `W` is `lanewidth(kernel)`, which the driver
+# derives from `kernel_shapes`, so the patterns follow the shipped menus
+# automatically. `@generated` because `shufflevector` needs a literal `Val`
+# index tuple.
 #
 # Lane order: `v` is `[re_0, im_0, ..., re_{W-1}, im_{W-1}]`, i.e. `W`
 # consecutive `Complex{R}` values read through their native binary layout.
@@ -504,7 +491,7 @@ end
 # MethodError rather than a wrong answer; the caller checks
 # `_complex_vector_eligible` first.
 #
-# GC.@preserve (proposal Section 6.3): the raw `Ptr{R}` is derived from
+# GC.@preserve: the raw `Ptr{R}` is derived from
 # `storage` and every dereference of it happens inside the preserve block, the
 # same discipline `_pack_a_contiguous!`/`_pack_complex_contiguous!` already
 # follow. The scalar row tail goes through `storage` itself (via `_axpby_at!`),

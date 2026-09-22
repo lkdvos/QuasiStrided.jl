@@ -1,8 +1,8 @@
 # Apply beta once to every element of C at MR x NR granularity, without
-# reading A or B. Shared by both drivers' Qk==0/alpha==0 short-circuit; uses
-# the tw_* (MR/NR-sized) buffers, since a beta-only pass needs no blocking --
-# which is why those four, unlike the kc-sized tw_k_buf_*/tw_packed_* ones, are
-# allocated even under `oracle = false`.
+# reading A or B. Shared by the Qk==0/alpha==0 short-circuit of `execute!` and
+# `execute_tilewise!`; uses the MR/NR-sized `tile_*` offset buffers, since a
+# beta-only pass needs no blocking -- which is why those four, unlike the
+# oracle-only `tw_*` ones, are allocated even under `oracle = false`.
 function _scale_all_of_C!(plan, betaT::T, MRk::Int, NRk::Int, Qm::Int, Qn::Int) where {T}
     ws = plan.workspace
     m_bufs = (ws.tile_m_buf_A, ws.tile_m_buf_C)
@@ -44,17 +44,17 @@ iteration touches is validated with one [`checked_span_bounds`](@ref) call
 before anything is packed or written, and the packing/micro-kernel calls
 inside it then go through `unsafe_pack_a!`/`unsafe_pack_b!`/
 `unsafe_execute_tile!`. The test performed is exactly the conjunction of the
-per-sliver tests it replaces (see `checked_span_bounds`), so no address the
-macro-blocking pack/execute path can reach is unvalidated and no previously
-accepted contraction is now rejected; `execute_tilewise!` keeps the per-tile
-checked path as an independent oracle for both the values and the rejections.
+per-sliver and per-tile tests (see `checked_span_bounds`), so no address the
+macro-blocking pack/execute path can reach is unvalidated, and a contraction
+is rejected exactly when a per-tile check would reject it; `execute_tilewise!`
+runs the per-tile checked path as an independent oracle for both the values
+and the rejections.
 
 Scoped to that path deliberately: the `Qk == 0 || alpha == 0` beta-only
-short-circuit above it goes to `_scale_all_of_C!`, which has never done a
+short-circuit above it goes to `_scale_all_of_C!`, which performs no
 storage-bounds check at all (it writes through `scale_tile!`'s `@inbounds`
-path, relying on the `AxisGroup`s' own construction-time validation). That is
-pre-existing behaviour, unchanged by the hoist, and is named here only so this
-paragraph is not read as a claim about it.
+path, relying on the `AxisGroup`s' own construction-time validation). It is
+named here only so this paragraph is not read as a claim about it.
 """
 function execute!(plan::ContractPlan{T}, alpha::Number, beta::Number) where {T}
     alphaT = convert(T, alpha)
@@ -120,8 +120,8 @@ function _execute_nest!(
     (n_ramp, n_step) = affine_ramp(plan.ngroup)
     (k_ramp, k_step) = affine_ramp(plan.kgroup)
 
-    # Hoisted storage-bounds validation (docs/decisions.md, "Per-call floor"):
-    # read once here rather than per sliver / per micro-tile.
+    # Hoisted storage-bounds validation: storage lengths read once here rather
+    # than per sliver / per micro-tile.
     lenA = length(plan.Astorage)
     lenB = length(plan.Bstorage)
     lenC = length(plan.Cstorage)
@@ -218,8 +218,7 @@ function _execute_nest!(
                 # product of the M-sliver rows and the N-sliver columns, and
                 # those two families partition the block's row and column
                 # offset sets, so this rectangle is exactly their union. It
-                # precedes every write to C, as the per-tile check it replaces
-                # did.
+                # precedes every write to C, as a per-tile check would.
                 checked_span_bounds(plan.Cbase, rng_mC, rng_nC, lenC)
 
                 # Pack the whole A panel for this (jc, pc, ic): every M-sliver.
@@ -273,8 +272,12 @@ end
               beta::Number,
               indC::NTuple{NC,Int}) where {NA,NB,NC}
 
-Compute `C[indC] = alpha * sum_K A[indA] * B[indB] + beta * C[indC]`; see
-`docs/decisions.md` for label semantics. Equivalent to
+Compute `C[indC] = alpha * sum_K A[indA] * B[indB] + beta * C[indC]`, with one
+`Int` label per axis: a label in `indA` and `indB` but not `indC` is contracted
+(K), and a label in `indC` and exactly one of `indA`/`indB` is free (M or N).
+Any other label pattern, or a label repeated within one tuple, throws an
+`ArgumentError`; matched labels of unequal axis length throw a
+`DimensionMismatch`. Equivalent to
 `execute!(plan_contract(C, A, indA, B, indB, indC), alpha, beta)` — use
 those directly to reuse a plan across calls. Returns `C`.
 """
