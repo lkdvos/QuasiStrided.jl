@@ -343,8 +343,10 @@ end
         (1, 3); kernel = kernel
     )
 
-    function replan(; Cstorage = vec(Cmat), Astorage = vec(Amat), Bstorage = vec(Bmat),
-            Cbase = 0, Abase = 0, Bbase = 0)
+    function replan(;
+            Cstorage = vec(Cmat), Astorage = vec(Amat), Bstorage = vec(Bmat),
+            Cbase = 0, Abase = 0, Bbase = 0
+        )
         return _pcf_Plan(
             base.kernel, base.mgroup, base.ngroup, base.kgroup, base.blocking,
             Astorage, Abase, Bstorage, Bbase, Cstorage, Cbase,

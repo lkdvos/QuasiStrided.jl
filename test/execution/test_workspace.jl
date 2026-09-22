@@ -1,4 +1,3 @@
-
 # =====================================================================
 # ContractWorkspace, the `workspace`/`allocator`/`oracle` keywords, and the
 # SIMDKernel default (docs/decisions.md, "Amendment 1"/"Amendment 2").

@@ -329,3 +329,9 @@ Convenience form: validate `tile` against `length(tile.storage)`.
 """
 checked_tile_storage_bounds(tile::QSTile) =
     checked_tile_storage_bounds(tile.base, tile.rows, tile.cols, length(tile.storage))
+
+# Whether an axis steps through storage one element at a time. Deliberately no
+# fallback method: an unknown axis type must be a MethodError, not `false`.
+_unit_stride_rows(ax::AffineAxis) = ax.stride == 1
+_unit_stride_rows(::ScatterAxis) = false
+_unit_stride_rows(::PtrScatterAxis) = false

@@ -83,15 +83,6 @@ one set for each of the real and imaginary planes.
 """
 avecs_per_column(::PlanarKernel{MR, NR, T, W}) where {MR, NR, T, W} = MR ÷ W
 
-# Plane-offset forwarding, scoped to this kernel type. `packed_a_offset` (the
-# single-plane accessor) deliberately has no method for a complex descriptor:
-# no complex kernel should ever be asked for one, and the MethodError is the
-# intended outcome.
-@inline packed_a_plane_offset(k::PlanarKernel, plane::Int, i::Int, p::Int) =
-    packed_a_plane_offset(k.descriptor, plane, i, p)
-@inline packed_b_plane_offset(k::PlanarKernel, plane::Int, j::Int, p::Int) =
-    packed_b_plane_offset(k.descriptor, plane, j, p)
-
 """
     planar_register_pressure(kernel::PlanarKernel) -> Int
 
@@ -656,24 +647,4 @@ function store_tile!(
     end
 
     return _store_tile_planar!(destination, acc, alpha, beta, kernel, m, n)
-end
-
-"""
-    execute_tile!(kernel::PlanarKernel, destination::QSTile, packed_a, packed_b, kc::Int, alpha, beta) -> destination
-
-Planar counterpart of `SIMDKernel`'s `execute_tile!`; same validation order and
-short-circuits (both are `_execute_tile_prologue!`'s). `kc` is the **logical**
-(complex) K depth, and the buffer-length checks go through
-`packed_a_length`/`packed_b_length`, which take a logical `kc` and return a
-count of **reals**.
-"""
-function execute_tile!(
-        kernel::PlanarKernel{MR, NR, T, W}, destination::QSTile,
-        packed_a::PA, packed_b::PB, kc::Int, alpha, beta
-    ) where {MR, NR, T, W, PA, PB}
-    run, alphaT, betaT =
-        _execute_tile_prologue!(kernel, destination, packed_a, packed_b, kc, alpha, beta)
-    run || return destination
-    acc = accumulate(kernel, zero_accumulator(kernel), packed_a, packed_b, kc)
-    return store_tile!(destination, acc, alphaT, betaT, kernel)
 end

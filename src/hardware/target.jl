@@ -218,3 +218,14 @@ _init_target!() = (
         unknown_target()
     end; nothing
 )
+
+# Whether the vectorized complex fast paths (the deinterleaving packer in
+# src/packing/pack_contiguous.jl and the planar store in
+# src/microkernels/planar.jl) apply on this host: its vector register must be
+# as wide as AVX-512's, which is what makes a 2*PD-real load/deinterleave/store
+# cheaper than 2*PD scalar stores. Keyed on vector width, not ISA name;
+# AVX2/NEON/unknown take the scalar loops. One shared predicate, so the two
+# fast paths cannot drift apart.
+@inline _complex_fastpath_isa_eligible(profile::TargetProfile) =
+    profile.vector_bytes == _isa_vector_bytes(Val(:avx512))
+@inline _complex_fastpath_isa_eligible() = _complex_fastpath_isa_eligible(target_profile())

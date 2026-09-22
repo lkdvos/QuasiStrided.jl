@@ -128,18 +128,6 @@ and not `MR÷W`; each vector covers `W÷2` complex rows.
 """
 avecs_per_column(::OneMKernel{MR, NR, T, W}) where {MR, NR, T, W} = (2 * MR) ÷ W
 
-# Plane-offset forwarding, as on `PlanarKernel`. The microkernel itself does
-# not use these (it addresses through the inner real kernel's single-plane
-# `packed_a_offset`/`packed_b_offset`); they exist so that the packed layout is
-# reachable from the kernel for tests and for symmetry with planar.
-# `packed_a_offset(k::OneMKernel, i, p)` deliberately has no method: the
-# single-plane accessor is meaningless on a complex descriptor, and the
-# `MethodError` is the intended outcome.
-@inline packed_a_plane_offset(k::OneMKernel, plane::Int, i::Int, p::Int) =
-    packed_a_plane_offset(k.descriptor, plane, i, p)
-@inline packed_b_plane_offset(k::OneMKernel, plane::Int, j::Int, p::Int) =
-    packed_b_plane_offset(k.descriptor, plane, j, p)
-
 """
     onem_register_pressure(kernel::OneMKernel) -> Int
 
@@ -305,25 +293,4 @@ function store_tile!(
     m, n = _store_prologue!(destination, alpha, beta)
     (m == 0 || n == 0) && return destination
     return _store_tile_onem!(destination, acc, alpha, beta, kernel, m, n)
-end
-
-"""
-    execute_tile!(kernel::OneMKernel, destination::QSTile, packed_a, packed_b, kc::Int, alpha, beta) -> destination
-
-1m counterpart of `SIMDKernel`'s `execute_tile!`; same validation order and
-short-circuits (both are `_execute_tile_prologue!`'s). `kc` is the **logical**
-(complex) K depth, and the buffer-length checks go through
-`packed_a_length`/`packed_b_length`, which take a logical `kc` and return a
-count of **reals** (`4*MR*kc` and `2*NR*kc`). The `2*kc` real-step doubling
-lives inside `accumulate` and is not visible here.
-"""
-function execute_tile!(
-        kernel::OneMKernel{MR, NR, T, W}, destination::QSTile,
-        packed_a::PA, packed_b::PB, kc::Int, alpha, beta
-    ) where {MR, NR, T, W, PA, PB}
-    run, alphaT, betaT =
-        _execute_tile_prologue!(kernel, destination, packed_a, packed_b, kc, alpha, beta)
-    run || return destination
-    acc = accumulate(kernel, zero_accumulator(kernel), packed_a, packed_b, kc)
-    return store_tile!(destination, acc, alphaT, betaT, kernel)
 end

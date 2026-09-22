@@ -9,7 +9,6 @@ using QuasiStrided: AxisGroup, BlockDescriptor, describe_block, KernelDescriptor
     tile_load, tile_store!, checked_tile_load, checked_tile_store!
 
 
-
 # =====================================================================
 # pack_a! / pack_b!: direct-indexing oracle helpers
 # =====================================================================
@@ -720,8 +719,10 @@ end
         koffs = [7, 900, 300, 1500]
         for storage in _dense_storages(vals), base in (0, 11), rowbase in (0, 5)
             rows = AffineAxis(rowbase, 1, MR)
-            for cols in Any[AffineAxis(0, MR, 5), AffineAxis(1800, -MR, 6), AffineAxis(40, 0, 4),
-                    ScatterAxis(koffs, 4), PtrScatterAxis(pointer(koffs), 4)]
+            for cols in Any[
+                    AffineAxis(0, MR, 5), AffineAxis(1800, -MR, 6), AffineAxis(40, 0, 4),
+                    ScatterAxis(koffs, 4), PtrScatterAxis(pointer(koffs), 4),
+                ]
                 kc = axis_length(cols)
                 expected = _oracle_packed_a(storage, base, _offs(rows), _offs(cols), MR, identity, T)
                 canary = T(-999)

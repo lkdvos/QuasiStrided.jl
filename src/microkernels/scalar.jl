@@ -69,23 +69,3 @@ function store_tile!(
     end
     return destination
 end
-
-"""
-    execute_tile!(kernel::ScalarKernel, destination::QSTile, packed_a, packed_b, kc::Int, alpha, beta) -> destination
-
-Checked composition of `zero_accumulator`, `accumulate` and `store_tile!`
-for a single K-panel call (multi-panel accumulation is the driver's job).
-Validation order and short-circuits are `_execute_tile_prologue!`'s, shared
-with every other kernel: `kc == 0` or `alpha == 0` scales by `beta` only,
-without reading `packed_a`/`packed_b`.
-"""
-function execute_tile!(
-        kernel::ScalarKernel{MR, NR, T}, destination::QSTile,
-        packed_a::PA, packed_b::PB, kc::Int, alpha, beta
-    ) where {MR, NR, T, PA, PB}
-    run, alphaT, betaT =
-        _execute_tile_prologue!(kernel, destination, packed_a, packed_b, kc, alpha, beta)
-    run || return destination
-    acc = accumulate(kernel, zero_accumulator(kernel), packed_a, packed_b, kc)
-    return store_tile!(destination, acc, alphaT, betaT, kernel)
-end

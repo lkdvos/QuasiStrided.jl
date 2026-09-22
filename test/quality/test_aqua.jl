@@ -22,11 +22,12 @@ using QuasiStrided
         # (TensorOperations, StridedViews, SIMD, TupleTools) and touches
         # nothing QuasiStrided defines; re-litigating those is not our job.
         ambiguities = false,
-        # False positive of `Test.detect_unbound_args` on
-        # `src/kernels/simd.jl`'s `_acc_lane(::NTuple{NV,Vec{W,T}}, ...,
-        # ::Val{NVECA})`: with a `Vararg`-shaped argument in play the detector
-        # stops seeing that `NVECA` is pinned by a separate, ordinary
-        # argument, which it always is at every call site.
+        # `Test.detect_unbound_args` flags every accumulator signature of the
+        # form `acc::NTuple{NV, Vec{W, R}}` (the planar and 1m kernels'
+        # `accumulate`/`store_tile!` and their generated helpers): at
+        # `NV == 0` the tuple is empty and `W`/`R` would be unbound. No kernel
+        # has an empty accumulator, and `W`/`R` are pinned by the kernel
+        # argument at every call site.
         unbound_args = false,
     )
 end

@@ -1,39 +1,25 @@
-# Packs against the frozen physical formats in kernel_descriptor.jl
-# (A: i + MR*p, B: j + NR*p; do not redefine).
+# Packers: copy one sliver of A (up to MR logical rows) or B (up to NR logical
+# columns) over a K range into a contiguous panel in the descriptor's packed
+# format. `pack_a!`/`pack_b!` validate and dispatch on the operand's
+# `PackFormat`; each format has its own leaf loop, and a contiguous fast path
+# (src/packing/pack_contiguous.jl) for the one sliver shape it can serve.
 
-# `Vec`/`vload`/`vstore` already arrive via src/panel.jl's `using`; the complex
-# fast path at the bottom of this file additionally needs the compile-time-index
-# shuffle (SIMD.jl v3, `simdvec.jl`), which is one LLVM `shufflevector`
-# instruction and never a runtime gather.
+# `Vec`/`vload`/`vstore` already arrive via src/packing/panel.jl's `using`; the
+# complex fast path additionally needs the compile-time-index shuffle (SIMD.jl
+# v3), which is one LLVM `shufflevector` instruction and never a runtime gather.
 using SIMD: shufflevector
 
-# Explicit runtime check (not dispatch) so a mismatch raises ArgumentError.
-@inline function _check_packed_eltype(packed, kernel::KernelDescriptor{MR, NR, T2}) where {MR, NR, T2}
-    eltype(packed) === T2 ||
-        throw(
-        ArgumentError(
-            "packed buffer eltype $(eltype(packed)) does not match kernel scalar type $T2"
-        )
-    )
-    return nothing
-end
-
-# Explicit runtime check (not dispatch), mirroring the real method above. The
+# Explicit runtime check (not dispatch) so a mismatch raises ArgumentError. The
 # packed buffer holds `realtype(kernel)`, which is *not* `scalartype(kernel)`
-# once the element type is complex -- that conflation is the main hazard in the
-# complex half of this file.
-@inline function _check_packed_eltype(
-        packed, kernel::ComplexKernelDescriptor{MR, NR, T2}
-    ) where {MR, NR, T2}
+# once the element type is complex.
+@inline function _check_packed_eltype(packed, kernel::Descriptor{MR, NR, T2}) where {MR, NR, T2}
     R = realtype(kernel)
-    eltype(packed) === R ||
-        throw(
-        ArgumentError(
-            "packed buffer eltype $(eltype(packed)) does not match kernel real type $R " *
-                "(scalar type $T2)"
-        )
-    )
-    return nothing
+    eltype(packed) === R && return nothing
+    msg = R === T2 ?
+        "packed buffer eltype $(eltype(packed)) does not match kernel scalar type $T2" :
+        "packed buffer eltype $(eltype(packed)) does not match kernel real type $R " *
+        "(scalar type $T2)"
+    throw(ArgumentError(msg))
 end
 
 # ----------------------------------------------------------------------------
@@ -106,28 +92,135 @@ end
 end
 
 # ----------------------------------------------------------------------------
-# Real packing
+# Entry points
 # ----------------------------------------------------------------------------
 
-# Shared inner loop for pack_a!/pack_b!, real and complex alike; `load`/
-# `plane_offset` close over the operand-specific index mapping and `format`
-# dispatches the per-lane store through `_pack_emit!`/`_pack_emit_zero!`
-# (defined below, alongside the complex formats). This used to be two
-# structurally separate loops -- see the retired rationale where the complex
-# one lived, right below `_pack_emit_zero!` -- unified as part of the
-# tensorcontract-rs comparison milestone so the complex path picks up the same
-# full/tail split the real path already had.
+"""
+    pack_a!(packed, source::QSTile, kernel::Descriptor{MR,NR,T,FA,FB}, transform) -> packed
+
+Pack an A source tile into `packed` (a buffer of `realtype(kernel)`: a
+`Vector`, a `SubArray` sliver of a macro panel, or a [`PackedPanel`](@ref)) in
+the physical format `FA`. `source` has `0 <= m <= mr(kernel)` **logical** rows
+and `kc = ncols(source)` columns; `packed` needs `length >=
+packed_a_length(kernel, kc)`, which counts reals at logical `kc`.
+
+Row `i < m` commits `convert(T, transform(A[i,p]))` -- for a complex `T`,
+`transform` is applied to the complex element and the result is then split
+into the packed format, never applied per real half. Padding rows (`i >= m`)
+write literal zeros into every real of the lane without reading `source` or
+calling `transform`. `kc == 0` is a no-op. All validation happens before any
+write. Never allocates.
+
+For a real kernel the layout is `packed_a_offset(kernel, i, p) == i +
+mr(kernel)*p`; see [`PlanarFormat`](@ref) and [`OneEFormat`](@ref) for the
+complex ones. See [`unsafe_pack_a!`](@ref) for the sibling entry point that
+skips the storage-bounds half of the validation.
+"""
+function pack_a!(
+        packed::V, source::QSTile, kernel::Descriptor{MR, NR, T2, FA, FB},
+        transform::F
+    ) where {V, MR, NR, T2, FA, FB, F}
+    return _pack_a!(packed, source, kernel, transform, Val(true))
+end
+
+"""
+    unsafe_pack_a!(packed, source::QSTile, kernel, transform) -> packed
+
+[`pack_a!`](@ref) **without** the `checked_tile_storage_bounds(source)` call.
+
+PRECONDITION, which the caller must have established: every address `source`
+can read -- `source.base + row_offset(i) + col_offset(p)` for `0 <= i <
+nrows(source)`, `0 <= p < ncols(source)` -- lies in
+`0:length(source.storage)-1`. Violating it is an out-of-bounds read through an
+`@inbounds`/pointer path, not an exception.
+
+Every other check `pack_a!` makes is still made here: the row-extent bound,
+`kc >= 0`, the packed-buffer capacity, and the packed eltype. Only the
+address-range check moves, and it moves to the caller.
+
+The one caller in this package is `_execute_nest!`
+(src/execution/execute.jl), which validates the union of an entire macro
+block's slivers in a single [`checked_span_bounds`](@ref) call before packing
+any of them -- an exactly equivalent test, because the block's slivers
+partition its offset buffer and all of them share the same K axis, so the
+block's offset range is the union of the slivers' and the check only ever
+looks at range extremes.
+"""
+function unsafe_pack_a!(
+        packed::V, source::QSTile, kernel::Descriptor{MR, NR, T2, FA, FB},
+        transform::F
+    ) where {V, MR, NR, T2, FA, FB, F}
+    return _pack_a!(packed, source, kernel, transform, Val(false))
+end
+
+"""
+    pack_b!(packed, source::QSTile, kernel::Descriptor{MR,NR,T,FA,FB}, transform) -> packed
+
+Pack a B source tile into `packed` in the physical format `FB`. `source` has
+`kc = nrows(source)` rows and `0 <= n <= nr(kernel)` **logical** columns;
+`packed` needs `length >= packed_b_length(kernel, kc)` reals. For a real
+kernel the layout is `packed_b_offset(kernel, j, p) == j + nr(kernel)*p` (not
+column-major). Same `transform`, padding, validation and allocation contract
+as [`pack_a!`](@ref).
+"""
+function pack_b!(
+        packed::V, source::QSTile, kernel::Descriptor{MR, NR, T2, FA, FB},
+        transform::F
+    ) where {V, MR, NR, T2, FA, FB, F}
+    return _pack_b!(packed, source, kernel, transform, Val(true))
+end
+
+"""
+    unsafe_pack_b!(packed, source::QSTile, kernel, transform) -> packed
+
+[`pack_b!`](@ref) without the `checked_tile_storage_bounds(source)` call; the
+B-side counterpart of [`unsafe_pack_a!`](@ref), with the same precondition
+(the caller has validated every address `source` can read) and the same single
+caller in this package.
+"""
+function unsafe_pack_b!(
+        packed::V, source::QSTile, kernel::Descriptor{MR, NR, T2, FA, FB},
+        transform::F
+    ) where {V, MR, NR, T2, FA, FB, F}
+    return _pack_b!(packed, source, kernel, transform, Val(false))
+end
+
+@inline function _pack_a!(
+        packed::V, source::QSTile, kernel::Descriptor{MR, NR, T2, FA, FB},
+        transform::F, bounds::Val{BOUNDS}
+    ) where {V, MR, NR, T2, FA, FB, F, BOUNDS}
+    _check_packed_eltype(packed, kernel)
+    m, kc = _check_pack_a(packed, source, kernel, bounds)
+    kc == 0 && return packed
+    return _pack_a_sliver!(FA(), packed, source, kernel, transform, m, kc)
+end
+
+@inline function _pack_b!(
+        packed::V, source::QSTile, kernel::Descriptor{MR, NR, T2, FA, FB},
+        transform::F, bounds::Val{BOUNDS}
+    ) where {V, MR, NR, T2, FA, FB, F, BOUNDS}
+    _check_packed_eltype(packed, kernel)
+    n, kc = _check_pack_b(packed, source, kernel, bounds)
+    kc == 0 && return packed
+    return _pack_b_sliver!(FB(), packed, source, kernel, transform, n, kc)
+end
+
+# ----------------------------------------------------------------------------
+# The leaf loop, shared by every format
+# ----------------------------------------------------------------------------
+
+# One sliver over `kc` K steps. `load`/`plane_offset` close over the
+# operand-specific index mapping, and `format` dispatches the per-lane store
+# through `_pack_emit!`/`_pack_emit_zero!`. `kc == 0` is handled by the caller.
 #
 # `PD` (the physical dim: MR or NR) is a compile-time constant. A full sliver
 # (`valid == PD`) gets a constant-trip-count inner loop that LLVM fully
 # unrolls; a tail sliver writes its valid lanes and then its zero padding as
-# two separate loops. Either way no loop body holds a conditional load: the
-# previous `i < valid ? load : zero` select compiled to a per-element branch
-# around the load, which blocked if-conversion and kept the whole loop scalar
-# (1.3-1.7x on B, 1.5-2x on A's fallback, measured on ccqlin038 / Julia
-# 1.13 against the driver's argument types). The per-K-step store order
-# (0, 1, ..., PD-1) and the padding contract (padding lanes never read
-# `source` and never call `transform`) are unchanged.
+# two separate loops. Either way no loop body holds a conditional load: a
+# per-element `t < valid ? load : zero` compiles to a branch around the load,
+# which blocks if-conversion and keeps the whole loop scalar. The per-K-step
+# store order (0, 1, ..., PD-1) and the padding contract (padding lanes never
+# read `source` and never call `transform`) hold for every format.
 #
 # `transform` applies to the loaded (complex, for a complex format) element
 # BEFORE `_pack_emit!` splits it into planes; padding lanes go through
@@ -158,10 +251,9 @@ end
     return packed
 end
 
-# RealFormat ("plain"): one real per element, no plane split. `plane_offset`
-# is still called with a leading `plane` argument (always `0` here) so the
-# real and complex call sites share the same closure shape; `packed_a_offset`/
-# `packed_b_offset` ignore it.
+# RealFormat: one real per element, no plane split. `plane_offset` is still
+# called with a leading `plane` argument (always `0` here) so that every
+# format's call sites share the same closure shape.
 @inline function _pack_emit!(
         packed::V, ::RealFormat, plane_offset::P, t::Int, p::Int, z::T
     ) where {V, P, T}
@@ -176,64 +268,11 @@ end
     return nothing
 end
 
-"""
-    pack_a!(packed::AbstractVector{T}, source::QSTile, kernel::KernelDescriptor{MR,NR,T}, transform) -> packed
-
-Pack an A source tile into `packed` (a reused `Vector{T}`, or a `SubArray`
-sliver of a macro panel) at `packed_a_offset(kernel, i, p) == i +
-mr(kernel)*p`. `source` has `0 <= m <= mr(kernel)` rows and `kc =
-ncols(source)` columns; `packed` needs `length >= packed_a_length(kernel,
-kc)`. Row `i < m` writes `convert(T, transform(A[i,p]))`; padding rows (`i >=
-m`) write `zero(T)` without reading `source` or calling `transform`. `kc ==
-0` is a no-op. All validation happens before any write. Never allocates.
-
-See [`unsafe_pack_a!`](@ref) for the sibling entry point that skips the
-storage-bounds half of that validation.
-"""
-function pack_a!(
-        packed::V, source::QSTile, kernel::KernelDescriptor{MR, NR, T2},
-        transform::F
+# The real sliver packers. A has a contiguous fast path; B does not.
+@inline function _pack_a_sliver!(
+        ::RealFormat, packed::V, source::QSTile, kernel::Descriptor{MR, NR, T2},
+        transform::F, m::Int, kc::Int
     ) where {V, MR, NR, T2, F}
-    return _pack_a!(packed, source, kernel, transform, Val(true))
-end
-
-"""
-    unsafe_pack_a!(packed, source::QSTile, kernel, transform) -> packed
-
-[`pack_a!`](@ref) **without** the `checked_tile_storage_bounds(source)` call.
-
-PRECONDITION, which the caller must have established: every address `source`
-can read -- `source.base + row_offset(i) + col_offset(p)` for `0 <= i <
-nrows(source)`, `0 <= p < ncols(source)` -- lies in
-`0:length(source.storage)-1`. Violating it is an out-of-bounds read through an
-`@inbounds`/pointer path, not an exception.
-
-Every other check `pack_a!` makes is still made here: the row-extent bound,
-`kc >= 0`, the packed-buffer capacity, and the packed eltype. Only the
-address-range check moves, and it moves to the caller.
-
-The one caller in this package is `_execute_nest!` (src/driver.jl), which
-validates the union of an entire macro block's slivers in a single
-[`checked_span_bounds`](@ref) call before packing any of them -- an exactly
-equivalent test, because the block's slivers partition its offset buffer and
-all of them share the same K axis, so the block's offset range is the union of
-the slivers' and the check only ever looks at range extremes.
-"""
-function unsafe_pack_a!(
-        packed::V, source::QSTile, kernel::KernelDescriptor{MR, NR, T2},
-        transform::F
-    ) where {V, MR, NR, T2, F}
-    return _pack_a!(packed, source, kernel, transform, Val(false))
-end
-
-@inline function _pack_a!(
-        packed::V, source::QSTile, kernel::KernelDescriptor{MR, NR, T2},
-        transform::F, bounds::Val{BOUNDS}
-    ) where {V, MR, NR, T2, F, BOUNDS}
-    _check_packed_eltype(packed, kernel)
-    m, kc = _check_pack_a(packed, source, kernel, bounds)
-    kc == 0 && return packed
-
     if _pack_a_contiguous_eligible(packed, source, transform, m, Val(MR), T2)
         rowbase = source.base + source.rows.base
         return _pack_a_contiguous!(packed, source.storage, rowbase, source.cols, Val(MR), kc)
@@ -245,70 +284,19 @@ end
     return packed
 end
 
-"""
-    pack_b!(packed::AbstractVector{T}, source::QSTile, kernel::KernelDescriptor{MR,NR,T}, transform) -> packed
-
-Pack a B source tile into `packed` (a reused `Vector{T}`, or a `SubArray`
-sliver of a macro panel) at `packed_b_offset(kernel, j, p) == j +
-nr(kernel)*p` (not column-major). `source` has `kc = nrows(source)` rows and
-`0 <= n <= nr(kernel)` columns; `packed` needs `length >=
-packed_b_length(kernel, kc)`. Column `j < n` writes `convert(T,
-transform(B[p,j]))`; padding columns write `zero(T)` without reading
-`source`. Same validation/allocation contract as [`pack_a!`](@ref).
-"""
-function pack_b!(
-        packed::V, source::QSTile, kernel::KernelDescriptor{MR, NR, T2},
-        transform::F
+@inline function _pack_b_sliver!(
+        ::RealFormat, packed::V, source::QSTile, kernel::Descriptor{MR, NR, T2},
+        transform::F, n::Int, kc::Int
     ) where {V, MR, NR, T2, F}
-    return _pack_b!(packed, source, kernel, transform, Val(true))
-end
-
-"""
-    unsafe_pack_b!(packed, source::QSTile, kernel, transform) -> packed
-
-[`pack_b!`](@ref) without the `checked_tile_storage_bounds(source)` call; the
-B-side counterpart of [`unsafe_pack_a!`](@ref), with the same precondition
-(the caller has validated every address `source` can read) and the same single
-caller in this package.
-"""
-function unsafe_pack_b!(
-        packed::V, source::QSTile, kernel::KernelDescriptor{MR, NR, T2},
-        transform::F
-    ) where {V, MR, NR, T2, F}
-    return _pack_b!(packed, source, kernel, transform, Val(false))
-end
-
-@inline function _pack_b!(
-        packed::V, source::QSTile, kernel::KernelDescriptor{MR, NR, T2},
-        transform::F, bounds::Val{BOUNDS}
-    ) where {V, MR, NR, T2, F, BOUNDS}
-    _check_packed_eltype(packed, kernel)
-    n, kc = _check_pack_b(packed, source, kernel, bounds)
-    kc == 0 && return packed
-
     load = (j, p) -> tile_load(source, p, j)  # source.rows=K, source.cols=N
     plane_offset = (plane, j, p) -> packed_b_offset(kernel, j, p)
     _pack_panel!(packed, T2, RealFormat(), Val(NR), kc, n, transform, load, plane_offset)
     return packed
 end
 
+
 # ===========================================================================
 # Complex packing
-#
-# Real and complex packing used to be two structurally separate loops here
-# (`_pack_panel!` for real, `_pack_panel_complex!` for complex), deliberately
-# kept apart so the complex milestone left the real path byte-identical as a
-# `git diff` fact rather than an argument (docs/decisions.md, "Complex
-# element-type milestone"), and so the later real-path restructuring
-# (full/tail split, contiguous A fast path) likewise left the complex loop
-# untouched. That rationale is retired on purpose as of the
-# tensorcontract-rs comparison milestone: the complex loop's per-element `t <
-# valid ? load : zero` conditional load was confirmed to compile to a genuine
-# branch (not a `select`), the same defect the real path's full/tail split
-# had already fixed once, so the two loops are now one -- `_pack_panel!`
-# above, format-dispatched through `_pack_emit!`/`_pack_emit_zero!` below --
-# and the complex path picks up the same fix rather than needing it fixed
-# twice.
 #
 # Everything below writes `real(T)` into the packed buffer. The `transform`
 # contract, frozen format-independently in that section:
@@ -388,119 +376,48 @@ end
     return nothing
 end
 
-"""
-    pack_a!(packed::AbstractVector{real(T)}, source::QSTile, kernel::ComplexKernelDescriptor{MR,NR,T,FA,FB}, transform) -> packed
 
-Pack a complex A source tile into `packed`, a buffer of `realtype(kernel) ==
-real(T)`, in the physical format `FA` (see [`PlanarFormat`](@ref),
-[`OneEFormat`](@ref)). `source` has `0 <= m <= mr(kernel)` **logical**
-(complex) rows and `kc = ncols(source)` columns; `packed` needs `length >=
-packed_a_length(kernel, kc)`, which counts **reals** at *logical* `kc`.
-
-Row `i < m` commits `convert(T, transform(A[i,p]))` -- `transform` is applied
-to the complex element and the result is then split into the packed format,
-never applied per real half. Padding rows (`i >= m`) write literal zeros into
-**every** real of the lane (all four, under [`OneEFormat`](@ref)) without
-reading `source` or calling `transform`. `kc == 0` is a no-op. All validation
-happens before any write. Never allocates.
-"""
-function pack_a!(
-        packed::V, source::QSTile, kernel::ComplexKernelDescriptor{MR, NR, T2, FA, FB},
-        transform::F
-    ) where {V, MR, NR, T2, FA, FB, F}
-    return _pack_a!(packed, source, kernel, transform, Val(true))
-end
-
-"""
-    unsafe_pack_a!(packed, source::QSTile, kernel::ComplexKernelDescriptor, transform) -> packed
-
-Complex-descriptor counterpart of [`unsafe_pack_a!`](@ref); same precondition.
-"""
-function unsafe_pack_a!(
-        packed::V, source::QSTile, kernel::ComplexKernelDescriptor{MR, NR, T2, FA, FB},
-        transform::F
-    ) where {V, MR, NR, T2, FA, FB, F}
-    return _pack_a!(packed, source, kernel, transform, Val(false))
-end
-
-@inline function _pack_a!(
-        packed::V, source::QSTile, kernel::ComplexKernelDescriptor{MR, NR, T2, FA, FB},
-        transform::F, bounds::Val{BOUNDS}
-    ) where {V, MR, NR, T2, FA, FB, F, BOUNDS}
-    _check_packed_eltype(packed, kernel)
-    m, kc = _check_pack_a(packed, source, kernel, bounds)
-    kc == 0 && return packed
-
+# The complex sliver packers, for any complex format.
+@inline function _pack_a_sliver!(
+        format::FMT, packed::V, source::QSTile, kernel::Descriptor{MR, NR, T2},
+        transform::F, m::Int, kc::Int
+    ) where {FMT <: Union{PlanarFormat, OneEFormat}, V, MR, NR, T2, F}
     # A's packed index runs along `source.rows` (the MR logical rows).
     if _pack_complex_contiguous_eligible(
-            packed, source.storage, source.rows, transform, FA(), m, Val(MR), T2
+            packed, source.storage, source.rows, transform, format, m, Val(MR), T2
         )
         elembase = source.base + source.rows.base
         return _pack_complex_contiguous!(
-            FA(), packed, source.storage, elembase, source.cols, Val(MR), kc, transform
+            format, packed, source.storage, elembase, source.cols, Val(MR), kc, transform
         )
     end
 
     load = (i, p) -> tile_load(source, i, p)
     plane_offset = (plane, i, p) -> packed_a_plane_offset(kernel, plane, i, p)
-    _pack_panel!(packed, T2, FA(), Val(MR), kc, m, transform, load, plane_offset)
+    _pack_panel!(packed, T2, format, Val(MR), kc, m, transform, load, plane_offset)
     return packed
 end
 
-"""
-    pack_b!(packed::AbstractVector{real(T)}, source::QSTile, kernel::ComplexKernelDescriptor{MR,NR,T,FA,FB}, transform) -> packed
-
-Pack a complex B source tile into `packed`, a buffer of `realtype(kernel) ==
-real(T)`, in the physical format `FB`. `source` has `kc = nrows(source)` rows
-and `0 <= n <= nr(kernel)` **logical** columns; `packed` needs `length >=
-packed_b_length(kernel, kc)` reals. Same `transform`, padding, validation and
-allocation contract as [`pack_a!`](@ref).
-"""
-function pack_b!(
-        packed::V, source::QSTile, kernel::ComplexKernelDescriptor{MR, NR, T2, FA, FB},
-        transform::F
-    ) where {V, MR, NR, T2, FA, FB, F}
-    return _pack_b!(packed, source, kernel, transform, Val(true))
-end
-
-"""
-    unsafe_pack_b!(packed, source::QSTile, kernel::ComplexKernelDescriptor, transform) -> packed
-
-Complex-descriptor counterpart of [`unsafe_pack_b!`](@ref); same precondition.
-"""
-function unsafe_pack_b!(
-        packed::V, source::QSTile, kernel::ComplexKernelDescriptor{MR, NR, T2, FA, FB},
-        transform::F
-    ) where {V, MR, NR, T2, FA, FB, F}
-    return _pack_b!(packed, source, kernel, transform, Val(false))
-end
-
-@inline function _pack_b!(
-        packed::V, source::QSTile, kernel::ComplexKernelDescriptor{MR, NR, T2, FA, FB},
-        transform::F, bounds::Val{BOUNDS}
-    ) where {V, MR, NR, T2, FA, FB, F, BOUNDS}
-    _check_packed_eltype(packed, kernel)
-    n, kc = _check_pack_b(packed, source, kernel, bounds)
-    kc == 0 && return packed
-
+@inline function _pack_b_sliver!(
+        format::FMT, packed::V, source::QSTile, kernel::Descriptor{MR, NR, T2},
+        transform::F, n::Int, kc::Int
+    ) where {FMT <: Union{PlanarFormat, OneEFormat}, V, MR, NR, T2, F}
     # B's packed index runs along `source.cols` (the NR logical columns), so
     # the unit-stride requirement is on the N axis, not the K axis -- the
-    # mirror image of A's, and the reason this gate is a separate call rather
-    # than a shared `source.rows` test. `FB` is `PlanarFormat` under both
-    # shipped complex methods, so proposal Section 4.5's "1m's B panel needs no
-    # new code" holds here literally: this is the same predicate and the same
-    # packer `PlanarMethod` uses.
+    # mirror image of A's. `FB` is `PlanarFormat` under both shipped complex
+    # methods, so 1m's B panel uses the same predicate and the same packer as
+    # `PlanarMethod`.
     if _pack_complex_contiguous_eligible(
-            packed, source.storage, source.cols, transform, FB(), n, Val(NR), T2
+            packed, source.storage, source.cols, transform, format, n, Val(NR), T2
         )
         elembase = source.base + source.cols.base
         return _pack_complex_contiguous!(
-            FB(), packed, source.storage, elembase, source.rows, Val(NR), kc, transform
+            format, packed, source.storage, elembase, source.rows, Val(NR), kc, transform
         )
     end
 
     load = (j, p) -> tile_load(source, p, j)  # source.rows=K, source.cols=N
     plane_offset = (plane, j, p) -> packed_b_plane_offset(kernel, plane, j, p)
-    _pack_panel!(packed, T2, FB(), Val(NR), kc, n, transform, load, plane_offset)
+    _pack_panel!(packed, T2, format, Val(NR), kc, n, transform, load, plane_offset)
     return packed
 end

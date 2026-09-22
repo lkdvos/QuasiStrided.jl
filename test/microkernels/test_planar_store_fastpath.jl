@@ -119,8 +119,10 @@ function store_fp_acc(::Type{T}, MR::Int, NR::Int, W::Int, seed::Int) where {T}
 end
 
 store_fp_cold(::Type{T}, len::Int, seed::Int) where {T} =
-    (rng = MersenneTwister(seed);
-        T[Complex(real(T)(2 * rand(rng) - 1), real(T)(2 * rand(rng) - 1)) for _ in 1:len])
+    (
+    rng = MersenneTwister(seed);
+    T[Complex(real(T)(2 * rand(rng) - 1), real(T)(2 * rand(rng) - 1)) for _ in 1:len]
+)
 
 # The alpha/beta regimes: all three `_axpby_tile!` branches, plus the
 # alpha == 1 / beta == 0 sub-case the proposal calls out, plus a purely
@@ -425,7 +427,7 @@ end
 # ---------------------------------------------------------------------------
 
 @testset "planar store fast path: end-to-end with conj ($T)" for
-        T in (ComplexF64, ComplexF32)
+    T in (ComplexF64, ComplexF32)
 
     R = real(T)
     rng = MersenneTwister(31337)

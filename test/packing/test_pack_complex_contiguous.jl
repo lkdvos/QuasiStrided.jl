@@ -87,10 +87,12 @@ fp_ref(::OneEFormat, ::Type{T}, vr, kc, valid, g, f) where {T} =
 function fp_storage(::Type{T}, n) where {T}
     R = real(T)
     return [
-        (i % 17 == 0 ? T(R(0), R(0)) :
-            i % 19 == 0 ? T(R(3), R(0)) :
-            i % 23 == 0 ? T(R(0), R(-5)) :
-            T(R(10 * i + 1), R(-(10 * i + 2)))) for i in 1:n
+        (
+                i % 17 == 0 ? T(R(0), R(0)) :
+                i % 19 == 0 ? T(R(3), R(0)) :
+                i % 23 == 0 ? T(R(0), R(-5)) :
+                T(R(10 * i + 1), R(-(10 * i + 2)))
+            ) for i in 1:n
     ]
 end
 
@@ -175,7 +177,7 @@ end
 # ---------------------------------------------------------------------------
 
 @testset "complex pack fast path: A panel, $T / $fmtname / MR=$MR / $fname" for
-        T in (ComplexF64, ComplexF32),
+    T in (ComplexF64, ComplexF32),
         (fmtname, fa) in (("planar", PlanarFormat()), ("1e", OneEFormat())),
         MR in sort(unique(vcat(MENU_MRS, collect(EXTRA_DIMS)))),
         (fname, f) in (("identity", identity), ("conj", conj))
@@ -201,7 +203,7 @@ end
 end
 
 @testset "complex pack fast path: B panel, $T / $fmtname / NR=$NR / $fname" for
-        T in (ComplexF64, ComplexF32),
+    T in (ComplexF64, ComplexF32),
         (fmtname, fb) in (("planar", PlanarFormat()), ("1e", OneEFormat())),
         NR in sort(unique(vcat(MENU_NRS, collect(EXTRA_DIMS)))),
         (fname, f) in (("identity", identity), ("conj", conj))
@@ -231,7 +233,7 @@ end
 # path's lane axis must be unit-stride but its STEP axis is free to scatter,
 # which is what makes it usable on this engine's irregular contractions.
 @testset "complex pack fast path: scattered K steps, kc==0 ($T, $fmtname)" for
-        T in (ComplexF64, ComplexF32),
+    T in (ComplexF64, ComplexF32),
         (fmtname, fa) in (("planar", PlanarFormat()), ("1e", OneEFormat()))
 
     MR, NR, kc = 8, 6, 6
@@ -262,7 +264,7 @@ end
 # that conjugated per real half (or that used a `*(-1.0)` sign vector and got
 # `-0.0` wrong) fails here.
 @testset "complex pack fast path: conj == identity on a pre-conjugated source ($T, $fmtname)" for
-        T in (ComplexF64, ComplexF32),
+    T in (ComplexF64, ComplexF32),
         (fmtname, fa) in (("planar", PlanarFormat()), ("1e", OneEFormat()))
 
     MR, NR, kc = 16, 8, 4
@@ -296,8 +298,10 @@ end
 
     GC.@preserve buf ptr_scatter_offs begin
         pk = packed_panel(buf, 1, length(buf))
-        elig(; packed = pk, store = storage, ax = rows, tr = identity, fmt = fa,
-            valid = MR, pd = Val(MR), et = T) =
+        elig(;
+            packed = pk, store = storage, ax = rows, tr = identity, fmt = fa,
+            valid = MR, pd = Val(MR), et = T
+        ) =
             QS._pack_complex_contiguous_eligible(packed, store, ax, tr, fmt, valid, pd, et)
 
         # Baseline: everything satisfied -> tracks the ISA gate and nothing else.
@@ -328,7 +332,7 @@ end
 # The ineligible shapes must still produce the right bytes -- the fallback is
 # the thing the gate protects, and it must remain reachable.
 @testset "complex pack fast path: ineligible shapes take the scalar path and stay correct ($T)" for
-        T in (ComplexF64, ComplexF32)
+    T in (ComplexF64, ComplexF32)
 
     MR, NR, kc = 8, 6, 4
     for fa in (PlanarFormat(), OneEFormat())
@@ -392,7 +396,7 @@ end
 # ---------------------------------------------------------------------------
 
 @testset "complex pack fast path: allocation-free ($T, $fmtname)" for
-        T in (ComplexF64, ComplexF32),
+    T in (ComplexF64, ComplexF32),
         (fmtname, fa) in (("planar", PlanarFormat()), ("1e", OneEFormat()))
 
     MR, NR, kc = 24, 3, 8

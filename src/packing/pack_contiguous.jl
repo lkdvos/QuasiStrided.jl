@@ -83,28 +83,6 @@ end
 # the two address sets identical, element for element.
 # ---------------------------------------------------------------------------
 
-# Decision 5 of the proposal: `:avx512` only for this pass. Deliberately NOT
-# `target_profile().isa === :avx512` -- nothing else in this package dispatches
-# on the ISA *name*, and a name test would both miss a future ISA of the same
-# width and hide what the gate is actually about. The question is whether the
-# host's native vector register is as wide as AVX-512's, which is the property
-# that makes a 2*PD-real load/deinterleave/store cheaper than 2*PD scalar
-# stores; `_isa_vector_bytes(Val(:avx512))` folds to that width at compile time
-# rather than spelling `64` here. AVX2/NEON/unknown fall through to the scalar
-# loop until they have been measured (proposal Section 6.2, Section 7 item 5).
-#
-# SHARED, deliberately one function and not a per-fast-path copy (proposal
-# Section 5: the eligibility question is the same question asked of different
-# tiles, and "should be visibly the same function, not two copies that could
-# drift"). Phase 2's planar store fast path
-# (src/kernels/planar.jl, `_complex_vector_eligible`) calls exactly this; it
-# lives here rather than there only because packing was built first. Renamed
-# from Phase 1's `_complex_pack_isa_eligible` for that reason -- the predicate
-# is unchanged.
-@inline _complex_fastpath_isa_eligible(profile::TargetProfile) =
-    profile.vector_bytes == _isa_vector_bytes(Val(:avx512))
-@inline _complex_fastpath_isa_eligible() = _complex_fastpath_isa_eligible(target_profile())
-
 # The value half of the gate, mirroring `_copies_unchanged` above: the two
 # transforms the driver can produce (src/driver.jl, `plan_contract`) are the
 # two the shuffle patterns below cover. Anything else -- including the
@@ -114,9 +92,8 @@ end
 @inline _complex_pack_transform_eligible(::typeof(conj)) = true
 @inline _complex_pack_transform_eligible(::Any) = false
 
-# `RealFormat` never reaches a `ComplexKernelDescriptor` in this package, but
-# the descriptor's format parameters are unconstrained beyond `<:PackFormat`,
-# so the gate answers for it rather than leaving a MethodError as the contract.
+# Total over `PackFormat`, so the gate answers for `RealFormat` rather than
+# leaving a MethodError as the contract.
 @inline _complex_pack_format_eligible(::PlanarFormat) = true
 @inline _complex_pack_format_eligible(::OneEFormat) = true
 @inline _complex_pack_format_eligible(::PackFormat) = false

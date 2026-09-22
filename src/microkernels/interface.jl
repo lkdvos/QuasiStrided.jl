@@ -109,7 +109,15 @@ packed_b_offset(k::DescriptorKernel, j::Int, p::Int) = packed_b_offset(k.descrip
 packed_a_length(k::DescriptorKernel, kc::Int) = packed_a_length(k.descriptor, kc)
 packed_b_length(k::DescriptorKernel, kc::Int) = packed_b_length(k.descriptor, kc)
 
-# pack_a!/pack_b! dispatch on a bare KernelDescriptor; forward any wrapper.
+# Plane-offset forwarding. The single-plane `packed_a_offset`/`packed_b_offset`
+# above only resolve for a real descriptor: a complex kernel asked for one gets
+# the intended MethodError.
+@inline packed_a_plane_offset(k::DescriptorKernel, plane::Int, i::Int, p::Int) =
+    packed_a_plane_offset(k.descriptor, plane, i, p)
+@inline packed_b_plane_offset(k::DescriptorKernel, plane::Int, j::Int, p::Int) =
+    packed_b_plane_offset(k.descriptor, plane, j, p)
+
+# pack_a!/pack_b! dispatch on a bare `Descriptor`; forward any wrapper.
 #
 # GUARDRAIL: every forwarded argument needs its OWN bound type parameter (`V`,
 # `K`, `F`). Leaving one unbound here reintroduces Phase 2b finding 5's
@@ -272,13 +280,41 @@ end
 end
 
 """
+    _default_lanewidth(::Type{T}) -> Int
+
+Default `SIMD.Vec` lane count for `T` (one 256-bit register's worth): 4 for
+`Float64`, 8 for `Float32`. Not hardware-detected or tuned.
+"""
+_default_lanewidth(::Type{Float64}) = 4
+_default_lanewidth(::Type{Float32}) = 8
+
+"""
+    execute_tile!(kernel, destination::QSTile, packed_a, packed_b, kc::Int, alpha, beta) -> destination
+
+Checked composition of `zero_accumulator`, `accumulate` and `store_tile!` for
+a single K-panel call (multi-panel accumulation is the driver's job), shared
+by every `DescriptorKernel`. Validation order and short-circuits are
+`_execute_tile_prologue!`'s: `kc == 0` or `alpha == 0` scales by `beta` only,
+without reading `packed_a`/`packed_b`. The vector kernels match
+`ScalarKernel` only to within a tolerance (FMA grouping differs), never
+bitwise.
+"""
+function execute_tile!(
+        kernel::K, destination::QSTile, packed_a::PA, packed_b::PB,
+        kc::Int, alpha, beta
+    ) where {MR, NR, T, K <: DescriptorKernel{MR, NR, T}, PA, PB}
+    run, alphaT, betaT =
+        _execute_tile_prologue!(kernel, destination, packed_a, packed_b, kc, alpha, beta)
+    run || return destination
+    acc = accumulate(kernel, zero_accumulator(kernel), packed_a, packed_b, kc)
+    return store_tile!(destination, acc, alphaT, betaT, kernel)
+end
+
+"""
     unsafe_execute_tile!(kernel, destination::QSTile, packed_a, packed_b, kc::Int, alpha, beta) -> destination
 
-`execute_tile!` **without** the `checked_tile_storage_bounds(destination)`
-call, for every kernel that composes `zero_accumulator`/`accumulate`/
-`store_tile!` -- i.e. all four of them, whose `execute_tile!` bodies are
-otherwise identical to this one and are left untouched as the checked
-reference path.
+[`execute_tile!`](@ref) **without** the
+`checked_tile_storage_bounds(destination)` call.
 
 PRECONDITION, which the caller must have established: every address
 `destination` can write -- `destination.base + row_offset(i) + col_offset(j)`

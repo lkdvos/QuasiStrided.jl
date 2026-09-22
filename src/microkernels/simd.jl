@@ -27,15 +27,6 @@ struct SIMDKernel{MR, NR, T, W} <: DescriptorKernel{MR, NR, T}
     end
 end
 
-"""
-    _default_lanewidth(::Type{T}) -> Int
-
-Default `SIMD.Vec` lane count for `T` (one 256-bit register's worth): 4 for
-`Float64`, 8 for `Float32`. Not hardware-detected or tuned.
-"""
-_default_lanewidth(::Type{Float64}) = 4
-_default_lanewidth(::Type{Float32}) = 8
-
 SIMDKernel(::Val{MR}, ::Val{NR}, ::Type{T}, ::Val{W}) where {MR, NR, T, W} =
     SIMDKernel{MR, NR, T, W}(KernelDescriptor(Val(MR), Val(NR), T))
 SIMDKernel(::Val{MR}, ::Val{NR}, ::Type{T}) where {MR, NR, T} =
@@ -138,25 +129,6 @@ such as a `Vector` or unit-range `view`.
         acc = _accumulate_step(kernel, acc, packed_a, packed_b, p)
     end
     return acc
-end
-
-# scale_tile! is reused as-is from src/kernel.jl (no kernel argument).
-
-_unit_stride_rows(ax::AffineAxis) = ax.stride == 1
-_unit_stride_rows(::ScatterAxis) = false
-_unit_stride_rows(::PtrScatterAxis) = false
-
-# Runtime-indexed accumulator access. NOT used by either store path any more:
-# both `_store_tile_scattered!` and `_store_tile_vector!` below are `@generated`
-# with literal tuple indices (see the GUARDRAIL comment). Kept as the named
-# example of the access pattern that planar/onem's own guardrail comments
-# forbid, and as the subject of `test/test_quality.jl`'s Aqua `unbound_args`
-# justification.
-@inline function _acc_lane(
-        acc::NTuple{NV, Vec{W, T}}, v::Int, j::Int, lane1::Int,
-        ::Val{NVECA}
-    ) where {NV, W, T, NVECA}
-    return acc[v + NVECA * j + 1][lane1]
 end
 
 """
@@ -323,23 +295,4 @@ function store_tile!(
     end
 
     return _store_tile_scattered!(destination, acc, alpha, beta, kernel, m, n)
-end
-
-"""
-    execute_tile!(kernel::SIMDKernel, destination::QSTile, packed_a, packed_b, kc::Int, alpha, beta) -> destination
-
-SIMD counterpart of `ScalarKernel`'s `execute_tile!`; same validation order
-and short-circuits (both are `_execute_tile_prologue!`'s). Numerically matches
-`ScalarKernel` only to within a tolerance (FMA grouping differs), never
-bitwise.
-"""
-function execute_tile!(
-        kernel::SIMDKernel{MR, NR, T, W}, destination::QSTile,
-        packed_a::PA, packed_b::PB, kc::Int, alpha, beta
-    ) where {MR, NR, T, W, PA, PB}
-    run, alphaT, betaT =
-        _execute_tile_prologue!(kernel, destination, packed_a, packed_b, kc, alpha, beta)
-    run || return destination
-    acc = accumulate(kernel, zero_accumulator(kernel), packed_a, packed_b, kc)
-    return store_tile!(destination, acc, alphaT, betaT, kernel)
 end
