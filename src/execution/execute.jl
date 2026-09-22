@@ -5,18 +5,18 @@
 # allocated even under `oracle = false`.
 function _scale_all_of_C!(plan, betaT::T, MRk::Int, NRk::Int, Qm::Int, Qn::Int) where {T}
     ws = plan.workspace
-    m_bufs = (ws.tw_m_buf_A, ws.tw_m_buf_C)
-    n_bufs = (ws.tw_n_buf_B, ws.tw_n_buf_C)
+    m_bufs = (ws.tile_m_buf_A, ws.tile_m_buf_C)
+    n_bufs = (ws.tile_n_buf_B, ws.tile_n_buf_C)
     mfirst = 0
     while mfirst < Qm
         mcount = min(MRk, Qm - mfirst)
         (_, dM_C) = block_descriptors!(m_bufs, plan.mgroup, mfirst, mcount)
-        rowsC = _axis_of(dM_C, ws.tw_m_buf_C, 0)
+        rowsC = _axis_of(dM_C, ws.tile_m_buf_C, 0)
         nfirst = 0
         while nfirst < Qn
             ncount = min(NRk, Qn - nfirst)
             (_, dN_C) = block_descriptors!(n_bufs, plan.ngroup, nfirst, ncount)
-            colsC = _axis_of(dN_C, ws.tw_n_buf_C, 0)
+            colsC = _axis_of(dN_C, ws.tile_n_buf_C, 0)
             _scale_micro_tile!(plan.Cstorage, plan.Cbase, rowsC, colsC, betaT)
             nfirst += ncount
         end

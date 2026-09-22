@@ -184,7 +184,7 @@ end
 # 1024x256x1024 at ComplexF64 is a >1 GB fixture and not needed for coverage
 # here). These go through the default complex kernel the driver picks for
 # a plain label/dims contraction -- the "planar" method
-# (`_default_complex_method` in src/driver.jl always returns `PlanarMethod()`
+# (`_default_method` in src/driver.jl always returns `PlanarMethod()`
 # unless a kernel is explicitly named, which only the DIRECT_CASES 1m entries
 # below do). `_c64`/`_c32` suffix distinguishes these from the real-dtype ids.
 const _COMPLEX_GRID = [
@@ -232,13 +232,13 @@ const DIRECT_CASES = Any[
 ]
 
 # 1m (`OneMKernel`) is reachable ONLY by explicitly naming the kernel to
-# `plan_contract` (src/driver.jl: `_default_complex_method` always returns
+# `plan_contract` (src/driver.jl: `_default_method` always returns
 # `PlanarMethod()`), so the label/dims `CASES` above -- which all go through
 # the default kernel -- never exercise it. Exercise it here via
 # `plan_contract(...; kernel = ...)` on a couple of MAIN_SHAPES, both complex
 # dtypes, at 1m's own shipped default register shape (mirrors
 # `bench_complex_efficiency.jl`'s `time_kernel`, which does the same thing
-# through the `kernel_shapes`/`_complex_kernel_from_shape` menu).
+# through the `kernel_shapes`/`_kernel_from_shape` menu).
 _onem_default_kernel(::Type{T}) where {T} = ((MR, NR, W) = kernel_shapes(T, OneMMethod())[end]; OneMKernel(Val(MR), Val(NR), T, Val(W)))
 
 const _ONEM_GRID = [("256^3", "onem_256"), ("512^3", "onem_512")]

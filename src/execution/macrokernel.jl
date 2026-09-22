@@ -69,21 +69,14 @@ end
     return nothing
 end
 
-# Sliver `s`'s region within a shared packed panel, at the CURRENT block's
-# depth `kc_len` (< the buffer's per-sliver capacity on a tail K block, since
-# the buffer is sized for kc_eff). Used by both the packing and the consuming
-# step of a (jc,pc,ic) iteration, so the two cannot disagree.
-@inline function _sliver_range(reg_tile::Int, kc_len::Int, s::Int)
-    stride = reg_tile * kc_len
-    lo = s * stride + 1
-    return lo:(lo + stride - 1)
-end
-
-# Same addressing as `_sliver_range`, as a borrowed pointer. Keep in step.
+# Sliver `s` of a shared packed panel, as a borrowed pointer, at the CURRENT
+# block's depth `kc_len` (< the buffer's per-sliver capacity on a tail K block,
+# since the buffer is sized for kc_eff). Used by both the packing and the
+# consuming step of a (jc,pc,ic) iteration, so the two cannot disagree.
 #
 # GUARDRAIL: `reg_tile` here is a count of REALS per logical K step --
 # `packed_a_per_k`/`packed_b_per_k`, NOT `mr`/`nr`. They coincide for every
-# real kernel (pinned in test/test_target.jl), so this is the identity on the
+# real kernel (pinned in test/planning/test_kernel_selection.jl), so this is the identity on the
 # real path; for a complex kernel only the packed count addresses the panel
 # correctly.
 @inline function _sliver_panel(buffer, reg_tile::Int, kc_len::Int, s::Int)

@@ -147,8 +147,8 @@ end
     @test isempty(ws.tw_k_buf_B)
     # The MR/NR-sized ones are NOT oracle-only: _scale_all_of_C!, the beta-only
     # pass of both drivers, uses them.
-    @test length(ws.tw_m_buf_A) == 4
-    @test length(ws.tw_n_buf_C) == 3
+    @test length(ws.tile_m_buf_A) == 4
+    @test length(ws.tile_n_buf_C) == 3
 
     execute!(plan, 1.0, 0.0)
     @test Cmat ≈ Amat * Bmat

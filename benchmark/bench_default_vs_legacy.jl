@@ -7,12 +7,12 @@
 
 include(joinpath(@__DIR__, "harness.jl"))
 
-using QuasiStrided: _default_kernel, default_blocking, _legacy_blocking, _legacy_shape
+using QuasiStrided: _default_kernel, default_blocking, _fallback_blocking, _fallback_shape
 
 # The pre-detection configuration, reconstructed.
 function legacy_config(::Type{T}) where {T}
-    MR, NR, W = _legacy_shape(T)
-    return (SIMDKernel(Val(MR), Val(NR), T, Val(W)), _legacy_blocking(T))
+    MR, NR, W = _fallback_shape(T)
+    return (SIMDKernel(Val(MR), Val(NR), T, Val(W)), _fallback_blocking(T))
 end
 
 # What `contract!` / `plan_contract` / QuasiStridedBackend use by default now.

@@ -1,12 +1,8 @@
-# contract!'s frozen signature/label semantics: see docs/decisions.md.
-# Planning (labels, AxisGroups, buffers) is split from execution so a
-# ContractPlan can be built once and reused:
+# The plan: everything `execute!` needs, resolved once so it can be reused.
 #   plan_contract(...) -> ContractPlan; execute!(plan, alpha, beta); contract! = both.
-# execute! is a BLIS five-loop (NC/KC/MC) nest with packed-panel reuse; the
-# pre-macro-blocking tile-by-tile driver is kept unexported as
-# `execute_tilewise!`, an independent correctness oracle for it.
-# The buffers themselves live in a separate, reusable `ContractWorkspace`
-# (src/workspace.jl; docs/decisions.md, "Amendment 1").
+# `plan_contract` orchestrates the other planning stages -- labels
+# (src/planning/labels.jl), conjugation, kernel selection, blocking -- and
+# sizes the `ContractWorkspace` (src/execution/workspace.jl).
 
 """
     ContractPlan
@@ -22,7 +18,7 @@ on the real path), a `where`-bound parameter resolved at construction, so
 every plan instance is concretely typed. Field layout is an implementation
 detail, not part of the frozen interface.
 
-Note the M/N orientation swap (docs/decisions.md, "Label-order milestone"):
+Note the M/N orientation swap:
 after a swap, `Astorage`/`Abase`/`atransform` describe the ORIGINAL `B`
 operand and `Bstorage`/`Bbase`/`btransform` describe the original `A`, so
 `plan.Astorage === parent(A)` does not hold in general -- do not assume the
@@ -47,11 +43,11 @@ struct ContractPlan{
     # `identity` or `conj`, as singleton function VALUES with their own type
     # parameters. GUARDRAIL: not a `Bool` field and not a `Val{Bool}` -- either
     # would cross `_pack_sliver!` as a `Union` or need mapping to a function at
-    # the pack site, i.e. Phase 2b finding 5 and its ~80 B/call.
+    # the pack site, costing a dynamic dispatch (~80 B) per call.
     atransform::TA
     btransform::TB
 
-    # Every buffer both drivers use (docs/decisions.md, "Amendment 1").
+    # Every buffer both drivers use.
     workspace::ContractWorkspace{T, VT}
 end
 
@@ -70,16 +66,16 @@ end
 are built, via `_default_kernel(T, Qm, Qn)`, because the extent-aware demotion
 needs `Qm`. For a real element type that is a [`SIMDKernel`](@ref) at the
 hardware-derived shape; for a complex one a [`PlanarKernel`](@ref) at the
-swept shape (and on a vector ISA with no complex measurement, an
-`ArgumentError` rather than a guaranteed-spilling default -- pass `kernel`
-explicitly to override). [`OneMKernel`](@ref) is never selected automatically;
-naming it is the only way to use 1m.
+measured shape on AVX-512, and at a shape fitted to the register file
+elsewhere (see src/planning/kernel_selection.jl). Pass `kernel` explicitly to
+override. [`OneMKernel`](@ref) is never selected automatically; naming it is
+the only way to use 1m.
 
 Planning phase of [`contract!`](@ref): resolves labels into M/N/K
 `AxisGroup`s, validates matched axis lengths and eltypes, and preallocates
 every buffer [`execute!`](@ref) needs.
 
-Label order and orientation (docs/decisions.md, "Label-order milestone"): the
+Label order and orientation: the
 labels inside the M composite (A's free labels) and the N composite (B's free
 labels) are each stable-sorted by `abs(stride)` of the label's axis *in `C`*,
 ascending, ties keeping the operand's own axis order -- so each composite is
@@ -97,7 +93,7 @@ up to a whole `mr(kernel)`/`nr(kernel)` multiple, then cap at the M/N extent
 (likewise rounded up); `kc` caps at the K extent. Throws
 `ArgumentError`/`DimensionMismatch` on invalid input.
 
-Buffers (docs/decisions.md, "Amendment 1"):
+Buffers:
 
   * `workspace = nothing` builds a fresh [`ContractWorkspace`](@ref); passing
     an existing one reuses it, grown as needed by [`reserve!`](@ref), even
@@ -146,7 +142,7 @@ function plan_contract(
     # re-deriving the beta-applied-once argument (docs/decisions.md, "A
     # conjugated output `C` is rejected this milestone"). The two transforms
     # are `Union{typeof(identity),typeof(conj)}` here and die at the
-    # `_plan_contract` barrier below, as `_default_kernel`'s Union already does.
+    # `_plan_contract` barrier below, as the kernel's Union does.
     _qs_isconj(C, false) && throw(
         ArgumentError(
             "plan_contract: cannot write into a conjugated view (C has op $(C.op)); " *
@@ -190,19 +186,11 @@ function plan_contract(
     kernel_asis = kernel === nothing ? _default_kernel(T, Qm, Qn) : kernel
     kernel_swapped = kernel === nothing ? _default_kernel(T, Qn, Qm) : kernel
 
-    # Complex kernels (`PlanarKernel`/`OneMKernel`) once always scatter-stored
-    # unconditionally, and back then the swap measurably lost the as-is
-    # orientation's N-side locality for no store-side gain (~2-4%, `ccsd_t_3`,
-    # ComplexF64/32). `PlanarKernel` now has a vectorized store fast path
-    # (`_store_tile_planar_vector!`, `src/kernels/planar.jl`), so there IS
-    # potentially something for the swap to win on the complex path -- this
-    # `T <: Real` guard is a deliberately deferred, unmeasured follow-up
-    # (docs/proposals/complex-fast-paths.md Decision 3), not a settled case of
-    # nothing to gain. Real kernels (`SIMDKernel` and, for this run-length
-    # rule, `ScalarKernel` too) keep the swap. Uses the pre-computed
-    # `run_m`/`run_n` (the core `_prefer_swap` method) rather than the
-    # label-list wrapper, per the tensorcontract-rs-comparison milestone's
-    # run-length dedup -- see `_prefer_swap`'s definition above.
+    # The swap is for real element types only. Extending it to complex
+    # kernels, which now also have a vectorized store, is a deliberately
+    # deferred, unmeasured follow-up (docs/proposals/complex-fast-paths.md,
+    # Decision 3). Real kernels (`SIMDKernel` and `ScalarKernel`) keep it.
+    # Uses the precomputed `run_m`/`run_n` directly.
     if T <: Real && _prefer_swap(run_m, run_n, mr(kernel_asis), mr(kernel_swapped))
         # B takes the M role and A the N role. Everything operand-bound moves
         # together: the groups (each already carries its own C map), the K
@@ -211,7 +199,7 @@ function plan_contract(
         # unchanged: `*` commutes on `T` and `conj` is elementwise, so
         # `sum_k conj?(B[n,k]) * conj?(A[m,k])` is the same sum.
         kgroup_swapped = _build_pair_group(klabels, indB, B, indA, A)  # maps: (B, A)
-        # F2 demotion (see `_demote_for_run`): only for an auto-selected
+        # Run-length demotion (see `_demote_for_run`): only for an auto-selected
         # kernel, keyed on the CHOSEN (post-swap) M orientation, i.e. N's own
         # run against the kernel it would actually run.
         kernel_final = kernel === nothing ?

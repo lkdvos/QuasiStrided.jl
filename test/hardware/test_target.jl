@@ -4,9 +4,9 @@
 
 using StridedViews: StridedView
 using QuasiStrided: TargetProfile, CacheLevel, target_profile, cache_topology,
-    unknown_target, _detect_isa, _detect_target, _derived_shape, _legacy_shape,
-    _shape_override, _kernel_for, _default_kernel, _legacy_blocking, kernel_shapes,
-    _parse_size, _count_cpu_list, NR_DEFAULT, _rule_applies, _rule_applies_complex,
+    unknown_target, _detect_isa, _detect_target, _derived_shape, _fallback_shape,
+    _shape_override, _kernel_for, _default_kernel, _fallback_blocking, kernel_shapes,
+    _parse_size, _count_cpu_list, NR_DEFAULT, _rule_applies,
     _isa_nregisters, packed_a_per_k, packed_b_per_k, realtype, complex_method,
     RealMethod, PlanarMethod, OneMMethod, accumulator_planes, a_reals, b_reals
 

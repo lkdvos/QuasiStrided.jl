@@ -38,7 +38,7 @@ using QuasiStrided: OneMKernel, OneMMethod, PlanarKernel, PlanarMethod,
     AffineAxis, ScatterAxis, DestinationTile, nrows, ncols,
     zero_accumulator, accumulate, scale_tile!, store_tile!, execute_tile!,
     lanewidth, avecs_per_column, target_profile, default_blocking,
-    kernel_shapes, _complex_kernel_from_shape, _default_complex_method
+    kernel_shapes, _kernel_from_shape, _default_method
 using SIMD: Vec
 
 const _QS = QuasiStrided
@@ -698,26 +698,24 @@ const _QS = QuasiStrided
     # Driver wiring: selectable ONLY by naming the kernel
     # ------------------------------------------------------------------
 
-    @testset "_complex_kernel_from_shape: the OneMMethod arm, and no auto-dispatch" begin
+    @testset "_kernel_from_shape: the OneMMethod arm, and no auto-dispatch" begin
         for (T, menu) in ((ComplexF64, MENU64), (ComplexF32, MENU32))
             @test kernel_shapes(T, OneMMethod()) === menu
             for (MR, NR, W) in menu
-                k = _complex_kernel_from_shape((MR, NR, W), T, OneMMethod())
+                k = _kernel_from_shape((MR, NR, W), T, OneMMethod())
                 @test k isa OneMKernel{MR, NR, T, W}
                 @test complex_method(k) === OneMMethod()
             end
-            # An off-menu shape falls back to the menu's last entry, exactly as
-            # the planar arm does -- never to another method.
-            fallback = menu[end]
-            k = _complex_kernel_from_shape((7, 7, 7), T, OneMMethod())
-            @test k isa OneMKernel{fallback[1], fallback[2], T, fallback[3]}
+            # An off-menu shape throws, exactly as the planar arm does -- it
+            # never silently builds a different shape or another method.
+            @test_throws ArgumentError _kernel_from_shape((7, 7, 7), T, OneMMethod())
         end
 
         # 1m is NOT the default and no rule may make it one: the reference
         # measured four method orderings on four machines and the freeze
         # forbids deriving a rule from any sweep.
-        @test _default_complex_method(ComplexF64) === PlanarMethod()
-        @test _default_complex_method(ComplexF32) === PlanarMethod()
+        @test _default_method(ComplexF64) === PlanarMethod()
+        @test _default_method(ComplexF32) === PlanarMethod()
         for T in (ComplexF64, ComplexF32)
             @test complex_method(_QS._default_kernel(T, 1024, 1024)) === PlanarMethod()
             @test _QS._default_kernel(T, 1024, 1024) isa PlanarKernel

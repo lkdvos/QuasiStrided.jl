@@ -41,8 +41,8 @@ function execute_tilewise!(plan::ContractPlan{T}, alpha::Number, beta::Number) w
         return plan.Cstorage
     end
 
-    m_bufs = (ws.tw_m_buf_A, ws.tw_m_buf_C)
-    n_bufs = (ws.tw_n_buf_B, ws.tw_n_buf_C)
+    m_bufs = (ws.tile_m_buf_A, ws.tile_m_buf_C)
+    n_bufs = (ws.tile_n_buf_B, ws.tile_n_buf_C)
     k_bufs = (ws.tw_k_buf_A, ws.tw_k_buf_B)
     kc_panel = plan.blocking.kc
 
@@ -50,15 +50,15 @@ function execute_tilewise!(plan::ContractPlan{T}, alpha::Number, beta::Number) w
     while mfirst < Qm
         mcount = min(MRk, Qm - mfirst)
         (dM_A, dM_C) = block_descriptors!(m_bufs, plan.mgroup, mfirst, mcount)
-        rowsA = _axis_of(dM_A, ws.tw_m_buf_A, 0)
-        rowsC = _axis_of(dM_C, ws.tw_m_buf_C, 0)
+        rowsA = _axis_of(dM_A, ws.tile_m_buf_A, 0)
+        rowsC = _axis_of(dM_C, ws.tile_m_buf_C, 0)
 
         nfirst = 0
         while nfirst < Qn
             ncount = min(NRk, Qn - nfirst)
             (dN_B, dN_C) = block_descriptors!(n_bufs, plan.ngroup, nfirst, ncount)
-            colsB = _axis_of(dN_B, ws.tw_n_buf_B, 0)
-            colsC = _axis_of(dN_C, ws.tw_n_buf_C, 0)
+            colsB = _axis_of(dN_B, ws.tile_n_buf_B, 0)
+            colsC = _axis_of(dN_C, ws.tile_n_buf_C, 0)
 
             kfirst = 0
             firstpanel = true

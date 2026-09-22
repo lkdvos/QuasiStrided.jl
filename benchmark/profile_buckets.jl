@@ -40,7 +40,7 @@ const SPECIFIC_QS_BUCKETS = [
         [
             "plan_contract", "_plan_contract", "_classify_labels", "_order_free_labels",
             "_prefer_swap", "_default_kernel", "_kernel_from_shape",
-            "_complex_kernel_from_shape", "default_blocking",
+            "_kernel_from_shape", "default_blocking",
             # Per-call-floor milestone (2026-09-21). These already landed in
             # "planning" through the ancestor walk -- `plan_contract` is their
             # only caller -- so naming them makes the attribution explicit
@@ -62,7 +62,7 @@ const SPECIFIC_QS_BUCKETS = [
         "driver_loop",
         [
             "_execute_nest!", "execute!", "_axis_of", "_classify_slivers!",
-            "_sliver_panel", "_sliver_range", "_scale_micro_tile!", "_scale_all_of_C!",
+            "_sliver_panel", "_scale_micro_tile!", "_scale_all_of_C!",
             "fill_offsets!", "describe_block", "block_descriptors!", "checked_tile_storage_bounds",
             # Per-call-floor milestone (2026-09-21): the closed-form affine
             # block path and the hoisted once-per-macro-block bounds check.

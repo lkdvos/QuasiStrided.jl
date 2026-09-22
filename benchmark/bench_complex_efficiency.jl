@@ -32,7 +32,7 @@
 include(joinpath(@__DIR__, "harness.jl"))
 
 using QuasiStrided: PlanarMethod, OneMMethod, complex_method, kernel_shapes,
-    _complex_kernel_from_shape, _default_kernel, default_blocking
+    _kernel_from_shape, _default_kernel, default_blocking
 
 const REPS = 21
 const SWEEP_SHAPES = vcat(MAIN_SHAPES, SMALL_SHAPES)
@@ -127,7 +127,7 @@ function arm_methods(csv, canaries, crng)
         for method in (PlanarMethod(), OneMMethod())
             for shape in kernel_shapes(T, method)
                 kernel = try
-                    _complex_kernel_from_shape(shape, T, method)
+                    _kernel_from_shape(shape, T, method)
                 catch err
                     @info "skipping $T $(method) $(shape): $(sprint(showerror, err))"
                     continue

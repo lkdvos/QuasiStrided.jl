@@ -2,9 +2,9 @@
 
 using StridedViews: StridedView
 using QuasiStrided: TargetProfile, CacheLevel, target_profile, cache_topology,
-    unknown_target, _detect_isa, _detect_target, _derived_shape, _legacy_shape,
-    _shape_override, _kernel_for, _default_kernel, _legacy_blocking, kernel_shapes,
-    _parse_size, _count_cpu_list, NR_DEFAULT, _rule_applies, _rule_applies_complex,
+    unknown_target, _detect_isa, _detect_target, _derived_shape, _fallback_shape,
+    _shape_override, _kernel_for, _default_kernel, _fallback_blocking, kernel_shapes,
+    _parse_size, _count_cpu_list, NR_DEFAULT, _rule_applies,
     _isa_nregisters, packed_a_per_k, packed_b_per_k, realtype, complex_method,
     RealMethod, PlanarMethod, OneMMethod, accumulator_planes, a_reals, b_reals
 
@@ -14,20 +14,20 @@ using QuasiStrided: TargetProfile, CacheLevel, target_profile, cache_topology,
         u = unknown_target()
         @test u.isa === :unknown
         for T in (Float64, Float32)
-            @test _derived_shape(u, T) === _legacy_shape(T)
+            @test _derived_shape(u, T) === _fallback_shape(T)
             k = _kernel_for(u, T)
             @test k isa SIMDKernel
-            @test (mr(k), nr(k), lanewidth(k)) === _legacy_shape(T)
+            @test (mr(k), nr(k), lanewidth(k)) === _fallback_shape(T)
         end
         # The exact constants from docs/decisions.md Phase E.
-        @test _legacy_blocking(Float64) === Blocking(64, 128, 768)
-        @test _legacy_blocking(Float32) === Blocking(96, 384, 1152)
+        @test _fallback_blocking(Float64) === Blocking(64, 128, 768)
+        @test _fallback_blocking(Float32) === Blocking(96, 384, 1152)
         for key in (:unknown, :avx2, :neon, :somethingelse), T in (Float64, Float32)
-            @test default_blocking(Val(key), T) === _legacy_blocking(T)
+            @test default_blocking(Val(key), T) === _fallback_blocking(T)
         end
         # The documented type-argument form is unchanged by detection.
-        @test default_blocking(Float64) === _legacy_blocking(Float64)
-        @test default_blocking(Float32) === _legacy_blocking(Float32)
+        @test default_blocking(Float64) === _fallback_blocking(Float64)
+        @test default_blocking(Float32) === _fallback_blocking(Float32)
     end
 
     @testset "derivation rule: MR = 2W, NR = NR_DEFAULT, NV = 12" begin
@@ -43,7 +43,7 @@ using QuasiStrided: TargetProfile, CacheLevel, target_profile, cache_topology,
         # AVX2 reproduces the old hardcoded shape, so an AVX2 machine sees no
         # change from this work.
         @test _derived_shape(synthetic(:avx2, 32), Float64) === (8, 6, 4)
-        @test _derived_shape(synthetic(:avx2, 32), Float64) === _legacy_shape(Float64)
+        @test _derived_shape(synthetic(:avx2, 32), Float64) === _fallback_shape(Float64)
     end
 
     @testset "the rule applies only where it was measured" begin
@@ -53,10 +53,10 @@ using QuasiStrided: TargetProfile, CacheLevel, target_profile, cache_topology,
         # This is also what keeps the shipped default identical on aarch64,
         # which test_driver.jl's "SIMDKernel is the default" testset pins.
         for T in (Float64, Float32)
-            @test _derived_shape(synthetic(:neon, 16), T) === _legacy_shape(T)
-            @test _derived_shape(synthetic(:unknown, 0), T) === _legacy_shape(T)
+            @test _derived_shape(synthetic(:neon, 16), T) === _fallback_shape(T)
+            @test _derived_shape(synthetic(:unknown, 0), T) === _fallback_shape(T)
             for vb in (16, 32, 64)   # width must not matter for an unmeasured ISA
-                @test _derived_shape(synthetic(:neon, vb), T) === _legacy_shape(T)
+                @test _derived_shape(synthetic(:neon, vb), T) === _fallback_shape(T)
             end
         end
     end
@@ -110,7 +110,7 @@ using QuasiStrided: TargetProfile, CacheLevel, target_profile, cache_topology,
             MR = mr(_default_kernel(T))
             @test mr(_default_kernel(T, 4 * MR, 256)) == MR   # Qm >= MR keeps it
             small = _default_kernel(T, 1, 256)                # Qm < MR demotes
-            @test (mr(small), nr(small), lanewidth(small)) === _legacy_shape(T)
+            @test (mr(small), nr(small), lanewidth(small)) === _fallback_shape(T)
             @test mr(_default_kernel(T, 0, 256)) == MR        # empty must not demote
         end
     end
@@ -161,7 +161,7 @@ end
         @test W == 64 ÷ sizeof(real(T))
 
         # The rule itself, with the override factored out.
-        @test QuasiStrided._complex_rule_shape(64, T) === (2 * W, NR_DEFAULT, W)
+        @test QuasiStrided._rule_shape(64, T) === (2 * W, NR_DEFAULT, W)
 
         # `_shape_override` on AVX-512 carries the Phase F sweep's winner, and
         # is what `_derived_shape` therefore returns. This is the only row in
@@ -179,7 +179,7 @@ end
         @test _derived_shape(synthetic(:avx512, 64), T) in kernel_shapes(T, PlanarMethod())
 
         # The menu is the three AVX-512 shapes, the AVX2 row, the NEON row,
-        # and a narrow floor entry that guarantees `_complex_fitted_shape`
+        # and a narrow floor entry that guarantees `_fitted_shape`
         # always finds something on an ISA with no row of its own. Pinned as a
         # SET so a reorder cannot change the compiled specialization count
         # silently, and so adding a shape is a deliberate edit here rather than
@@ -225,18 +225,18 @@ end
 end
 
 @testset "the complex rule applies on :avx512 only, and fits elsewhere" begin
-    @test _rule_applies_complex(Val(:avx512))
+    @test _rule_applies(Val(:avx512), QuasiStrided.PlanarMethod())
     for T in (ComplexF64, ComplexF32)
         # The measured *rule* (and its swept override) is :avx512-only. Off it,
         # the shape is fitted to the register file rather than derived -- and,
         # since CI, rather than refused. What must hold is that the result fits
         # the budget and is in the menu; the exact shape is an implementation
-        # detail of `_complex_fitted_shape` and is deliberately not pinned here.
+        # detail of `_fitted_shape` and is deliberately not pinned here.
         # `:unknown` and an unrecognised key have no override row, so they
         # exercise the fit itself: whatever it returns must fit the budget it
         # was given and be in the menu.
         for key in (:unknown, :somethingelse)
-            @test !_rule_applies_complex(Val(key))
+            @test !_rule_applies(Val(key), QuasiStrided.PlanarMethod())
             @test _shape_override(Val(key), T) === nothing
             for vb in (0, 16, 32, 64), nreg in (0, 16, 32)
                 shape = _derived_shape(synthetic(key, vb; nregisters = nreg), T)
@@ -249,7 +249,7 @@ end
         # `:avx2` and `:neon` do have rows, so the override short-circuits the
         # rule and the fit alike -- and, unlike the fit, is width-independent.
         for key in (:avx2, :neon)
-            @test !_rule_applies_complex(Val(key))
+            @test !_rule_applies(Val(key), QuasiStrided.PlanarMethod())
             for vb in (0, 16, 32, 64), nreg in (0, 16, 32)
                 @test _derived_shape(synthetic(key, vb; nregisters = nreg), T) ===
                     _shape_override(Val(key), T)
@@ -266,16 +266,16 @@ end
         # `ComplexF32` (8, 6, 8) is `MV = 1` and lands exactly on 16, so it
         # would have been admissible -- the resolver does not special-case
         # either, it just asks the budget.
-        @test _legacy_shape(T) === (8, NR_DEFAULT, _legacy_shape(real(T))[3])
+        @test _fallback_shape(T) === (8, NR_DEFAULT, _fallback_shape(real(T))[3])
     end
-    @test QuasiStrided._planar_pressure(_legacy_shape(ComplexF64)...) == 30
-    @test QuasiStrided._planar_pressure(_legacy_shape(ComplexF32)...) == 16
+    @test QuasiStrided._planar_pressure(_fallback_shape(ComplexF64)...) == 30
+    @test QuasiStrided._planar_pressure(_fallback_shape(ComplexF32)...) == 16
     for T in (ComplexF64, ComplexF32)
     end
     # The real rule still applies on AVX2 -- this is the `:neon` precedent, not
     # a narrowing of anything that already shipped.
-    @test _rule_applies(Val(:avx2))
-    @test _rule_applies(Val(:avx512))
+    @test _rule_applies(Val(:avx2), QuasiStrided.RealMethod())
+    @test _rule_applies(Val(:avx512), QuasiStrided.RealMethod())
 end
 
 @testset "register budget: the real assertion verbatim, the complex one generalized" begin
@@ -312,7 +312,7 @@ end
     end
     # Menus stay bounded so the compiled specialization set does. Planar's is
     # six: three measured AVX-512 shapes plus one `MV = 1` entry per lane width
-    # for `_complex_fitted_shape` to land on off `:avx512`. 1m's is three --
+    # for `_fitted_shape` to land on off `:avx512`. 1m's is three --
     # it is never selected automatically, so it needs no fitted entries.
     for T in (ComplexF64, ComplexF32)
         @test length(kernel_shapes(T, PlanarMethod())) <= 6
@@ -351,18 +351,18 @@ end
         @test default_blocking(Val(key), T, RealMethod()) === default_blocking(Val(key), T)
         @test default_blocking(Val(key), T) === default_blocking(Val(key), T)
     end
-    # A direct `_legacy_blocking` call degrades through the same formula rather
+    # A direct `_fallback_blocking` call degrades through the same formula rather
     # than throwing a MethodError.
-    @test _legacy_blocking(ComplexF64) === Blocking(32, 128, 384)
-    @test _legacy_blocking(ComplexF64, OneMMethod()) === Blocking(16, 128, 384)
-    @test _legacy_blocking(ComplexF32) === Blocking(48, 384, 576)
+    @test _fallback_blocking(ComplexF64) === Blocking(32, 128, 384)
+    @test _fallback_blocking(ComplexF64, OneMMethod()) === Blocking(16, 128, 384)
+    @test _fallback_blocking(ComplexF32) === Blocking(48, 384, 576)
     # The real rows are untouched.
-    @test _legacy_blocking(Float64) === Blocking(64, 128, 768)
-    @test _legacy_blocking(Float32) === Blocking(96, 384, 1152)
+    @test _fallback_blocking(Float64) === Blocking(64, 128, 768)
+    @test _fallback_blocking(Float32) === Blocking(96, 384, 1152)
 end
 
 @testset "the complex kernel constructor is an explicit, single seam" begin
-    # Phase C wired `_complex_kernel_from_shape`'s PlanarMethod arm and Phase D
+    # Phase C wired `_kernel_from_shape`'s PlanarMethod arm and Phase D
     # its OneMMethod arm; the method-generic arm still throws, so an
     # unimplemented method can never silently fall back to one that is
     # implemented -- a substitution that would make a planar-vs-1m measurement
@@ -373,7 +373,7 @@ end
         @test scalartype(kernel) === T
         @test QuasiStrided.realtype(kernel) === real(T)
         @test QuasiStrided.complex_method(kernel) === PlanarMethod()
-        @test QuasiStrided._default_complex_method(T) === PlanarMethod()
+        @test QuasiStrided._default_method(T) === PlanarMethod()
 
         # What holds on EVERY host: the resolved shape is in the menu (so the
         # `@generated` dispatch cannot have fallen through to the menu tail)
@@ -397,7 +397,7 @@ end
     # It is still not the default, and no rule may make it one.
     for T in (ComplexF64, ComplexF32)
         shape = first(QuasiStrided.kernel_shapes(T, OneMMethod()))
-        kernel = QuasiStrided._complex_kernel_from_shape(shape, T, OneMMethod())
+        kernel = QuasiStrided._kernel_from_shape(shape, T, OneMMethod())
         @test kernel isa QuasiStrided.OneMKernel
         @test scalartype(kernel) === T
         @test QuasiStrided.complex_method(kernel) === OneMMethod()
@@ -412,7 +412,7 @@ end
     for T in (ComplexF64, ComplexF32)
         shape = first(QuasiStrided.kernel_shapes(T, OneMMethod()))
         err = try
-            QuasiStrided._complex_kernel_from_shape(shape, T, QuasiStrided.RealMethod())
+            QuasiStrided._kernel_from_shape(shape, T, QuasiStrided.RealMethod())
         catch e
             e
         end
@@ -435,7 +435,7 @@ end
     #
     # So off :avx512 the shape is fitted to the detected register file, and the
     # two things that must hold are (1) it fits, and (2) it is in the menu --
-    # `_complex_kernel_from_shape` is `@generated` over the menu and falls
+    # `_kernel_from_shape` is `@generated` over the menu and falls
     # through to the LAST entry on no match, so a fitted shape absent from the
     # menu would silently build a different kernel than was asked for.
     for (isakey, vb, nreg) in (
@@ -449,7 +449,7 @@ end
             @test QuasiStrided._planar_pressure(MR, NR, W) <= budget
             @test shape in kernel_shapes(T, PlanarMethod())
             # Constructible, and at the shape asked for -- not the menu tail.
-            k = QuasiStrided._complex_kernel_from_shape(shape, T, PlanarMethod())
+            k = QuasiStrided._kernel_from_shape(shape, T, PlanarMethod())
             @test (mr(k), nr(k), lanewidth(k)) === shape
         end
     end
@@ -463,5 +463,34 @@ end
     # The real path derives or falls back on every ISA, never throws.
     for isakey in (:avx512, :avx2, :neon, :unknown), T in (Float64, Float32)
         @test QuasiStrided._derived_shape(synthetic(isakey, 32), T) isa Tuple{Int, Int, Int}
+    end
+end
+
+@testset "_demote_for_run: largest menu shape whose mr divides the run" begin
+    demote = QuasiStrided._demote_for_run
+    for T in (Float64, Float32), (MR, NR, W) in kernel_shapes(T)
+        k = SIMDKernel(Val(MR), Val(NR), T, Val(W))
+        # Every sliver is already unit-stride: the run is a multiple of `mr`,
+        # or it covers all of M.
+        @test demote(T, k, 3 * MR, 1000, 1) === k
+        @test demote(T, k, 7, 7, 1) === k
+        # Deeper than the K cutoff: never demoted.
+        kmax = T === Float64 ? QuasiStrided.F2_DEMOTE_KMAX_F64 : QuasiStrided.F2_DEMOTE_KMAX_F32
+        @test demote(T, k, 1, 1000, kmax + 1) === k
+        for run in (1, 4, 8, 12, 16, 20, 24, 48)
+            run % MR == 0 && continue
+            fits = [s for s in kernel_shapes(T) if run % s[1] == 0]
+            d = demote(T, k, run, 1000, 1)
+            if isempty(fits)
+                @test d === k
+            else
+                @test (mr(d), nr(d), lanewidth(d)) === fits[argmax(first.(fits))]
+            end
+        end
+    end
+    # Complex kernels are never demoted (a deliberately deferred extension).
+    for T in (ComplexF64, ComplexF32)
+        k = _default_kernel(T)
+        @test demote(T, k, 1, 1000, 1) === k
     end
 end

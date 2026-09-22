@@ -1,12 +1,9 @@
-# Buffer workspace for the contraction driver, split out of `ContractPlan`
-# (docs/decisions.md, "Amendment 1"). Frozen typing discipline: `VT` is a
-# `where`-bound parameter resolved at construction (never a `Union`- or
+# The buffers a plan executes into, kept separate from `ContractPlan` so they
+# can be reused across contractions. Typing discipline: `VT` is a `where`-bound
+# parameter resolved at construction (never a `Union`- or
 # `AbstractVector`-typed field), and the offset buffers stay concretely
 # `Vector{Int}` -- acquired as non-temporaries, so only the packed panels
-# genuinely route through the allocator.
-#
-# Frozen import convention: TensorOperations is always reached as `TO.<name>`.
-import TensorOperations as TO
+# route through the allocator.
 
 """
     ContractWorkspace{T,VT<:AbstractVector}
@@ -34,8 +31,9 @@ it, never pass it back as `workspace = ws` (docs/decisions.md, "Verified
 allocator behavior").
 
 The `tw_*` buffers belong to `execute_tilewise!`, the independent oracle, and
-are allocated only under `oracle = true` -- except the four `MR`/`NR`-sized
-ones, which the beta-only pass of *both* drivers uses.
+are allocated only under `oracle = true`. The four register-tile-sized
+`tile_*` offset buffers are always allocated: the beta-only pass of both
+drivers uses them, and so does the oracle's tile loop.
 
 Field layout is an implementation detail, not part of the frozen interface.
 """
@@ -61,13 +59,16 @@ struct ContractWorkspace{T, VT <: AbstractVector}
     packed_a::VT
     packed_b::VT
 
-    # execute_tilewise!'s own small buffers (MR/NR/blocking.kc-sized).
-    # Deliberately NOT shared with the macro buffers above: the oracle must
-    # have no mutable state in common with the code it checks.
-    tw_m_buf_A::Vector{Int}
-    tw_m_buf_C::Vector{Int}
-    tw_n_buf_B::Vector{Int}
-    tw_n_buf_C::Vector{Int}
+    # One register tile's offsets (MR/NR-sized): the beta-only pass and the
+    # oracle's tile loop.
+    tile_m_buf_A::Vector{Int}
+    tile_m_buf_C::Vector{Int}
+    tile_n_buf_B::Vector{Int}
+    tile_n_buf_C::Vector{Int}
+
+    # execute_tilewise!'s own K-panel buffers (blocking.kc-sized). Deliberately
+    # NOT shared with the macro buffers above: the oracle must have no packed
+    # or K-offset state in common with the code it checks.
     tw_k_buf_A::Vector{Int}
     tw_k_buf_B::Vector{Int}
     tw_packed_a::VT
@@ -83,8 +84,8 @@ struct ContractWorkspace{T, VT <: AbstractVector}
             m_desc_A::Vector{BlockDescriptor}, m_desc_C::Vector{BlockDescriptor},
             n_desc_B::Vector{BlockDescriptor}, n_desc_C::Vector{BlockDescriptor},
             packed_a::VT, packed_b::VT,
-            tw_m_buf_A::Vector{Int}, tw_m_buf_C::Vector{Int},
-            tw_n_buf_B::Vector{Int}, tw_n_buf_C::Vector{Int},
+            tile_m_buf_A::Vector{Int}, tile_m_buf_C::Vector{Int},
+            tile_n_buf_B::Vector{Int}, tile_n_buf_C::Vector{Int},
             tw_k_buf_A::Vector{Int}, tw_k_buf_B::Vector{Int},
             tw_packed_a::VT, tw_packed_b::VT
         ) where {T, VT <: AbstractVector}
@@ -98,7 +99,7 @@ struct ContractWorkspace{T, VT <: AbstractVector}
             m_buf_A, m_buf_C, n_buf_B, n_buf_C, k_buf_A, k_buf_B,
             m_desc_A, m_desc_C, n_desc_B, n_desc_C,
             packed_a, packed_b,
-            tw_m_buf_A, tw_m_buf_C, tw_n_buf_B, tw_n_buf_C,
+            tile_m_buf_A, tile_m_buf_C, tile_n_buf_B, tile_n_buf_C,
             tw_k_buf_A, tw_k_buf_B, tw_packed_a, tw_packed_b,
         )
     end
@@ -188,7 +189,7 @@ allocator the packed panels are acquired once via
 `TensorOperations.tensoralloc(..., Val(true), allocator)`, are never resized,
 and must be handed back with [`release!`](@ref).
 
-Buffers are `undef`-initialized, not zeroed: `_pack_panel!` (`src/packing.jl`)
+Buffers are `undef`-initialized, not zeroed: the packers (`src/packing/pack.jl`)
 writes every slot of a panel it is given, padding included, and the offset
 buffers are fully rewritten by `fill_offsets!` before each block is read.
 """
@@ -266,10 +267,10 @@ function reserve!(
     _grow!(ws.packed_a, s.packed_a)
     _grow!(ws.packed_b, s.packed_b)
 
-    _grow!(ws.tw_m_buf_A, s.mr)
-    _grow!(ws.tw_m_buf_C, s.mr)
-    _grow!(ws.tw_n_buf_B, s.nr)
-    _grow!(ws.tw_n_buf_C, s.nr)
+    _grow!(ws.tile_m_buf_A, s.mr)
+    _grow!(ws.tile_m_buf_C, s.mr)
+    _grow!(ws.tile_n_buf_B, s.nr)
+    _grow!(ws.tile_n_buf_C, s.nr)
 
     if oracle
         _grow!(ws.tw_k_buf_A, s.kc)
@@ -317,8 +318,8 @@ end
 # Build or reuse the plan's workspace. Dispatching on the allocator type (not
 # an `isa` branch on a value) keeps both paths concretely typed and makes the
 # unreachable one disappear at compile time. Default path: a plain, GC-owned
-# workspace, reused via `reserve!` when one is handed in -- the
-# zero-steady-state-allocation fast path (docs/decisions.md, Amendment 1).
+# workspace, reused via `reserve!` when one is handed in, which is
+# the zero-steady-state-allocation fast path.
 function _resolve_workspace(
         ::Type{T}, workspace, kernel, blocking::Blocking, oracle::Bool,
         allocator::TO.DefaultAllocator
