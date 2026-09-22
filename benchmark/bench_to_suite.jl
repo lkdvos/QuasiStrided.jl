@@ -1,6 +1,13 @@
-# Head-to-head timing of StridedNative(), StridedBLAS() and QuasiStridedBackend()
-# on the upstream TensorOperations.jl benchmark suite's :pairwise/:tccg/:mps/
-# :ctmrg/:trg cases.
+# Head-to-head timing of StridedBLAS() and QuasiStridedBackend() on the
+# upstream TensorOperations.jl benchmark suite's :pairwise/:tccg/:mps/:ctmrg/
+# :trg cases.
+#
+# StridedNative() was dropped from BACKENDS (2026-09-22): it was already
+# excluded from plot_bench_to_suite.jl's plots (see that file's header), so
+# timing it here only cost walltime -- and on :ctmrg/:trg specifically it has
+# a severe, size-growing slowdown (see the --trg-chis note below) that made a
+# ComplexF64 run risk blowing the job's walltime budget for numbers nobody
+# looks at.
 #
 #   julia --project=benchmark benchmark/bench_to_suite.jl [options]
 #
@@ -25,14 +32,22 @@
 # Writes bench_to_suite.csv / canary_to_suite.csv / summary_to_suite.txt /
 # mismatches_to_suite.txt / PROVENANCE_to_suite.txt to
 # benchmark/results/<hostname>-<date>/.
+#
+# bench_to_suite.csv's `gflops` column is the median-time-based rate
+# (unchanged); `min_gflops`/`std_gflops` are the min and standard deviation
+# of the REPS per-rep GFLOP/s samples (not derived from min/max *time*
+# converted to a rate -- computed directly on the per-rep throughput array so
+# they describe the throughput distribution plot_bench_to_suite.jl's violin
+# plots are built from).
 
 using TensorOperations
-using TensorOperations: StridedNative, StridedBLAS
+using TensorOperations: StridedBLAS
 using TensorOperationsBenchmarks
 using TensorOperationsBenchmarks: BenchmarkCase, ContractSpec, NetworkSpec, flops, bytes,
     ArrayProvider, randtensor
 using QuasiStrided
 using QuasiStrided: QuasiStridedBackend
+using Statistics: std
 import Pkg
 
 include(joinpath(@__DIR__, "harness.jl"))
@@ -50,7 +65,6 @@ const TRG_CHIS = parse_ints(argopt("trg-chis", "16,32,48"))
 const MAX_CASE_BYTES = argopt("max-bytes", 2 * 2^30)
 
 const BACKENDS = (
-    StridedNative = StridedNative(),
     StridedBLAS = StridedBLAS(),
     QuasiStrided = QuasiStridedBackend(),
 )
@@ -151,16 +165,31 @@ const PROVENANCE_PATH = joinpath(OUTDIR, "PROVENANCE_to_suite.txt")
 csv_io = open(CSV_PATH, "w")
 println(
     csv_io,
-    "backend,dtype,category,case_id,dim,params,reps,median_seconds,gflops,gbytes"
+    "backend,dtype,category,case_id,dim,params,reps,median_seconds,gflops,gbytes,min_gflops,std_gflops"
 )
-function log_row(backend_name, T, case::BenchmarkCase, reps, t, gf, gb)
+function log_row(backend_name, T, case::BenchmarkCase, reps, t, gf, gb, min_gf, std_gf)
     println(
         csv_io,
         "$backend_name,$T,$(case.category),$(case.id),$(case_sweepparam(case)),",
         params_string(case.params), ",$reps,",
-        @sprintf("%.9f,%.4f,%.4f", t, gf, gb)
+        @sprintf("%.9f,%.4f,%.4f,%.4f,%.4f", t, gf, gb, min_gf, std_gf)
     )
     return flush(csv_io)
+end
+
+# Per-rep timing samples (not just the median) -- same warm-up-then-timed
+# discipline as harness.jl's `median_time_s`, but returns every sample so the
+# caller can compute min/std of the derived throughput, not just its median.
+function timed_samples_s(f!::Function; reps::Int)
+    f!()  # warm-up, discarded
+    ts = Vector{Float64}(undef, reps)
+    for r in 1:reps
+        t0 = time_ns()
+        f!()
+        t1 = time_ns()
+        ts[r] = (t1 - t0) / 1.0e9
+    end
+    return ts
 end
 
 print_env_header(stdout, "bench_to_suite.jl")
@@ -253,18 +282,20 @@ for T in DTYPES
             haskey(results, bname) || continue           # threw above
             bname === :QuasiStrided && !qs_ok && continue # mismatched above
             C = alloc_output(spec, ctx, T)
-            t = median_time_s(
-                () -> run_case!(backend, spec, ctx, C);
-                reps = REPS
-            )
+            times = timed_samples_s(() -> run_case!(backend, spec, ctx, C); reps = REPS)
+            t = median(times)
             gf = fl / t / 1.0e9
             gb = cb / t / 1.0e9
-            log_row(bname, T, case, REPS, t, gf, gb)
+            gflops_samples = (fl ./ times) ./ 1.0e9
+            min_gf = minimum(gflops_samples)
+            std_gf = std(gflops_samples)
+            log_row(bname, T, case, REPS, t, gf, gb, min_gf, std_gf)
             push!(
                 raw,
                 (
                     backend = String(bname), dtype = T, category = case.category,
                     id = case.id, dim = case_sweepparam(case), t = t, gflops = gf, gbytes = gb,
+                    min_gflops = min_gf, std_gflops = std_gf,
                 )
             )
         end
@@ -329,33 +360,26 @@ open(SUMMARY_PATH, "w") do io
                     )
                 end
                 tof(b) = (i = findfirst(r -> r.backend == b, rows); i === nothing ? nothing : rows[i].t)
-                tn, tb, tq = tof("StridedNative"), tof("StridedBLAS"), tof("QuasiStrided")
+                tb, tq = tof("StridedBLAS"), tof("QuasiStrided")
                 qs_blas = (tq === nothing || tb === nothing) ? "n/a" :
                     @sprintf("%.3f", tq / tb)
-                nat_qs = (tn === nothing || tq === nothing) ? "n/a" :
-                    @sprintf("%.3f", tn / tq)
                 println(
                     io, "    -> QS/BLAS = ", qs_blas,
-                    "   (>1 = QuasiStrided slower than BLAS)",
-                    "   Native/QS = ", nat_qs,
-                    "   (>1 = QuasiStrided faster than Native)"
+                    "   (>1 = QuasiStrided slower than BLAS)"
                 )
             end
 
-            gq, gn = Float64[], Float64[]
+            gq = Float64[]
             for id in ids
                 rows = filter(r -> r.dtype == T && r.category == cat && r.id == id, raw)
                 tof(b) = (i = findfirst(r -> r.backend == b, rows); i === nothing ? nothing : rows[i].t)
-                tn, tb, tq = tof("StridedNative"), tof("StridedBLAS"), tof("QuasiStrided")
+                tb, tq = tof("StridedBLAS"), tof("QuasiStrided")
                 (tq !== nothing && tb !== nothing) && push!(gq, tq / tb)
-                (tn !== nothing && tq !== nothing) && push!(gn, tn / tq)
             end
             geomean(v) = isempty(v) ? NaN : exp(sum(log, v) / length(v))
             println(
                 io, "  [", T, "/", cat, "] geomean QS/BLAS = ",
-                @sprintf("%.3f", geomean(gq)), " over ", length(gq), " cases; ",
-                "geomean Native/QS = ", @sprintf("%.3f", geomean(gn)),
-                " over ", length(gn), " cases"
+                @sprintf("%.3f", geomean(gq)), " over ", length(gq), " cases"
             )
         end
     end

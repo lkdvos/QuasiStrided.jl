@@ -86,6 +86,35 @@ const CASES = [
         ),
         dtype = Float32,
     ),
+    # Same shape as ccsd_t_1_dim16, at ComplexF64 -- added 2026-09-22 to
+    # investigate why QuasiStrided's ComplexF64/Float64 GFLOP/s ratio on
+    # :tccg (bench_to_suite.jl, job 7087420) sits at ~0.29 median vs
+    # StridedBLAS's ~0.68 (docs/decisions.md, "ComplexF64 tccg slowdown").
+    (
+        id = "ccsd_t_1_dim16_c64",
+        IA = [:i, :j, :m, :a], IB = [:m, :k, :b, :c],
+        IC = [:a, :b, :c, :i, :j, :k],
+        dims = Dict(
+            :i => 16, :j => 16, :m => 16, :a => 16, :k => 16, :b => 16, :c => 16
+        ),
+        dtype = ComplexF64,
+    ),
+    # TCCG's ccsd_6: C[i,j,k] = A[i,l,m,k] * B[m,j,l] -- 3-index output, 2
+    # contracted indices. QS/BLAS GFLOP/s ratio in job 7087420's data: 36.02
+    # (Float64) vs 10.46 (ComplexF64), ratio 0.29 -- squarely at the observed
+    # median, added here as the other half of the same investigation.
+    (
+        id = "ccsd_6_dim16",
+        IA = [:i, :l, :m, :k], IB = [:m, :j, :l], IC = [:i, :j, :k],
+        dims = Dict(:i => 16, :l => 16, :m => 16, :k => 16, :j => 16),
+        dtype = Float64,
+    ),
+    (
+        id = "ccsd_6_dim16_c64",
+        IA = [:i, :l, :m, :k], IB = [:m, :j, :l], IC = [:i, :j, :k],
+        dims = Dict(:i => 16, :l => 16, :m => 16, :k => 16, :j => 16),
+        dtype = ComplexF64,
+    ),
     # C[m,n] = A[m,k] * B[k,n] -- plain square GEMM, large and compute-bound
     # by construction; the reference point for "what does the microkernel
     # share look like when there's nothing else to do."
