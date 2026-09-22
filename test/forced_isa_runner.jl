@@ -13,7 +13,7 @@
 #
 # Useful triples: avx512/64/32, avx2/32/16, neon/16/32, unknown/0/0.
 #
-# Expected residue: `test_target.jl`'s "runs on this host without throwing"
+# Expected residue: `hardware/test_target.jl`'s "runs on this host without throwing"
 # compares a fresh `_detect_target()` against the stored profile and therefore
 # fails by construction here -- that one failure is this harness, not the
 # package. Run from the test environment (`Pkg.test`-style) if you want the

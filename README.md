@@ -101,6 +101,25 @@ API split" section for the exhaustive, frozen three-tier list (1 exported +
 11 public + internal names) and the rationale (avoiding export collisions
 with TensorOperations, e.g. both packages having a `scalartype`).
 
+## Code map
+
+`src/` follows the algorithm. `plan_contract` runs the planning stages once;
+`execute!` runs a BLIS five-loop nest that packs slivers of `A` and `B` into
+contiguous panels and drives a microkernel over register tiles of `C`.
+
+| Folder | Stage | Contents |
+| --- | --- | --- |
+| `src/hardware/` | detection | ISA, vector width, register count and cache topology, detected once per process (`target_profile()`) |
+| `src/layout/` | addressing | `AxisGroup` (a grouped tensor axis as zero-based offsets), block descriptors, and the affine/scattered tile axes and `QSTile` the packers and kernels read and write through |
+| `src/packing/` | packing | the packed-panel formats and the `Descriptor` that fixes them per kernel (`format.jl`), borrowed-pointer panels, and the `pack_a!`/`pack_b!` packers with their contiguous fast paths |
+| `src/microkernels/` | microkernels | the shared kernel interface (`execute_tile!` = `zero_accumulator` + `accumulate` + `store_tile!`) and the scalar, SIMD, planar-complex and 1m-complex kernels |
+| `src/planning/` | planning | label classification and ordering, conjugation, kernel selection from the detected hardware, cache blocking, and `plan_contract`/`ContractPlan` |
+| `src/execution/` | execution | the reusable `ContractWorkspace`, the five-loop nest behind `execute!`/`contract!`, its macro-kernel helpers, and `execute_tilewise!`, the tile-by-tile correctness oracle |
+| `src/integrations/` | adapters | `QuasiStridedBackend` for TensorOperations.jl |
+
+`test/` mirrors this layout; `test/runtests.jl` includes every file into one
+scope, in stage order. `docs/decisions.md` is the design log.
+
 ## Status
 
 Implemented and tested (`Pkg.test()`: **13171/13171**, Julia 1.12.6, Xeon

@@ -48,7 +48,7 @@ mismatches; all direct-API arms bitwise `==` to Arm 2.** Canary spread
 worse): all 8/8 points, ratios 14.04x-66.73x. Dim-8 clause (4both must not
 regress vs Arm1 where Arm1 median >100us): no violations, 4both is 4-7x
 *faster* than Arm1 at every dim-8 point too. **No pre-authorized size guard
-needed.** Recommendation: implement S1 in `src/driver.jl` -- this alone is
+needed.** Recommendation: implement S1 in `src/execution/execute.jl` -- this alone is
 the milestone's primary deliverable.
 
 **G1-swap (S1b, orientation swap): AMBIGUOUS -- escalating per the plan's
@@ -79,7 +79,7 @@ own tests/benchmarks before merge -- not shipped speculatively unverified.
 
 ## T3 results (implementation)
 
-Commit `e7c4787` (`src/driver.jl` +97/-6; `test/test_driver.jl` +333/309
+Commit `e7c4787` (`src/execution/execute.jl` +97/-6; `test/execution/test_execute.jl` +333/309
 new assertions; `docs/decisions.md` +15 dated correction). Full suite
 **35165/35165** (baseline 34856 + 309 new), 0 fail, 0 error, no pre-existing
 test's expected values changed. Runic clean on both changed files.
@@ -128,14 +128,14 @@ milestone; both are reasonable T5/follow-up notes, not defects.
 
 **Docs correction landed**: `docs/decisions.md`'s false "pinned by an
 existing test" claim now has a dated 2026-09-19 addendum pointing at the
-real pinning tests. Forward-reference note: `src/driver.jl`'s new docstring
+real pinning tests. Forward-reference note: `src/planning/labels.jl`'s new docstring
 cites `docs/decisions.md, "Label-order milestone"` -- that section doesn't
 exist yet, T6 must either use that exact heading or fix the reference.
 
 ## T4 results (broad regression)
 
 BASE (`e2b5e5c`, `git archive` extraction, fresh offline manifest) vs FIX
-(`f06fde0`, live worktree). Confirmed genuinely different `src/driver.jl`
+(`f06fde0`, live worktree). Confirmed genuinely different `src/planning/labels.jl`
 (BASE lacks `_order_free_labels`/`_prefer_swap`) and different resolved
 `QuasiStrided` source paths.
 
@@ -186,7 +186,7 @@ UNSTABLE, so the explicit `alg=` was necessary, not redundant); (2) traced
 (storage/base/transform/groups) as one consistent set, role-keyed not
 tensor-keyed -- **and found the asymmetric-conj test case
 (`conjA != conjB`) the brief worried might be missing was already present**
-(`test/test_driver.jl`, now the "swap threads conj/transforms correctly"
+(`test/planning/test_plan_contract.jl`, now the "swap threads conj/transforms correctly"
 testset); (3) hand-counted the new test assertions (+309/+310, matches);
 (4) confirmed `_order_free_labels`/`_leading_unit_run`/`_prefer_swap` are
 all concretely-typed, no `Any`/`Union` leakage.
@@ -290,7 +290,7 @@ Third attempt: clean, 34856/34856, 4m40s.
 ## T1 (discovery) -- done, key findings
 
 - A1 CONFIRMED: `_vector_store_eligible`/`DenseVector` guard present
-  (`src/kernels/simd.jl:163-181`); `benchmark/bench_ccsd_t_store.jl` present
+  (`src/microkernels/simd.jl`); `benchmark/bench_ccsd_t_store.jl` present
   with Arms 1-3.
 - A2 CONFIRMED: `ccqlin038.flatironinstitute.org`, `cascadelake`. (Kernel
   shape probe MR/NR figures from the planner's brief, not re-verified here;
@@ -306,8 +306,8 @@ Third attempt: clean, 34856/34856, 4m40s.
   `Pkg.add("Runic")` first, or may need to be skipped/deferred; flag to T3.
 - **Disputed claim REFUTED**: `docs/decisions.md`'s "pinned by an existing
   test" claim for `_classify_labels`'s label order has NO supporting test.
-  `test/test_driver.jl:222` is an error-path test only;
-  `test/test_driver.jl:945-949` reads `plan.mgroup`/`ngroup` from an existing
+  `test/planning/test_plan_contract.jl` is an error-path test only;
+  `test/planning/test_plan_contract.jl` reads `plan.mgroup`/`ngroup` from an existing
   plan but asserts nothing about their order/contents. No `@test` anywhere
   pins the M/N composite order for a normal case. **R6 does NOT fire** --
   proceed without user escalation on this point, but T3/T6 should correct
@@ -387,7 +387,7 @@ INFERENCE, to be confirmed by T1.
 - AC6. One `orch-reviewer` pass, no unresolved blocking finding.
 - AC7. Untouched: `QuasiStridedBackend` eligibility/hard-reject/fallback;
   `_classify_labels` rejection paths; `_execute_nest!` five-loop nest;
-  `src/target.jl`; blocking constants; kernel shape menus.
+  `src/hardware/target.jl`; blocking constants; kernel shape menus.
 
 **Assumptions (T1 confirms):**
 - A1. `store-fastpath-investigation` HEAD has `f467b45` (Cause A fix) +
@@ -405,16 +405,16 @@ merging `upstream-bench`; adapter eligibility; TBLIS parity; MR-from-C's-run
 
 ### 2. Design decisions
 
-**Mechanism (EVIDENCE):** `_classify_labels` (`src/driver.jl:19-88`) returns
+**Mechanism (EVIDENCE):** `_classify_labels` (`src/planning/labels.jl`) returns
 `mlabels` in `indA` appearance order, `nlabels` in `indB` order.
 `plan_contract` (`:753-757`) passes these straight to `_build_pair_group`
 (`:92-113`), which builds `AxisGroup(lens, (sA, sC))` in list order --
-`fill_offsets!` (`src/axis_group.jl:136-199`) enumerates first-label-fastest.
+`fill_offsets!` (`src/layout/axis_group.jl`) enumerates first-label-fastest.
 So the store order into C is dictated by A's/B's incidental axis order, not
 C's. Permuting the label list permutes A's and C's enumeration identically
 -- **correctness preserved by construction**. Engine is symmetric in A/B
 (swapping "which operand is M" is a relabeling). No test currently pins the
-M/N label order (only an error-path test at `test/test_driver.jl:222`) --
+M/N label order (only an error-path test at `test/planning/test_plan_contract.jl`) --
 the docs' "pinned by an existing test" claim is unsupported on the current
 tree; T1 re-checks on the branch.
 
@@ -443,7 +443,7 @@ not a gate).
 
 **Interfaces (T3 binding):**
 ```julia
-# src/driver.jl, planning time only, between _classify_labels and
+# src/execution/execute.jl, planning time only, between _classify_labels and
 # _build_pair_group. Pure, returns new Vector{Int}.
 _order_free_labels(labels::Vector{Int}, indC::NTuple{NC,Int}, C::StridedView) -> Vector{Int}
 #   stable sort by abs(Base.strides(C)[findfirst(==(lbl), indC)]) ascending.
@@ -498,13 +498,13 @@ Edit scope: benchmark script + results dir only, no src/test.
 - Ambiguous: stop, present table to user, do not pick.
 
 **T3 (orch-fable, high):** implement `_order_free_labels` (+ `_prefer_swap`
-if G1-swap) in `src/driver.jl` only. New tests: ordering-helper unit test;
+if G1-swap) in `src/planning/labels.jl` only. New tests: ordering-helper unit test;
 pinning test on a ccsd_t-shaped fixture (`plan.mgroup.strides[2]`
 nondecreasing abs); correctness vs reference (both dtypes, alpha!=1,
 beta!=0, permuted/sliced C); execute! vs execute_tilewise! agreement; if
 S1b, full conj x op cross-product on a swap-triggering ComplexF64 fixture.
-`Pkg.test()` + Runic. Edit scope: `src/driver.jl`,
-`test/test_driver.jl`/`test/test_macro_driver.jl` (additive only).
+`Pkg.test()` + Runic. Edit scope: `src/execution/execute.jl`,
+`test/planning/test_plan_contract.jl`/`test/execution/test_macro_blocking.jl` (additive only).
 
 **T4 (orch-builder, standard):** re-run T2's script on fix tree (AC3); ABBA
 broad regression pulling `bench_to_suite.jl`+env from `upstream-bench` as
@@ -527,7 +527,7 @@ no engine change warranted, R1 recommendation.
 
 ### 4. Integration order / conflicts
 
-Serial except T1||T2. `src/driver.jl`+tests: T3 only. Benchmark script: T2
+Serial except T1||T2. `src/execution/execute.jl`+tests: T3 only. Benchmark script: T2
 owns, T4 runs (may add uncommitted flags). `docs/decisions.md`/`STATUS.md`:
 T6 only. `benchmark/harness.jl`: T4 may temporarily overwrite, must restore.
 Expect trivial append-conflict in decisions.md/STATUS.md when PRs #5/#6/this
@@ -542,7 +542,7 @@ smaller F32 gains (expected); deferring S1b per G1-swap; fallback regression
 set if A4 refuted; PR base per Q4 default.
 
 **May not decide:** any src/ edit before G1-pass; edits outside
-`src/driver.jl`; blocking constants/kernel menus/`_classify_labels` error
+`src/planning/labels.jl`; blocking constants/kernel menus/`_classify_labels` error
 semantics/adapter eligibility; cache-size cost model; merging
 `upstream-bench`; committing pulled benchmark tooling to `label-order`;
 skipping T5.
@@ -569,12 +569,12 @@ measures at both dims.
 
 ## Key file references
 
-- `src/driver.jl` (`_classify_labels` 19-88, `_build_pair_group` 92-113,
+- `src/planning/labels.jl` (`_classify_labels` 19-88, `_build_pair_group` 92-113,
   `plan_contract` 716-770, `_execute_nest!` 945-1046)
-- `src/axis_group.jl` (`fill_offsets!` 136-199, `describe_block` 227-251)
-- `src/kernels/simd.jl` (`store_tile!` 207-245)
-- `src/kernel.jl` (`_axpby_tile!`/`_axpby_at!` 126-136)
-- `src/tensoroperations.jl` (`_qs_labels` 123-130)
+- `src/layout/axis_group.jl` (`fill_offsets!` 136-199, `describe_block` 227-251)
+- `src/microkernels/simd.jl` (`store_tile!` 207-245)
+- `src/microkernels/interface.jl` (`_axpby_tile!`/`_axpby_at!` 126-136)
+- `src/integrations/tensoroperations.jl` (`_qs_labels` 123-130)
 - `docs/decisions.md` (Cause B ~3709-3720; frozen label semantics 8-29;
   orientation-swap out-of-scope note ~1395) -- on `store-fastpath-investigation`
 - `benchmark/harness.jl`, `benchmark/bench_real_path_guard.jl`,

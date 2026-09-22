@@ -1,6 +1,6 @@
 # T2b evidence-gathering probe: how big is the F2 run-length demotion's
-# regression (`_demote_for_run`, src/driver.jl:270-282, fired unconditionally
-# from its two call sites at src/driver.jl:1062-1066/1074) across a range of
+# regression (`_demote_for_run`, src/planning/kernel_selection.jl, fired unconditionally
+# from its two call sites at src/planning/kernel_selection.jl/1074) across a range of
 # `Qk` ("K-depth", the contracted extent `m` in the fixture below)?
 #
 # T1 (this milestone, earlier in this session) already confirmed, on this
@@ -28,7 +28,7 @@
 #   1. auto           -- plan_contract(...), no `kernel=`; F2 fires as today.
 #   2. forced-default -- plan_contract(...; kernel = _default_kernel(T, Qm,
 #                         Qn)); explicit `kernel=` makes both call sites use
-#                         this kernel verbatim (see src/driver.jl:1045-1046,
+#                         this kernel verbatim (see src/planning/plan.jl,
 #                         1065-1067/1073-1075), bypassing F2 entirely.
 #   3. forced-demoted -- plan_contract(...; kernel = <whatever `auto` chose>),
 #                         i.e. F2's own pick, forced so its cost can be

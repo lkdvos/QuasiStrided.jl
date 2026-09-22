@@ -1,11 +1,11 @@
-# Exercises src/kernel.jl: ScalarKernel, zero_accumulator, accumulate,
+# Exercises src/microkernels/interface.jl: ScalarKernel, zero_accumulator, accumulate,
 # store_tile!, scale_tile!, execute_tile! (against QSTile destinations).
 
 using Random
 
 using QuasiStrided: ScalarKernel, scale_tile!, QSTile, AffineAxis, ScatterAxis
 
-@testset "kernel.jl (scalar reference)" begin
+@testset "ScalarKernel (scalar reference)" begin
 
     @testset "zero_accumulator" begin
         k = ScalarKernel(Val(4), Val(3), Float64)
@@ -179,7 +179,7 @@ using QuasiStrided: ScalarKernel, scale_tile!, QSTile, AffineAxis, ScatterAxis
         execute_tile!(k, dest, packed_a, packed_b, kc, 1.5, 0.0)
         @test all(isfinite, storage)
 
-        # Textual confirmation (see src/kernel.jl): in store_tile!'s
+        # Textual confirmation (see src/microkernels/interface.jl): in store_tile!'s
         # `iszero(beta)` branch, and in scale_tile!'s `iszero(beta)` branch,
         # the only statement touching storage is an assignment, never a load.
     end

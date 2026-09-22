@@ -1,5 +1,5 @@
 # StridedViews integration, plus a test-only packing/contraction consumer,
-# written against the frozen spec without reading src/axis_group.jl's internals.
+# written against the frozen spec without reading src/layout/axis_group.jl's internals.
 
 using Test
 using StridedViews: StridedView, offset

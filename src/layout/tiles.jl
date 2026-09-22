@@ -219,7 +219,7 @@ function checked_tile_store!(tile::QSTile, i::Int, j::Int, v)
 end
 
 # One-time-per-tile storage-bounds check (Phase 2b review finding), called
-# from packing.jl/kernel.jl before the unchecked @inbounds hot paths run.
+# from the packers and microkernels before the unchecked @inbounds hot paths run.
 
 """
     axis_offset_range(ax::Union{AffineAxis,ScatterAxis}) -> (lo::Int, hi::Int)
@@ -291,7 +291,7 @@ only ever looks at the four extremes, and because `(rlo + clo)` and
 `(rhi + chi)` are both realized addresses of any rectangular (row-set x
 column-set) region, it is exact for such a region, not conservative: it
 accepts a region iff it accepts every rectangular sub-region of it, and
-rejects iff at least one address is out of bounds. `src/driver.jl` relies on
+rejects iff at least one address is out of bounds. `src/execution/execute.jl` relies on
 that equivalence to check a whole macro block once instead of each of its
 slivers.
 """

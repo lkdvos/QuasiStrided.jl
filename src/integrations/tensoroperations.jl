@@ -1,7 +1,7 @@
 # TensorOperations adapter: `QuasiStridedBackend`. Frozen contract:
 # docs/decisions.md, "TensorOperations integration milestone: Phase A direction
 # freeze". This is the whole TensorOperations-facing surface; the engine
-# (src/driver.jl and everything it includes) knows nothing about TO.
+# (src/execution/execute.jl and everything it includes) knows nothing about TO.
 #
 # Frozen import convention: every TensorOperations name is written `TO.<name>`
 # (a bare `using TensorOperations` would collide on `scalartype`), except the
@@ -183,7 +183,7 @@ end
 #
 # `conjA`/`conjB` are NOT dropped: both are forwarded to `plan_contract`, which
 # folds each with the corresponding view's `.op` through `_qs_isconj`
-# (src/driver.jl) and applies the result in the packing pass. Three facts about
+# (src/planning/conjugation.jl) and applies the result in the packing pass. Three facts about
 # that split are load-bearing and are the reason these comments exist.
 #
 # (a) THE COMBINING RULE IS XOR, not `||`:
@@ -299,7 +299,7 @@ Under `TensorOperations.DefaultAllocator` the buffers come from a persistent,
 `reserve!`-grown task-local [`ContractWorkspace`](@ref); any other allocator
 gets a workspace scoped to the single call. Dispatching on the allocator type,
 rather than branching on its value, mirrors `_resolve_workspace` in
-src/driver.jl and keeps both paths concretely typed.
+src/execution/workspace.jl and keeps both paths concretely typed.
 """
 function TO.tensorcontract!(
         C::AbstractArray,
@@ -358,7 +358,7 @@ end
 
 # `tensoradd!`/`tensortrace!` fall back to `TO.StridedNative()`: QuasiStrided
 # has no analog of either (no standalone add/permute step, and no trace/
-# diagonal support at all -- `_classify_labels` in `src/driver.jl` rejects
+# diagonal support at all -- `_classify_labels` in `src/planning/labels.jl` rejects
 # repeated labels), so there is nothing of this engine's own to run. Amended
 # 2026-09-16 (docs/decisions.md, "Amendment: tensoradd!/tensortrace! fall
 # back") to fall back rather than hard-reject, reversing the original Phase A
@@ -389,7 +389,7 @@ end
 
 Falls back to `TO.StridedNative()`: `QuasiStridedBackend` implements
 contraction only ([`TensorOperations.tensorcontract!`](@ref)) and has no
-trace/diagonal support at all (`_classify_labels` in `src/driver.jl` rejects
+trace/diagonal support at all (`_classify_labels` in `src/planning/labels.jl` rejects
 repeated labels), so has nothing of its own to run here. This is the one
 exception to "never falls back" (see [`QuasiStridedBackend`](@ref)); a timing
 taken on a `tensortrace!` call under this backend measures `StridedNative`,

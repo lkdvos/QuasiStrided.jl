@@ -1,6 +1,6 @@
 # Independent oracle/property tests for the macro-blocking `execute!`
 # (docs/decisions.md, "Macro-blocking milestone"). Nothing under test is
-# exported, and test_driver.jl introduces unqualified `plan_contract`/
+# exported, and helpers.jl introduces unqualified `plan_contract`/
 # `execute!` bindings into the same top-level scope, so every use here is
 # written as `QuasiStrided.<name>` to avoid colliding with those.
 
@@ -11,7 +11,7 @@ using StridedViews: StridedView, offset
 # `test/runtests.jl` restores QuasiStrided's un-exported internal tier into the
 # including scope, so the names below are already bound when this file is
 # `include`d from there. Guarded so the file also runs standalone
-# (`julia test/test_macro_driver.jl`-style) without shadowing or re-binding
+# (`julia test/execution/test_macro_blocking.jl`-style) without shadowing or re-binding
 # anything when it does not. Everything added for the complex element type is
 # written `QuasiStrided.<name>` regardless, per the header comment.
 using QuasiStrided

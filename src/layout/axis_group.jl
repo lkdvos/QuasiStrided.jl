@@ -216,7 +216,7 @@ match. A rank-zero group (all dimensions singleton, `Q == 1`) is a ramp with
 step 0, and an empty domain (`Q == 0`) is vacuously one.
 
 Callers use it to replace a materialized offset buffer with closed-form
-arithmetic (`src/driver.jl`, `_execute_nest!`). It reads only `g`'s type
+arithmetic (`src/execution/execute.jl`, `_execute_nest!`). It reads only `g`'s type
 parameters and fields, so with a concretely typed `g` it unrolls to a handful
 of integer compares and allocates nothing.
 """

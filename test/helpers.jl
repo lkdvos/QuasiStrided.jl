@@ -20,7 +20,7 @@ import TensorOperations as TO
 
 # Plan for the dense matmul C[m,n] = sum_k A[m,k]*B[k,n], the shape most
 # testsets below use; every `plan_contract` keyword is forwarded verbatim, so
-# an omitted one takes plan_contract's own default. (test_macro_driver.jl has
+# an omitted one takes plan_contract's own default. (execution/test_macro_blocking.jl has
 # its own copy: both files are included into the same scope, so the names must
 # differ.)
 function _mm_plan(Cmat, Amat, Bmat; kwargs...)

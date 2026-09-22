@@ -1,4 +1,4 @@
-# Exercises src/kernels/onem.jl: the 1m (induced) complex microkernel.
+# Exercises src/microkernels/onem.jl: the 1m (induced) complex microkernel.
 #
 # The oracles are deliberately *test-local* and independent of the engine:
 #   * `onee_pack_a` writes the `OneEFormat` offsets out literally, rather than
@@ -117,7 +117,7 @@ const _QS = QuasiStrided
         return out
     end
 
-    # 1m's shape menus (src/driver.jl), plus a small shape for cheap exercises.
+    # 1m's shape menus (src/execution/execute.jl), plus a small shape for cheap exercises.
     MENU64 = ((12, 8, 8), (16, 6, 8), (8, 8, 8))
     MENU32 = ((24, 8, 16), (32, 6, 16), (16, 8, 16))
     SMALL = (8, 4, 4)

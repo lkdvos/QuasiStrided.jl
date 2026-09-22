@@ -117,7 +117,7 @@ end
 # STABLE, which is the contract (ties keep input order) that
 # `alg = DEFAULT_STABLE` supplied before. A fresh vector is still returned:
 # sorting `labels` in place would mutate `_classify_labels`'s output, which
-# callers (and test/test_driver.jl's label-order pinning) read afterwards.
+# callers (and test/planning/test_plan_contract.jl's label-order pinning) read afterwards.
 function _order_free_labels(
         labels::Vector{Int}, indC::NTuple{NC, Int}, C::StridedView
     ) where {NC}
@@ -179,7 +179,7 @@ end
 # there (loses the as-is orientation's N-side locality for no store-side
 # gain), back when `PlanarKernel`/`OneMKernel` (complex) shipped only a
 # scattered/scalar store. As of the planar vectorized store fast path
-# (`_store_tile_planar_vector!`, `src/kernels/planar.jl`), that measurement is
+# (`_store_tile_planar_vector!`, `src/microkernels/planar.jl`), that measurement is
 # STALE: there is now a vector store for the swap to potentially win on the
 # complex path too. The `T <: Real` guard below is a DELIBERATELY DEFERRED,
 # UNMEASURED follow-up, not a settled "moot" case -- per

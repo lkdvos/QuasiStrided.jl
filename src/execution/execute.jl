@@ -85,7 +85,7 @@ function execute!(plan::ContractPlan{T}, alpha::Number, beta::Number) where {T}
     # *current* block, never from a buffer's length.
     ws = plan.workspace
 
-    # Panels below borrow pointers into ws.packed_a/_b (src/panel.jl), as do
+    # Panels below borrow pointers into ws.packed_a/_b (src/packing/panel.jl), as do
     # the PtrScatterAxes from `_axis_of`; this is their lifetime.
     return GC.@preserve ws begin
         _execute_nest!(
@@ -105,7 +105,7 @@ function _execute_nest!(
     # the packed panels. NOT interchangeable with `MRk`/`NRk`, which keep their
     # meaning everywhere else here (sliver counts, block extents,
     # `_classify_slivers!`): one counts register-tile rows, the other reals.
-    # `MRp === MRk` for every real kernel (pinned in test/test_target.jl), so
+    # `MRp === MRk` for every real kernel (pinned in test/planning/test_kernel_selection.jl), so
     # the substitution below is provably the identity on the real path.
     MRp = packed_a_per_k(kernel)
     NRp = packed_b_per_k(kernel)

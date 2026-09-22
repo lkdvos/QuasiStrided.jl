@@ -17,7 +17,7 @@
 # length, an offset or a driver loop bound.
 #
 # Cliff B (Julia heap-allocating a dynamically indexed `NTuple` above NV = 16;
-# see src/kernels/simd.jl for the measured number) applies here exactly as it
+# see src/microkernels/simd.jl for the measured number) applies here exactly as it
 # does to planar: the store below is `@generated` with literal tuple indices
 # including the lane tail, and the real path's runtime-indexed `_acc_lane`
 # helper is not used. `accumulate` inherits the real kernel's already-
@@ -45,7 +45,7 @@ constructor).
 The field is named `descriptor`, so `mr`/`nr`/`scalartype`/`packed_a_length`/
 `packed_b_length`/`realtype`/`packed_a_per_k`/`packed_b_per_k`/`a_format`/
 `b_format` all forward through the existing `DescriptorKernel` methods in
-src/kernel.jl and src/complex_format.jl.
+src/microkernels/interface.jl and src/microkernels/interface.jl.
 
 `KI` exists only because Julia cannot compute a field type from type
 parameters: the freeze spells the field `inner::SIMDKernel{2MR,NR,real(T),W}`,
@@ -211,8 +211,8 @@ end
 # shuffle, no second load.
 #
 # `@generated` with literal tuple indices (Cliff B), unrolled over `(v, j)`
-# exactly as `_store_tile_scattered!` (src/kernels/simd.jl) and
-# `_store_tile_planar!` (src/kernels/planar.jl). Scattered/scalar path only;
+# exactly as `_store_tile_scattered!` (src/microkernels/simd.jl) and
+# `_store_tile_planar!` (src/microkernels/planar.jl). Scattered/scalar path only;
 # the unit-stride interleaved store is the same deliberately deferred,
 # measurement-gated follow-on it is for planar.
 @generated function _store_tile_onem!(
@@ -284,7 +284,7 @@ even real rows, those two halves are always **adjacent lanes of the same
 acc[v + MV*j + 1][2u+2])` with `MV = 2MR÷W`. No shuffle, no second load.
 
 Ships the scattered/scalar path only, delegating to the existing generic
-`_axpby_tile!` (src/kernel.jl).
+`_axpby_tile!` (src/microkernels/interface.jl).
 """
 function store_tile!(
         destination::QSTile, acc::NTuple{NV, Vec{W, R}},

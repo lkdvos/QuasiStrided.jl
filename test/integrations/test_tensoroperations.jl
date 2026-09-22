@@ -4,7 +4,7 @@
 # `Test`/`Random`/`QuasiStrided`.
 
 # Standalone-run support: `runtests.jl` supplies `Test`/`Random`/`QuasiStrided`
-# before including this file, and `test_driver.jl` supplies the unqualified
+# before including this file, and `helpers.jl` supplies the unqualified
 # `plan_contract` binding (see `runtests.jl`'s comment on why it is not restored
 # there). Both are guarded, so including this file on its own works and the
 # `runtests.jl` path is bit-for-bit unaffected.
@@ -670,7 +670,7 @@ end
 
 # =====================================================================
 # Workspace-pooling tests. Unlike the sections above these are written WITH
-# knowledge of src/tensoroperations.jl, since they pin the task-local pooling
+# knowledge of src/integrations/tensoroperations.jl, since they pin the task-local pooling
 # behavior itself rather than externally observable `@tensor` results.
 # =====================================================================
 
@@ -720,7 +720,7 @@ end
         # pool-cleaning block since it must NOT populate the pool); the
         # SIMDKernel accumulator is not kept register-resident by Julia
         # 1.10's compiler (docs/decisions.md, Amendment 2's caveat), so this
-        # needs the same skip test_driver.jl/test_simd_kernel.jl use.
+        # needs the same skip execution/test_execute.jl/microkernels/test_simd_kernel.jl use.
         steady1 = @allocated run_once()
         steady2 = @allocated run_once()
         @test pool[T] === ws  # same workspace object, not rebuilt
@@ -787,7 +787,7 @@ end
 
 # Workspace reuse across shapes *through the backend path* specifically: the
 # task-local pool must not corrupt results when one pooled workspace is grown
-# and then reused oversized by a smaller problem. (test_driver.jl covers
+# and then reused oversized by a smaller problem. (execution/test_workspace.jl covers
 # reserve!/growth at the plan_contract level directly.)
 @testset "workspace pooling: correctness across differently-shaped contractions on one task" begin
     Random.seed!(2024)

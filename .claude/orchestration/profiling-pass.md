@@ -19,7 +19,7 @@ coordinator-owned status record.
    `profile_buckets.jl`) rather than write a new profiler from scratch.
 2. Merge PR #5 into `main` first (not: work on an isolated copy, not: work
    directly on the branch).
-3. When it turned out PR #5 also carries a real `src/tensoroperations.jl`
+3. When it turned out PR #5 also carries a real `src/integrations/tensoroperations.jl`
    behavior change (Amendment 7: `tensoradd!`/`tensortrace!` fall back to
    `StridedNative` instead of hard-rejecting) that its own GitHub
    description never mentioned: merge everything as-is (the change was
@@ -67,7 +67,7 @@ benchmark-tooling edits plus docs.
       "microkernel", `"driver.jl"` in "planning") could still swallow a
       more specific ancestor frame before the walk ever reached it (e.g. a
       generated store body's `macro expansion` leaf, still in
-      `src/kernels/simd.jl`, matched `"kernels/"` immediately instead of
+      `src/microkernels/simd.jl`, matched `"kernels/"` immediately instead of
       continuing up to `_store_tile_vector!`). Quantified: `ccsd_t_1_dim16_f32`'s
       true store share was ~75%, not the ~38% Correction 1 reported; the
       executed macro-blocking loop nest was being counted as "planning"

@@ -15,7 +15,7 @@
 end
 
 # `pack!` is pack_a!/pack_b! -- or their `unsafe_pack_a!`/`unsafe_pack_b!`
-# siblings (src/packing.jl) -- as a plain function, specialized on, never a
+# siblings (src/packing/pack.jl) -- as a plain function, specialized on, never a
 # closure; A and B differ only in which of rows/cols is the k axis, which the
 # caller has already resolved. `transform` is the plan's per-operand
 # `identity`/`conj` singleton.
@@ -26,7 +26,7 @@ end
 #
 # GUARDRAIL: every argument here has its OWN bound type parameter, `transform`
 # included. Leaving `TF` unbound reintroduces the Phase 2b finding-5 ~80 B/call
-# dynamic dispatch, for the reason spelled out at `pack_a!` in src/kernel.jl.
+# dynamic dispatch, for the reason spelled out at `pack_a!` in src/microkernels/interface.jl.
 # And all THREE call sites -- `_execute_nest!`'s two and `execute_tilewise!`'s
 # one -- must pass the matching operand's transform: missing the third makes
 # the in-tree ORACLE silently wrong for conjugated inputs.
@@ -48,7 +48,7 @@ end
 end
 
 # Same guardrail barrier as `_execute_micro_tile!`, over `unsafe_execute_tile!`
-# (src/kernel.jl) instead of `execute_tile!`: the destination's storage-bounds
+# (src/microkernels/interface.jl) instead of `execute_tile!`: the destination's storage-bounds
 # check has already been made ONCE for the whole (ic, jc) macro block this tile
 # belongs to. `unsafe_` is in the name at every call site precisely because the
 # precondition now lives at the caller.

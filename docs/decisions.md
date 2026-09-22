@@ -3,6 +3,36 @@
 Main process only. Record every public-interface decision and file ownership
 change here before workers depend on it.
 
+**File layout.** `src/` and `test/` were reorganized into algorithm-stage
+folders on 2026-09-22. `src/...`/`test/...` paths below have been rewritten to
+the current files (with stale line numbers dropped); bare file names and line
+numbers inside historical entries still refer to the layout of their time:
+
+| old | now |
+| --- | --- |
+| `src/target.jl` | `src/hardware/target.jl` |
+| `src/axis_group.jl`, `src/tiles.jl` | `src/layout/` (plus `src/layout/pair_group.jl`, out of `driver.jl`) |
+| `src/kernel_descriptor.jl`, `src/complex_format.jl` | `src/packing/format.jl` (the `ComplexMethod` traits: `src/microkernels/interface.jl`) |
+| `src/panel.jl`, `src/packing.jl` | `src/packing/panel.jl`, `src/packing/pack.jl`, `src/packing/pack_contiguous.jl` |
+| `src/kernel.jl`, `src/kernels/*.jl` | `src/microkernels/interface.jl`, `src/microkernels/scalar.jl`, `src/microkernels/{simd,planar,onem}.jl` |
+| `src/driver.jl` | `src/planning/{labels,conjugation,kernel_selection,plan}.jl`, `src/execution/{macrokernel,execute,oracle}.jl` |
+| `src/blocking.jl`, `src/workspace.jl` | `src/planning/blocking.jl`, `src/execution/workspace.jl` |
+| `src/tensoroperations.jl` | `src/integrations/tensoroperations.jl` |
+| `test/test_driver.jl` | `test/helpers.jl`, `test/planning/test_plan_contract.jl`, `test/execution/test_{execute,workspace}.jl` |
+| `test/test_target.jl` | `test/hardware/test_target.jl`, `test/planning/test_kernel_selection.jl` |
+| `test/test_packing.jl` | `test/layout/test_tiles.jl`, `test/packing/test_pack_real.jl` |
+| `test/test_phase2_integration.jl`, `test/test_phase3_integration.jl` | `test/execution/test_manual_pipeline.jl`, `test/execution/test_scalar_vs_simd.jl` |
+| `test/test_macro_driver.jl`, `test/test_per_call_floor.jl`, `test/test_quality.jl` | `test/execution/test_macro_blocking.jl`, `test/planning/test_per_call_overhead.jl`, `test/quality/test_aqua.jl` |
+| other `test/test_*.jl` | the matching `test/<stage>/` folder |
+
+Renamed internals: `_legacy_shape`/`_legacy_blocking` are now
+`_fallback_shape`/`_fallback_blocking`, `_complex_kernel_from_shape` is
+`_kernel_from_shape(shape, T, method)`, `_default_complex_method` is
+`_default_method`, `_rule_applies_complex(isa)` is `_rule_applies(isa,
+method)`, `_complex_fitted_shape` is `_fitted_shape(profile, T,
+PlanarMethod())`, and `KernelDescriptor`/`ComplexKernelDescriptor` are aliases
+of one `Descriptor{MR,NR,T,FA,FB}`.
+
 ## Frozen interfaces
 
 ### `contract!` entry point (Phase 0)
@@ -60,17 +90,17 @@ axis-list front end per the handoff (no einsum string parsing).
 | File | Owner | Phase |
 | --- | --- | --- |
 | `Project.toml`, `src/QuasiStrided.jl`, `test/runtests.jl`, this file, `STATUS.md` | main process | all |
-| `src/axis_group.jl` | indexing implementer | 1 |
-| `test/test_axis_group.jl` | oracle/test implementer | 1 |
-| `test/strided_integration.jl` | oracle/test implementer | 1 |
-| `src/tiles.jl` | packing implementer | 2 |
-| `src/packing.jl` | packing implementer | 2 |
-| `test/test_packing.jl` | packing implementer | 2 |
-| `src/kernel.jl` | scalar implementer | 2 |
-| `test/test_kernel.jl` | scalar implementer | 2 |
-| `src/kernels/simd.jl` | SIMD implementer | 3 |
-| `src/driver.jl` | driver implementer | 3 |
-| `test/test_driver.jl` | driver implementer | 3 |
+| `src/layout/axis_group.jl` | indexing implementer | 1 |
+| `test/layout/test_axis_group.jl` | oracle/test implementer | 1 |
+| `test/layout/test_stridedviews_axisgroup.jl` | oracle/test implementer | 1 |
+| `src/layout/tiles.jl` | packing implementer | 2 |
+| `src/packing/pack.jl` | packing implementer | 2 |
+| `test/packing/test_pack_real.jl` | packing implementer | 2 |
+| `src/microkernels/interface.jl` | scalar implementer | 2 |
+| `test/microkernels/test_scalar_kernel.jl` | scalar implementer | 2 |
+| `src/microkernels/simd.jl` | SIMD implementer | 3 |
+| `src/execution/execute.jl` | driver implementer | 3 |
+| `test/execution/test_execute.jl` | driver implementer | 3 |
 | `benchmark/*.jl` | respective implementer of the component benchmarked | 1-3 |
 | `README.md` | main process (content from all phases) | 4 |
 
@@ -90,7 +120,7 @@ Two reconciliations, both anticipated by each worker's own task instructions
 (neither worker was told to block on the other):
 
 1. **Destination-tile type drift.** The scalar implementer (owning
-   `src/kernel.jl`) was explicitly told not to block on `src/tiles.jl`
+   `src/microkernels/interface.jl`) was explicitly told not to block on `src/layout/tiles.jl`
    landing, and wrote its own `ScalarDestination` (closures for row/col
    addressing) rather than depending on the packing implementer's real
    `QSTile`/`DestinationTile`. Both express the same addressing contract
@@ -98,7 +128,7 @@ Two reconciliations, both anticipated by each worker's own task instructions
    Fix: added `scale_tile!`/`store_tile!`/`execute_tile!` methods dispatching
    on `QSTile` directly (mirroring the `ScalarDestination`-typed methods
    line-for-line, substituting `nrows`/`ncols`/`tile_load`/`tile_store!` for
-   `destination.m`/`.n`/closures) to `src/kernel.jl`. **`DestinationTile` +
+   `destination.m`/`.n`/closures) to `src/microkernels/interface.jl`. **`DestinationTile` +
    these new methods is the path Phase 3's driver should use**;
    `ScalarDestination` remains only as the scalar worker's own test
    scaffolding and is not exported.
@@ -106,7 +136,7 @@ Two reconciliations, both anticipated by each worker's own task instructions
    dispatch on a bare `KernelDescriptor`; `ScalarKernel` (scalar implementer)
    wraps one rather than being one, so passing a `ScalarKernel` straight
    through to `pack_a!`/`pack_b!` was a `MethodError`. Fix: two one-line
-   forwarding methods in `src/kernel.jl`,
+   forwarding methods in `src/microkernels/interface.jl`,
    `pack_a!(packed, source, k::ScalarKernel, transform) = pack_a!(packed, source, k.descriptor, transform)`
    (and same for `pack_b!`). Any future concrete kernel wrapping a
    `KernelDescriptor` as a `.descriptor` field should add the same two
@@ -132,13 +162,13 @@ findings kept in `STATUS.md`'s history is unnecessary; disposition of each:
 1. **[blocking, FIXED]** `pack_a!`/`pack_b!` never validated reachable
    source-storage bounds before `@inbounds` reads. Added
    `axis_offset_range` (per-axis min/max offset, `Int128`-checked) and
-   `checked_tile_storage_bounds` (`src/tiles.jl`, exported), called once per
-   tile in `pack_a!`/`pack_b!` before their loops (`src/packing.jl`).
+   `checked_tile_storage_bounds` (`src/layout/tiles.jl`, exported), called once per
+   tile in `pack_a!`/`pack_b!` before their loops (`src/packing/pack.jl`).
 2. **[blocking, FIXED]** `execute_tile!` on a real `DestinationTile`
    (`QSTile`) validated shape (`m<=MR`,`n<=NR`) but never storage bounds
    before `scale_tile!`/`store_tile!`'s `@inbounds` writes. Added the same
    `checked_tile_storage_bounds` call in `execute_tile!` (the `QSTile`
-   overload in `src/kernel.jl`), before both the short-circuit and the full
+   overload in `src/microkernels/interface.jl`), before both the short-circuit and the full
    accumulate/store path (the review's reproducer used a short-circuit call,
    so the check had to precede that branch too, not just the main path).
    `scale_tile!`/`store_tile!` themselves remain intentionally unchecked hot
@@ -148,7 +178,7 @@ findings kept in `STATUS.md`'s history is unnecessary; disposition of each:
 3. **[should-fix, FIXED]** Neither `execute_tile!` overload validated
    `packed_a`/`packed_b` length against `packed_a_length`/`packed_b_length(kernel,kc)`
    before `accumulate`'s `@inbounds` reads. Added `DimensionMismatch` checks
-   in both overloads in `src/kernel.jl`, positioned after the short-circuit
+   in both overloads in `src/microkernels/scalar.jl`, positioned after the short-circuit
    (kc=0/alpha=0 legitimately doesn't need the buffers, so an undersized
    buffer that is never read must not be rejected — a case added as a test).
 4. **[should-fix, FIXED]** `QSTile`/`DestinationTile` execution path had no
@@ -176,14 +206,14 @@ findings kept in `STATUS.md`'s history is unnecessary; disposition of each:
    (`_pack_panel!`) their own free type parameters. No signature, contract,
    or packed-offset-formula change. The identical bug recurred one layer up
    in `ScalarKernel`'s and `SIMDKernel`'s `pack_a!`/`pack_b!` forwarding
-   methods (`src/kernel.jl`, `src/kernels/simd.jl` — untyped `kernel`/
+   methods (`src/microkernels/interface.jl`, `src/microkernels/simd.jl` — untyped `kernel`/
    `transform` parameters), found and fixed by the main process with the
    same pattern (the diagnosis task was correctly scoped to not touch those
    two files, so it flagged this precisely rather than exceeding scope).
    Verified zero allocation, after warmup, for both `pack_a!`/`pack_b!`
    called directly with `KernelDescriptor` and via both kernel forwarding
    paths, across affine/scattered sources, `kc=0`, and a nontrivial
-   transform. Regression tests in `test/test_packing.jl`.
+   transform. Regression tests in `test/packing/test_pack_real.jl`.
    **Residual, newly observed, NOT part of this fix**: `execute!` through
    the driver still allocates (measured: ScalarKernel ~10.7KB, SIMDKernel
    ~5.9KB for a 9x10x8 case with 2 K-panels) — smaller than before this fix
@@ -191,12 +221,12 @@ findings kept in `STATUS.md`'s history is unnecessary; disposition of each:
    (176 B/call, a `Matrix{T}`) is spec-accepted and not a bug (see design
    doc section 8: acceptable for the scalar reference, unlike SIMD, whose
    `zero_accumulator` measures 0 B). The rest of the residual is in
-   `src/driver.jl`'s own tiling loop, not diagnosed here — this fix was
+   `src/execution/execute.jl`'s own tiling loop, not diagnosed here — this fix was
    correctly scoped to `pack_a!`/`pack_b!` only, per its task instructions,
    and did not touch the driver. Left as a new, smaller, open item — see
    `STATUS.md`.
 6. **[note, ACCEPTED]** `accumulate` is a `Base.accumulate` method, not a
-   fresh binding — kept as documented in `src/kernel.jl` (avoids an
+   fresh binding — kept as documented in `src/microkernels/scalar.jl` (avoids an
    `export`/`Base` name collision under `using QuasiStrided`); no better
    option without renaming the frozen public API.
 7. **[note, ACCEPTED]** `AffineAxis.stride*t` is a single multiplication, not
@@ -216,19 +246,19 @@ findings kept in `STATUS.md`'s history is unnecessary; disposition of each:
 ## Phase 3 integration notes
 
 Two workers (SIMD implementer, driver implementer) ran in parallel with
-disjoint file ownership (`src/kernels/simd.jl`+`test/test_simd_kernel.jl` vs
-`src/driver.jl`+`test/test_driver.jl`) and, unlike Phase 2, needed almost no
+disjoint file ownership (`src/microkernels/simd.jl`+`test/microkernels/test_simd_kernel.jl` vs
+`src/execution/execute.jl`+`test/execution/test_execute.jl`) and, unlike Phase 2, needed almost no
 reconciliation: both independently followed the `ScalarKernel` pattern
 (wrap `KernelDescriptor`, forward `mr`/`nr`/`scalartype`/`packed_*`, add
 `pack_a!`/`pack_b!` forwarding methods per the Phase 2 integration note),
 so `SIMDKernel` slotted into the driver as a drop-in `kernel=` swap with zero
-source changes to `src/driver.jl`. Main process integration work:
+source changes to `src/planning/plan.jl`. Main process integration work:
 
 1. Exported `SIMDKernel`, `lanewidth`, `avecs_per_column` (from
    `kernels/simd.jl`) and `plan_contract`, `execute!`, `ContractPlan` (from
    `driver.jl`) in `src/QuasiStrided.jl` — neither worker could edit that
    file themselves.
-2. Added `test/test_simd_kernel.jl` and (new, main-process-owned)
+2. Added `test/microkernels/test_simd_kernel.jl` and (new, main-process-owned)
    `test/test_phase3_integration.jl` to `test/runtests.jl`'s include list.
 3. `test/test_phase3_integration.jl`: verifies `plan_contract`/`execute!`
    actually accept `SIMDKernel` in place of the default `ScalarKernel` and
@@ -257,8 +287,8 @@ a single machine, single microarchitecture, not a cross-machine claim).
 
 ## Phase 4 review: findings and disposition
 
-Sonnet High review of everything since Phase 2b (`src/kernels/simd.jl`,
-`src/driver.jl`, `test/test_phase3_integration.jl`), 2026-09-08. No blocking
+Sonnet High review of everything since Phase 2b (`src/microkernels/simd.jl`,
+`src/execution/execute.jl`, `test/test_phase3_integration.jl`), 2026-09-08. No blocking
 findings — confirmed the Phase 2b bounds checks are not bypassed anywhere in
 the driver's tiling loop or in `SIMDKernel`'s own `execute_tile!`, beta is
 applied exactly once per output tile across K panels, and label
@@ -271,12 +301,12 @@ closed:
    *lower*, not higher, allocation than `ScalarKernel` through the driver —
    both nonzero only from the already-deferred `pack_a!`/`pack_b!` finding).
    Added a permanent regression test,
-   `test/test_driver.jl`'s "execution allocation through SIMDKernel is not
+   `test/planning/test_plan_contract.jl`'s "execution allocation through SIMDKernel is not
    worse than ScalarKernel" testset, asserting this rather than relying on a
    one-off manual check.
 2. `_classify_labels`'s dangling-only-in-B case ((F,T,F) — a distinct code
    path from the dangling-only-in-A case, the B loop rather than the A
-   loop) was untested. Added to `test/test_driver.jl`'s label-validation
+   loop) was untested. Added to `test/planning/test_plan_contract.jl`'s label-validation
    testset.
 
 Driver-level benchmark (Cascade Lake, 64x64x64 contraction, MR=8/NR=6,
@@ -357,10 +387,10 @@ as a hard target: 0 B for `SIMDKernel` on Julia >= 1.11, bounded for
 2. `axis_from_descriptor(descriptor::BlockDescriptor, buffer::Vector{Int}, first::Int)`
    — `AffineAxis` when regular, else `ScatterAxis(view(buffer, first+1 :
    first+count), count)`. Existing 2-arg form forwards with `first = 0`.
-3. `pack_a!`/`pack_b!` (`src/packing.jl`) widen their `packed` parameter from
+3. `pack_a!`/`pack_b!` (`src/packing/pack.jl`) widen their `packed` parameter from
    `Vector{T}` to `AbstractVector{T}`, so a macro panel view can be packed
    into directly. `_check_packed_eltype` and `_pack_panel!` widen the same
-   way. `src/kernel.jl`'s two forwarding methods (`pack_a!`/`pack_b!` for
+   way. `src/microkernels/interface.jl`'s two forwarding methods (`pack_a!`/`pack_b!` for
    `DescriptorKernel`) widen identically — this was the exact site of the
    Phase 2b finding-5 recurrence (missing `where`-bound forwarding
    parameter), so the Phase B implementer must re-verify zero allocation on
@@ -416,13 +446,13 @@ them with sweep-measured values and records provenance here.
 
 | File | Owner | Phase |
 | --- | --- | --- |
-| `src/axis_group.jl` (additive `describe_block`/related methods only), `src/tiles.jl` (additive `axis_from_descriptor` only), `src/packing.jl` (`AbstractVector` widening only), `test/test_axis_group.jl`/`test_packing.jl` (additive tests) | interface implementer | Macro-B |
-| `src/blocking.jl` (new), `src/driver.jl`, `test/test_driver.jl` | macro-kernel implementer | Macro-C |
-| `test/test_macro_driver.jl` (new) | oracle/test implementer | Macro-C |
+| `src/layout/axis_group.jl` (additive `describe_block`/related methods only), `src/layout/tiles.jl` (additive `axis_from_descriptor` only), `src/packing/pack.jl` (`AbstractVector` widening only), `test/layout/test_axis_group.jl`/`test_packing.jl` (additive tests) | interface implementer | Macro-B |
+| `src/planning/blocking.jl` (new), `src/execution/execute.jl`, `test/planning/test_plan_contract.jl` | macro-kernel implementer | Macro-C |
+| `test/execution/test_macro_blocking.jl` (new) | oracle/test implementer | Macro-C |
 | `benchmark/bench_driver.jl` (new) | benchmark implementer | Macro-E |
 
-`src/kernel.jl` (beyond the two forwarding methods above), `src/kernels/simd.jl`,
-`src/kernel_descriptor.jl` remain frozen this milestone.
+`src/microkernels/interface.jl` (beyond the two forwarding methods above), `src/microkernels/simd.jl`,
+`src/packing/format.jl` remain frozen this milestone.
 
 ## Phase D: Fable review of the integrated macro path
 
@@ -452,7 +482,7 @@ Disposition of each finding:
    internal "carry" boundary to break the constant-stride sequence. The
    reviewer verified correctness via an ad hoc 160-combination scratch
    check, not a committed test. Added
-   `test/test_macro_driver.jl`'s "irregular sliver at nonzero offset
+   `test/execution/test_macro_blocking.jl`'s "irregular sliver at nonzero offset
    (multi-label M group)" testset: a 2-label M group (`a`,`q`) where `A`'s
    map is naturally contiguous (regular even across the `a`/`q` boundary)
    but `C`'s map is deliberately padded so it fails the affine-fold
@@ -473,7 +503,7 @@ Disposition of each finding:
    could not construct a failing input (offsets come from the validated
    `AxisGroup`). Not fixed: no demonstrated failure, and it predates this
    milestone.
-3. **[note, ACCEPTED]** `test/test_macro_driver.jl`'s buffer-poisoning
+3. **[note, ACCEPTED]** `test/execution/test_macro_blocking.jl`'s buffer-poisoning
    testset can only detect read-before-fill, not intra-call staleness (the
    actual macro-blocking risk) — but the small-random-block cases in
    testset 1 (`mc,kc,nc ∈ 1:13` against shapes up to 37) are what would
@@ -508,7 +538,7 @@ cutting):
 * Shapes: `64^3`, `128^3`, `256^3`, `512^3`, a shallow-K case
   (`256x24x256`), `1024x256x1024`, and a 3-index scattered/sliced-C-row
   case (`A[a,k,b] B[k,n] -> C[a,n,b]`, `a=64,k=64,b=16,n=64`, adapted
-  directly from `test/test_macro_driver.jl`'s permuted-A /
+  directly from `test/execution/test_macro_blocking.jl`'s permuted-A /
   negative-stride-B / sliced-with-offset-C fixture). 512^3 was not skipped
   — the trial run showed 256^3 costs only ~5 ms/`execute!` call
   (`ScalarKernel`), so 512^3 (~40 ms) fit the full grid comfortably.
@@ -638,10 +668,10 @@ explicit `using TensorOperations: <names>` list restricted to names that do
 not collide with QuasiStrided's own (`Index2Tuple`, `linearize` are safe).
 A bare `using TensorOperations` is **not** permitted: TO exports
 `scalartype` (re-exported from VectorInterface) and QuasiStrided defines its
-own, unrelated `scalartype` in `src/kernel_descriptor.jl`. Which binding
+own, unrelated `scalartype` in `src/packing/format.jl`. Which binding
 wins then depends on definition ordering inside the module, which is exactly
 the kind of implicit coupling this record exists to prevent. Every TO name
-used in `src/tensoroperations.jl` is written `TO.<name>` unless it appears
+used in `src/integrations/tensoroperations.jl` is written `TO.<name>` unless it appears
 in the explicit `using ... : ...` list.
 
 ### `QuasiStridedBackend`
@@ -681,7 +711,7 @@ never silently routes the work elsewhere.
    backend implements contraction only and pointing at using a different
    `backend=` for networks that need add/trace. QuasiStrided has no
    `tensoradd!`/`tensortrace!` analog and no diagonal/trace support at all
-   (`src/driver.jl`'s `_classify_labels` rejects repeated labels), so there
+   (`src/planning/labels.jl`'s `_classify_labels` rejects repeated labels), so there
    is nothing to delegate to.
 2. `TO.tensorcontract!(..., ::QuasiStridedBackend, ...)` throws
    `ArgumentError` for every ineligible input class — wrong or mixed
@@ -756,7 +786,7 @@ all(StridedViews.isstrided, (A, B, C))
 ```
 
 Anything else throws (previous subsection). The eltype restriction is not a
-convenience: `src/kernel_descriptor.jl` throws unless
+convenience: `src/packing/format.jl` throws unless
 `T === Float32 || T === Float64`, and `default_blocking` only has measured
 constants for those two.
 
@@ -772,7 +802,7 @@ which is unconditionally `false` for real `T`.
 The consequences are binding on T4 and on any later relaxation of the
 eltype restriction:
 
-- `src/tensoroperations.jl` must carry this reasoning as a source comment at
+- `src/integrations/tensoroperations.jl` must carry this reasoning as a source comment at
   the point where `conjA`/`conjB` are dropped — not as a silent omission.
 - T6/T2 must include a test that pins it (real operands with `conjA`/
   `conjB` set true still give results identical to `StridedNative()`).
@@ -861,7 +891,7 @@ left to TO's `argcheck_tensorcontract`, which the adapter calls first
 **Index-model coverage.** QuasiStrided's index model covers TO's contraction
 index space exactly: diagonal labels, batch labels, C-only labels and
 dangling labels cannot arise from `pA`/`pB`/`pAB`, which are permutations by
-construction. `_classify_labels`' rejection paths in `src/driver.jl` are
+construction. `_classify_labels`' rejection paths in `src/planning/labels.jl` are
 therefore dead code *from this entry point* — they stay, because
 `contract!` remains reachable directly, but no new index-model work is
 needed this milestone. Empty index groups (outer products, full contraction
@@ -919,7 +949,7 @@ pure, side-effect-free, and the identity on an operand that is already a
 operands are strided, so the wrap cannot itself throw where the old order
 would not have. Verified by re-running the full suite (13167 → 13171, no
 regressions) and by the `"C is a PermutedDimsArray of A"` regression testset
-in `test/test_tensoroperations.jl`.
+in `test/integrations/test_tensoroperations.jl`.
 
 ### Amendment 1: `ContractWorkspace` and the `allocator` keyword
 
@@ -1003,8 +1033,8 @@ of which allocator branch is taken":
   crossing a function boundary into packing or kernel code.** Verify with
   `@code_warntype` exactly as Phase C did.
 - **Offset buffers stay `Vector{Int}`, unconditionally.** `fill_offsets!`
-  (`src/axis_group.jl:136`), `block_descriptors!` (`:261`),
-  `describe_block` (`:227`) and `axis_from_descriptor` (`src/tiles.jl:82`)
+  (`src/layout/axis_group.jl`), `block_descriptors!` (`:261`),
+  `describe_block` (`:227`) and `axis_from_descriptor` (`src/layout/tiles.jl`)
   are all frozen with concrete `Vector{Int}` parameters. Widening them is
   explicitly **out of scope** this milestone. The offset buffers are
   therefore acquired with `Val(false)`, which yields a real `Vector{Int}`
@@ -1046,7 +1076,7 @@ of which allocator branch is taken":
 ### Amendment 2: `SIMDKernel` becomes the default kernel
 
 `_default_kernel(::Type{T}) = ScalarKernel(Val(8), Val(6), T)`
-(`src/driver.jl:109`) becomes `SIMDKernel(Val(8), Val(6), T)`, engine-wide —
+(`src/planning/kernel_selection.jl`) becomes `SIMDKernel(Val(8), Val(6), T)`, engine-wide —
 for the frozen `contract!` entry point, for `plan_contract`'s own `kernel`
 keyword default, and for the new backend path alike. This is a deliberate
 amendment to the default as it stands in the macro-blocking milestone's
@@ -1074,7 +1104,7 @@ default therefore changes the *allocation* profile of the default path on
   the gap stays visible rather than hidden.
 - Any allocation assertion added this milestone against the default path
   must be marked `skip=(VERSION < v"1.11")`, matching the existing treatment
-  in `test/test_simd_kernel.jl` — weakening or deleting such an assertion is
+  in `test/microkernels/test_simd_kernel.jl` — weakening or deleting such an assertion is
   not an acceptable alternative.
 - `README.md` (T12) states the default kernel and this caveat.
 
@@ -1126,22 +1156,22 @@ script needs the same one-line treatment. **T1 is behavior-neutral: the
 
 | File | Owner | Phase |
 | --- | --- | --- |
-| `src/tensoroperations.jl` (new) | TO-adapter implementer | TO-B (T4), TO-C (T5) |
-| `src/workspace.jl` (new), `src/driver.jl`, `test/test_driver.jl` | workspace implementer | TO-B (T3) |
+| `src/integrations/tensoroperations.jl` (new) | TO-adapter implementer | TO-B (T4), TO-C (T5) |
+| `src/execution/workspace.jl` (new), `src/execution/execute.jl`, `test/execution/test_workspace.jl` | workspace implementer | TO-B (T3) |
 | `src/QuasiStrided.jl` (export/`public`/`include` blocks), `test/runtests.jl`, `benchmark/bench_axis_group.jl`, `benchmark/bench_driver.jl` (name-restoring `using` blocks only) | API-split implementer | TO-B (T1) |
-| `test/test_tensoroperations.jl` (new) | TO-comparison test author (blind) | TO-B (T6), then TO-C (T2) |
+| `test/integrations/test_tensoroperations.jl` (new) | TO-comparison test author (blind) | TO-B (T6), then TO-C (T2) |
 | `Project.toml`, `.github/workflows/CI.yml` | packaging implementer | TO-B (T7) |
-| `test/test_quality.jl` (new) | quality-gate implementer | TO-C (T8) |
+| `test/quality/test_aqua.jl` (new) | quality-gate implementer | TO-C (T8) |
 | `benchmark/bench_tensoroperations.jl` (new) | TO-benchmark implementer | TO-D (T9) |
-| `README.md`, docstrings in `src/tensoroperations.jl` | main process | TO-F (T12) |
+| `README.md`, docstrings in `src/integrations/tensoroperations.jl` | main process | TO-F (T12) |
 | `docs/decisions.md`, `STATUS.md` | main process | all |
 
 Known, anticipated collision: T1 and T4 both edit `src/QuasiStrided.jl` (one
 rewrites the `export` blocks and adds the `public` block, the other adds one
 `include` and one `export`). Reconcile at integration, as Phase 2 and
 Phase 3 of the bootstrap milestone already did; neither worker blocks on the
-other. `src/axis_group.jl`, `src/tiles.jl`, `src/packing.jl`,
-`src/kernel.jl`, `src/kernels/simd.jl` and `src/kernel_descriptor.jl` are
+other. `src/layout/axis_group.jl`, `src/layout/tiles.jl`, `src/packing/pack.jl`,
+`src/microkernels/interface.jl`, `src/microkernels/simd.jl` and `src/packing/format.jl` are
 **frozen** this milestone — the offset-buffer typing constraint above exists
 precisely so none of them needs to change.
 
@@ -1157,7 +1187,7 @@ at TensorOperations' `test/tblis.jl` as the structural template.
 
 T6 is **authored blind**, per this repo's established practice: its author
 works from this frozen section and from `test/tblis.jl`, and must not read
-`src/tensoroperations.jl`. T2 comes strictly after both T6 and the adapter
+`src/integrations/tensoroperations.jl`. T2 comes strictly after both T6 and the adapter
 integration, and adds only what someone who has read the adapter can write.
 
 ## TensorOperations integration milestone: close
@@ -1179,7 +1209,7 @@ disposition would otherwise have no home in the authoritative *why* record.
 
 ### What shipped
 
-1. **The adapter** — `src/tensoroperations.jl` (new, 378 lines). One
+1. **The adapter** — `src/integrations/tensoroperations.jl` (new, 378 lines). One
    `TO.tensorcontract!` method on `::QuasiStridedBackend`, plus
    `TO.tensoradd!`/`TO.tensortrace!` methods that throw `ArgumentError`
    unconditionally. `QuasiStridedBackend` is the package's single exported
@@ -1193,7 +1223,7 @@ disposition would otherwise have no home in the authoritative *why* record.
    verbatim from the frozen snippet, with only the `TO.numout`/`TO.numin`
    qualification the import convention requires. No `TO.select_backend`
    method exists, and no path falls back: every ineligible input throws.
-2. **Workspace pooling** — `src/workspace.jl` (new) factors the packed and
+2. **Workspace pooling** — `src/execution/workspace.jl` (new) factors the packed and
    offset buffers out of `ContractPlan` into
    `ContractWorkspace{T,VT<:AbstractVector{T}}`, with `reserve!`
    (grow-only, never shrink, never a `view`) and `release!`.
@@ -1216,9 +1246,9 @@ disposition would otherwise have no home in the authoritative *why* record.
    `contract!`, `plan_contract` and the backend path alike, with the Julia
    1.10 allocation caveat carried into `README.md` and the CI matrix left
    intact so it stays visible.
-5. **Tests and packaging** — `test/test_tensoroperations.jl` (new, 521
+5. **Tests and packaging** — `test/integrations/test_tensoroperations.jl` (new, 521
    lines; T6 authored blind against `StridedNative`/`StridedBLAS`, extended
-   by T2 after integration), `test/test_quality.jl` (new; `Aqua.test_all`
+   by T2 after integration), `test/quality/test_aqua.jl` (new; `Aqua.test_all`
    with `ambiguities=false` and `unbound_args=false`, each disabled with a
    recorded, reproduced justification — the piracy check that matters for
    adding methods to TO's generics stays on). `Project.toml` gained
@@ -1325,7 +1355,7 @@ fixed by T11:
    order, is the "Addendum (T11, 2026-09-09)" under "Required
    argument-checking order in the adapter" above. Pinned by the
    `"C is a PermutedDimsArray of A"` regression testset in
-   `test/test_tensoroperations.jl`. This is an upstream `Base` gap that
+   `test/integrations/test_tensoroperations.jl`. This is an upstream `Base` gap that
    `StridedNative`/`StridedBLAS` share; the adapter closes it for its own
    path only.
 2. **[should-fix, FIXED]** `README.md`'s allocation claim overstated what
@@ -1452,7 +1482,7 @@ listed "CPU-dispatch tables" as not implemented.
 **What survives, unchanged:**
 
 * No analytical or probing model ever chooses a number at runtime. Nothing in
-  this milestone computes a block size from a cache size. `src/target.jl` now
+  this milestone computes a block size from a cache size. `src/hardware/target.jl` now
   *detects* cache sizes, ways and sharing, and `default_blocking` deliberately
   does not consult any of it — see "Why cache geometry is still not used".
 * No probing at package load or at first call. `__init__` does one dictionary
@@ -1656,11 +1686,11 @@ against this machine's ~115 GFLOP/s peak:
 | (16,14,8) | 28 | 25.8 | **101.8** |
 | (32,6,8) | 24 | 26.9 | **102.6** |
 
-`src/driver.jl` hands each micro-tile `view(ws.packed_a, _sliver_range(...))`.
+`src/execution/execute.jl` hands each micro-tile `view(ws.packed_a, _sliver_range(...))`.
 That costs nothing up to `NV = 16` and about **4x above it**: the view's
 address arithmetic stops the `NTuple{NV,Vec{W,T}}` accumulator from staying
 register-resident. Confirmed independently by profiling `(16,14,8)` through the
-driver — 388 of 560 self samples land on `src/kernels/simd.jl:147`, the K-loop
+driver — 388 of 560 self samples land on `src/microkernels/simd.jl`, the K-loop
 line itself, i.e. the accumulator round-trip, and none do for `(16,8,8)` — and
 by a temporary driver patch that copies each sliver into a plain `Vector`
 before the kernel call, which took `(16,14,8)` at 256^3 from 22.2 to 37.4
@@ -1761,7 +1791,7 @@ A raw pointer removes the cliff *and* beats a plain `Vector` at every shape,
 because the base address is loop-invariant by construction. Critically this
 needs **no new dependency**: `SIMD.vload` already accepts a `Ptr{T}`.
 
-Shipped as `PackedPanel` (`src/panel.jl`): a borrowed `(ptr, len)` pair, with
+Shipped as `PackedPanel` (`src/packing/panel.jl`): a borrowed `(ptr, len)` pair, with
 `panel_vload`/`panel_load`/`panel_store!` accessors that also have
 `AbstractVector` methods, so every existing caller and the whole test suite
 keeps working with `Vector`s and `view`s. `len` is carried only so
@@ -1798,7 +1828,7 @@ Two things worth recording about how this was found. First, **a Float32
 default shipped in Phase G allocated 24576 B per call on scattered
 contractions** and the suite did not catch it: the existing allocation
 assertions all use plain, regular contractions, and this only manifests on an
-irregular destination. `test/test_target.jl` now asserts zero allocation
+irregular destination. `test/hardware/test_target.jl` now asserts zero allocation
 through a permuted-A / negative-stride-B / sliced-C fixture at the shipped
 defaults — the case this engine exists for. Second, the initial diagnosis was
 wrong: `_acc_lane`'s dynamic tuple indexing in `store_tile!` looked like the
@@ -1807,7 +1837,7 @@ generated, statically-indexed scattered store was kept anyway (it is a
 genuine improvement to that path), but the finding is that guessing cost a
 round trip and the allocation profiler settled it in one command.
 
-Fixed by `PtrScatterAxis` (`src/tiles.jl`): the same borrowed-pointer idea as
+Fixed by `PtrScatterAxis` (`src/layout/tiles.jl`): the same borrowed-pointer idea as
 `PackedPanel`, holding `Ptr{Int} + count` instead of a vector, so it is
 `isbits` and `Union{AffineAxis,PtrScatterAxis}` lives in a tagged stack slot.
 `Base.isbitsunion` confirms it. `ScatterAxis` is unchanged and remains the
@@ -1887,7 +1917,7 @@ specifically for Julia v1.12 support — a large, compiler-fragile package on
 grant funding. It is also unnecessary: the valuable idea was the addressing
 layer, and that was reproduced with `SIMD.vload(Vec{W,T}, ::Ptr{T})` and zero
 new dependencies. Noted for a future maintainer: `CPUSummary.jl` is a
-better-tested replacement for `src/target.jl`'s cache detection (it already
+better-tested replacement for `src/hardware/target.jl`'s cache detection (it already
 reports cache inclusivity, and divides L3 by the number of sharing cores),
 and `LayoutPointers`/`StrideArraysCore` provide `gesp`/`PtrArray`, if a
 dependency ever becomes acceptable.
@@ -1953,18 +1983,18 @@ names the legacy kernel. Naming the kernel already picks up the matching
 blocking through `default_blocking(kernel)`, so no second mechanism is needed.
 
 This is the same decision, for the same reason, as `_shape_override(::Val,
-::Type) = nothing` in `src/driver.jl` -- "deliberately empty: ... a row here
+::Type) = nothing` in `src/planning/kernel_selection.jl` -- "deliberately empty: ... a row here
 would only pin this package to one machine's noise" (Phase H). Every
 planar-vs-1m ratio this milestone reports names `ccqlin038`.
 
 ### The frozen packed format is preserved, not extended
 
-`src/kernel_descriptor.jl` stays **completely unmodified**: its `T` remains the
+`src/packing/format.jl` stays **completely unmodified**: its `T` remains the
 real type, its `T === Float32 || T === Float64` guard remains, and
 `packed_a_offset`/`packed_b_offset`/`packed_a_length`/`packed_b_length` on
 `KernelDescriptor` remain as written. It is the *real-panel* descriptor.
 
-`src/complex_format.jl` (new) introduces a strictly more general offset formula
+`src/packing/format.jl` (new) introduces a strictly more general offset formula
 under new names on a new type, `ComplexKernelDescriptor{MR,NR,T,FA,FB}`:
 
     p * reg_tile * reals_per_element  +  plane * reg_tile  +  index
@@ -2015,7 +2045,7 @@ loop nest").
         descriptor::ComplexKernelDescriptor{MR,NR,T,OneEFormat,PlanarFormat}
         inner::SIMDKernel{2MR,NR,real(T),W}
 
-Both carry a field named `descriptor`, so **`src/kernel.jl` needs no changes at
+Both carry a field named `descriptor`, so **`src/microkernels/interface.jl` needs no changes at
 all**: `mr`/`nr`/`scalartype`/`packed_a_length`/`packed_b_length` forward through
 the existing `DescriptorKernel` methods, and `pack_a!`/`pack_b!` forward through
 the existing generic whose per-argument `where` bounds are the Phase 2b finding-5
@@ -2240,7 +2270,7 @@ forwarded with per-argument bound type parameters, and already tested
 ("transform is never called on padding lanes", via call counting). The driver's
 `_pack_sliver!` stops hardcoding `identity` and takes `transform::TF` with **its
 own bound type parameter** -- leaving it unbound reintroduces finding 5, as the
-comment at `src/kernel.jl:30-33` says in as many words.
+comment at `src/microkernels/interface.jl` says in as many words.
 
 Three call sites, and the third is the trap: `_execute_nest!`'s `pack_b!` and
 `pack_a!` calls, and **`execute_tilewise!`'s**. If the third is missed, the
@@ -2367,7 +2397,7 @@ Four oracle layers, following this project's existing practice:
    iteration draw `conjA`/`conjB` and draw `opA`/`opB` from
    `(identity, conj, adjoint, transpose)`, under `Random.seed!` so failures
    reproduce. Exhaustive enumeration is reserved for the microsecond-scale matmul
-   fixture in `test/test_tensoroperations.jl`, whose `conjA, conjB ∈ (false,true)`
+   fixture in `test/integrations/test_tensoroperations.jl`, whose `conjA, conjB ∈ (false,true)`
    loop already exists and simply becomes non-trivial.
 
 Plus: a cache-crossing case **per method**, since each method has its own `mc`;
@@ -2389,7 +2419,7 @@ zero-allocation assertions hold unchanged and are duplicated for complex; (4) th
 "no union-typed or partially-applied types reach the nest" assertion extends to
 the complex path and the new `TF` parameter; (5) a measured regression guard.
 
-`test/test_target.jl`'s register-budget assertion `(MR÷W)*NR + MR÷W <= 32` is
+`test/planning/test_kernel_selection.jl`'s register-budget assertion `(MR÷W)*NR + MR÷W <= 32` is
 **generalised, not widened**: keep it verbatim and add a method-aware complex
 assertion driven by the detected `nregisters` rather than a literal 32, since
 planar carries separate real and imaginary accumulator planes.
@@ -2470,13 +2500,13 @@ threading; GPU; autotuning; K padding.
 
 | File | Owner | Phase |
 | --- | --- | --- |
-| `src/complex_format.jl` (new) | main process (freeze), then packing implementer | A, B2 |
-| `src/kernels/planar.jl` (new), `test/test_planar_kernel.jl` (new) | planar-kernel implementer | B3 |
-| `src/kernels/onem.jl` (new) | 1m implementer | D |
-| `src/workspace.jl`, `src/driver.jl`, `src/blocking.jl` | plumbing implementer (**exclusive** -- no other worker edits `src/driver.jl`) | B1 |
-| `src/packing.jl` (additive only; `_pack_panel!` untouched) | packing implementer | B2 |
-| `src/tensoroperations.jl` | adapter implementer | B4 |
-| `test/test_tensoroperations.jl` | adapter-test implementer (authored blind against this section) | B5 |
+| `src/packing/format.jl` (new) | main process (freeze), then packing implementer | A, B2 |
+| `src/microkernels/planar.jl` (new), `test/microkernels/test_planar_kernel.jl` (new) | planar-kernel implementer | B3 |
+| `src/microkernels/onem.jl` (new) | 1m implementer | D |
+| `src/execution/workspace.jl`, `src/execution/execute.jl`, `src/planning/blocking.jl` | plumbing implementer (**exclusive** -- no other worker edits `src/execution/execute.jl`) | B1 |
+| `src/packing/pack.jl` (additive only; `_pack_panel!` untouched) | packing implementer | B2 |
+| `src/integrations/tensoroperations.jl` | adapter implementer | B4 |
+| `test/integrations/test_tensoroperations.jl` | adapter-test implementer (authored blind against this section) | B5 |
 | `benchmark/bench_complex_shape.jl`, `benchmark/bench_complex_method.jl` (new) | measurement implementer | F |
 
 ### Amendment 3: the conjugation invariant is discharged, and the eltype gate widens
@@ -2507,7 +2537,7 @@ What is **amended**:
           eltype(A) === eltype(B) === eltype(C) && eltype(C) ∈ _QS_ELTYPES
 
   with `_qs_strided_ok` and `_qs_eligible` unchanged in structure.
-- **"`src/tensoroperations.jl` must carry this reasoning as a source comment at
+- **"`src/integrations/tensoroperations.jl` must carry this reasoning as a source comment at
   the point where `conjA`/`conjB` are dropped."** They are no longer dropped, so
   there is no such point. Superseded by: the adapter must carry, as source
   comments, (a) the `_qs_isconj` combining rule and why `⊻` is the right
@@ -2520,9 +2550,9 @@ What is **amended**:
   eltype check: `_qs_isconj` folding `conjA`/`conjB` with `.op`;
   `_op_conjugates`' throwing fallback, so no `op` can be silently mishandled;
   and the conjugated-`C` rejection.
-- **The supporting facts about the engine-level gate** ("`src/kernel_descriptor.jl`
+- **The supporting facts about the engine-level gate** ("`src/packing/format.jl`
   throws unless `T === Float32 || T === Float64`, and `default_blocking` only has
-  measured constants for those two"). `src/kernel_descriptor.jl` is unchanged --
+  measured constants for those two"). `src/packing/format.jl` is unchanged --
   complex goes through the separate `ComplexKernelDescriptor`, per "The frozen
   packed format is preserved, not extended" above -- and `default_blocking` gains
   a derived complex row rather than a hand-tabulated one.
@@ -2621,7 +2651,7 @@ measurements, because a measured starting point beats a guessed one, but **their
 assertion is untouched, and no throughput claim is made -- spill counts are not
 timings, and this project does not rank shapes it has not timed. The measured
 table is recorded in `planar_register_pressure`'s docstring in
-`test/test_planar_kernel.jl`. Phase F must decide whether `(16,6)`/`(32,6)`
+`test/microkernels/test_planar_kernel.jl`. Phase F must decide whether `(16,6)`/`(32,6)`
 stays at the head of the menu or whether `(24,3)`/`(48,3)` (pressure 26, zero
 spills) should lead, **on measured throughput, not on this table.**
 
@@ -2749,7 +2779,7 @@ through how LLVM schedules the loop-carried tuple.
 
 Consequences, and what is deliberately *not* being done:
 
-- The frozen `<= 32` assertion stays in `test/test_target.jl`. It is still a
+- The frozen `<= 32` assertion stays in `test/planning/test_kernel_selection.jl`. It is still a
   sound lower bar, and weakening or complicating it on the strength of a
   spill-count reading would be the wrong trade.
 - The menu order still stays untouched. Phase C declined to reorder on spill
@@ -2812,7 +2842,7 @@ convention is to keep the 1.10 gap visible rather than hidden; the
 
 ### The end-to-end randomized oracle, and what it pins that nothing else did
 
-`test/test_macro_driver.jl` gained the fourth oracle layer: 501 randomized
+`test/execution/test_macro_blocking.jl` gained the fourth oracle layer: 501 randomized
 complex cases (300 `ComplexF64` + 200 `ComplexF32`, spread over every available
 (method, shape) combination) against a dense-matmul oracle that uses **its own**
 conjugation table and rule, never the engine's `_qs_isconj`/`_op_conjugates`.
@@ -3127,7 +3157,7 @@ Findings, all fixed:
   `Rq ≈ A * B`, so the guard is intact and stronger -- but the claim about its
   text was false, and the freeze's "git diff shows additions, not edits" proof
   does not hold for that file. Reworded to "kept and strengthened".
-- **S1 (source).** `src/tensoroperations.jl` contradicted itself twenty lines
+- **S1 (source).** `src/integrations/tensoroperations.jl` contradicted itself twenty lines
   apart: the pre-Phase-C comment still said "the adapter does not duplicate
   it", while the Phase C comment below said the duplication is deliberate and
   why. Phase C corrected the record but not the comment. Rewritten.
@@ -3206,9 +3236,9 @@ pieces of material lived **only** in the source and are transcribed below
 before being condensed there.
 
 **Guardrail comments were deliberately kept in place, in the source**, tightened
-but never removed: the per-argument bound-type-parameter rule (`src/kernel.jl`,
+but never removed: the per-argument bound-type-parameter rule (`src/microkernels/interface.jl`,
 `_pack_sliver!`), the "do not collapse the barrier methods" warning, the
-borrowed-pointer-not-`view` result (`src/panel.jl`), the literal-tuple-index
+borrowed-pointer-not-`view` result (`src/packing/panel.jl`), the literal-tuple-index
 rule (Cliff B, 24576 B), `muladd(-ai, bi, c)` over `c - ai*bi`, 1m's even-`W`
 requirement, `complex_format.jl`'s reduction-to-the-frozen-format argument,
 `ContractWorkspace`'s `eltype(VT) === real(T)` invariant, and Amendment 3's
@@ -3216,7 +3246,7 @@ three conjugation comments. A guardrail is one sharp sentence in the source, not
 a pointer to this file, because the reader who needs it is editing the line
 above it.
 
-### Transcribed from `src/kernels/onem.jl`: why the induced method works
+### Transcribed from `src/microkernels/onem.jl`: why the induced method works
 
 `OneEFormat` A at logical K step `p` occupies `4*MR` reals laid out as two
 consecutive *real* K steps of `2*MR`:
@@ -3242,7 +3272,7 @@ is what the `(2u+1, 2u+2)` lane pair in `_store_tile_onem!` reads back.
 The `2*kc` doubling is confined to 1m's own `accumulate` and never appears in a
 length, an offset or a driver loop bound.
 
-### Transcribed from `src/kernels/planar.jl`: the per-shape `vfnmadd` count
+### Transcribed from `src/microkernels/planar.jl`: the per-shape `vfnmadd` count
 
 Phase C recorded that `muladd(-ai, bi, cr)` folds its `fneg` into
 `vfnmadd231pd`/`ps` with zero separate negations. The per-shape table behind
@@ -3297,7 +3327,7 @@ Attempted and REVERTED, with a number, because this is the interesting one:
   preserved in the merged form, so this is not the hazard the original split
   was guarding -- it is a new one, found only because it was measured.
 
-  Left as two methods, with a comment in `src/tensoroperations.jl` carrying the
+  Left as two methods, with a comment in `src/integrations/tensoroperations.jl` carrying the
   numbers so the merge is not re-proposed. **Worth generalising**: "reads
   better" and "allocates the same" are independent properties in this
   codebase, and a readability refactor of a plan-constructing entry point needs
@@ -3312,7 +3342,7 @@ with a concrete `execute_tile!` return at every shipped kernel type crossed
 with every `(rows, cols)` axis-kind pair.
 
 **Left alone deliberately.** `_pack_panel!` and `_pack_panel_complex!`
-(`src/packing.jl`) are parallel loops and stay parallel. The milestone kept them
+(`src/packing/pack.jl`) are parallel loops and stay parallel. The milestone kept them
 separate so that "the real path is byte-identical" is a `git diff` fact rather
 than an argument, and unifying them would require *proving* the real path's
 generated code unchanged -- which a hoisted `emit` callback cannot be shown to
@@ -3571,7 +3601,7 @@ rejections/throws on any case, **including** the pure-outer-product
 `(1,0,1)` pairwise shapes (`dim15_1_0_1`, `dim63_1_0_1`, `dim128_1_0_1`,
 `ncontract=0`) and all 4-6-index chemistry shapes (`ccsd_t_*`'s six-index
 outputs among them). This is a positive correctness finding for
-`src/tensoroperations.jl` on shapes it had not previously been measured
+`src/integrations/tensoroperations.jl` on shapes it had not previously been measured
 against — the TensorOperations integration milestone's T9 benchmark used
 plain-matmul and shallow-K shapes only.
 
@@ -3641,7 +3671,7 @@ under-report store cost: (1) a genuine tool bug, caught at review (T6) and
 since fixed in `benchmark/profile_buckets.jl` — `"microkernel"`'s bucket
 matched on the bare file-path substring `"kernels/"`, and the store path's
 own named frames (`_store_tile_scattered!`, `tile_store!`, `tile_offset`,
-`_axpby_tile!`) live in that same file (`src/kernels/simd.jl`) as the FMA
+`_axpby_tile!`) live in that same file (`src/microkernels/simd.jl`) as the FMA
 microkernel, so first-match-wins ordering swallowed them into `microkernel`
 instead of `store` (the original run's `ccsd_t_1_dim16` `microkernel: 7.97%`
 figure was mostly store cost, not arithmetic — do not use that number); (2)
@@ -3678,15 +3708,15 @@ it is reconstructible from `bench_to_suite.csv` plus the cited
   cost at all — this is an output-store problem, full stop.
 
 **Two separable causes found for the store cost, both cited to a specific
-location.** Neither was fixed or modified — both `src/kernels/simd.jl:217`
-and `src/driver.jl:815` were read only, as a read-only diagnostic pass.
+location.** Neither was fixed or modified — both `src/microkernels/simd.jl`
+and `src/execution/execute.jl` were read only, as a read-only diagnostic pass.
 
 - **Cause A: the vectorized store fast-path guard is unsatisfiable for any
   `Array`-backed destination, not just on the TensorOperations path.**
-  `src/kernels/simd.jl:217`'s guard —
+  `src/microkernels/simd.jl`'s guard —
   `_unit_stride_rows(destination.rows) && destination.storage isa Vector{T}`
-  — never passes: `src/driver.jl:815` sets `Cstorage = parent(C)` inside
-  `_plan_contract(C::StridedView, ...)` (`src/driver.jl:776`), which every
+  — never passes: `src/planning/plan.jl` sets `Cstorage = parent(C)` inside
+  `_plan_contract(C::StridedView, ...)` (`src/planning/plan.jl`), which every
   plan-construction call goes through regardless of entry point (native
   `contract!`/`plan_contract` or the TensorOperations adapter). `parent` of a
   `StridedView` wrapping a plain `Array` resolves to `Memory{T}`, never
@@ -3760,8 +3790,8 @@ checks:
    pattern's cache/TLB cost).
 
 **These are unverified findings from a diagnostic pass, not fixes, and not
-yet confirmed by a second reviewer.** `src/kernels/simd.jl:217` and
-`src/driver.jl:815` were read, not modified; no attempt was made in this
+yet confirmed by a second reviewer.** `src/microkernels/simd.jl` and
+`src/execution/execute.jl` were read, not modified; no attempt was made in this
 milestone to fix or test the fast-path guard.
 
 ### Follow-ups, explicitly out of scope for this milestone
@@ -3786,7 +3816,7 @@ benchmark-suite comparison milestone
 whose profiling triage found the `ccsd_t_*_dim16` regression class (six-index
 output, 6.6-14.2x slower than `StridedBLAS`) traced to two separable,
 **unverified** causes: (A) the vectorized store fast-path guard in
-`src/kernels/simd.jl:217` (`_unit_stride_rows(destination.rows) &&
+`src/microkernels/simd.jl` (`_unit_stride_rows(destination.rows) &&
 destination.storage isa Vector{T}`) appearing unsatisfiable for any
 `Array`-backed destination; (B) that specific case class's output exceeding
 L3 with a cache/TLB-unfriendly stride pattern. This milestone resolves Cause
@@ -3797,8 +3827,8 @@ register-shape milestone).
 ### Non-goals (frozen for this milestone)
 
 `QuasiStridedBackend`'s hard-reject/no-fallback invariant; the macro-blocking
-five-loop structure in `src/driver.jl`; the register-shape/blocking constant
-derivation in `src/target.jl`; a general fix for Cause B (output-side
+five-loop structure in `src/execution/execute.jl`; the register-shape/blocking constant
+derivation in `src/hardware/target.jl`; a general fix for Cause B (output-side
 blocking or an accepted temp, like `StridedBLAS`'s own strategy); a wider
 profiling sweep across more upstream-suite cases (the prior triage explicitly
 recommended against this); repointing the `TensorOperationsBenchmarks`
@@ -3809,7 +3839,7 @@ view 303 --repo QuantumKitHub/TensorOperations.jl`).
 
 - **E1.** The guard is analytically dead on every real driver path on Julia
   >= 1.11, and live on Julia 1.10. The only destination-tile constructor on
-  the real path is `src/driver.jl:815` (`Cstorage = parent(C)`, inside
+  the real path is `src/planning/plan.jl` (`Cstorage = parent(C)`, inside
   `_plan_contract(C::StridedView, ...)` at `:776`). StridedViews v0.5.2
   (`~/.julia/packages/StridedViews/MHBDj/src/auxiliary.jl:50-55`) resolves
   `parent` of an `Array`-backed `StridedView` to `Memory{T}` under `@static
@@ -3879,7 +3909,7 @@ register shapes from a genuine `Vector`/`Memory` destination taking the fast
 path. Choose **(b) docs-only correction** if T2 shows no tile-level gain at
 any shipped shape, or if a fix cannot reach zero steady-state allocation at
 the shipped register shapes (`NV` up to 28) with tail rows without touching
-`src/driver.jl`/`src/target.jl`/`src/blocking.jl` (frozen, non-goals above) --
+`src/execution/execute.jl`/`src/hardware/target.jl`/`src/planning/blocking.jl` (frozen, non-goals above) --
 in that case the code is left as-is, the guard gets a comment stating its
 per-Julia-version reachability, and the deferral is recorded here. Choose
 **(c) escalate to the user** if T1 finds `SIMD.jl` misbehaves on
@@ -3888,8 +3918,8 @@ be a new design question, not a bug fix.
 
 **Replanning triggers**: T1/T3 finds a unit-stride C row in any of the four
 regression cases (E3 refuted -- redo the attribution before deciding
-anything); a fix would require touching `src/driver.jl`/`src/target.jl`/
-`src/blocking.jl`; the re-measurement shows a one-sided regression across
+anything); a fix would require touching `src/planning/labels.jl`/`src/hardware/target.jl`/
+`src/planning/blocking.jl`; the re-measurement shows a one-sided regression across
 shapes after a fix; the C-local label-order control (Arm 3) in
 `bench_ccsd_t_store.jl` runs materially faster than the adapter's own label
 order (Arm 1) on the `dim=16` cases -- that would point at a different,
@@ -3944,7 +3974,7 @@ false belief that it closes the `ccsd_t_*` regression -- it does not, and
 the docs must say so plainly (T1/T3); (3) T2 shows a real, consistent,
 above-noise gain at every shipped/swept register shape from a genuine
 `Vector`/`Memory` destination taking the fast path. Proceeding to **T4**:
-widen `src/kernels/simd.jl:217`'s guard from `destination.storage isa
+widen `src/microkernels/simd.jl`'s guard from `destination.storage isa
 Vector{T}` to a `DenseVector{T}` check (covering `Memory{T}` too, per D2),
 with a statically-indexed tail body (per E6) verified allocation-free at
 `NV` up to 28 with tail rows, on Julia >= 1.11. This will speed up ordinary
@@ -3956,7 +3986,7 @@ re-run as evidence either way for that specific case class.
 ### T4-T5: the fix and its measured effect
 
 **T4 (the fix, already committed on this branch, `f467b45`).**
-`src/kernels/simd.jl`'s store fast-path guard (`_vector_store_eligible`,
+`src/microkernels/simd.jl`'s store fast-path guard (`_vector_store_eligible`,
 formerly an inline `isa Vector{T}` check) was widened to accept any concrete
 `DenseVector{T}` (covering `Memory{T}`, which is what the real driver always
 hands the kernel on Julia >= 1.11), while continuing to exclude
@@ -4067,11 +4097,11 @@ fully resolved.
 "currently pinned by an existing test", used twice above for
 `_classify_labels`'s label ordering, was inaccurate: no test pinned the
 order of labels inside the M/N composites before this date. The only tests
-touching `_classify_labels` were its error paths (`test/test_driver.jl`,
+touching `_classify_labels` were its error paths (`test/planning/test_plan_contract.jl`,
 "driver: label validation errors") and an unrelated `ContractPlan`
 field-passthrough test; neither asserts anything about composite order. The
 first test that does is the label-order milestone's pinning testset,
-`test/test_driver.jl`, "label order: pinning test on the ccsd_t shapes
+`test/planning/test_plan_contract.jl`, "label order: pinning test on the ccsd_t shapes
 (composite order and swap)", which asserts the post-sort `mgroup`/`ngroup` C
 maps and the orientation-swap decision on all four `ccsd_t_*` shapes. That
 milestone changed the ordering rule itself (see `plan_contract`'s docstring:
@@ -4090,8 +4120,8 @@ free labels sorted by `|stride|` in `C`, guarded M/N orientation swap);
   since the affected files are this milestone's own frozen non-goals):
   `_acc_lane` is now unused by any store path (both `_store_tile_scattered!`
   and the new `_store_tile_vector!` are `@generated` with literal indices),
-  but `src/kernels/planar.jl` and `src/kernels/onem.jl` each have a comment
-  stating the real path *uses* `_acc_lane`, and `test/test_quality.jl`'s Aqua
+  but `src/microkernels/planar.jl` and `src/microkernels/onem.jl` each have a comment
+  stating the real path *uses* `_acc_lane`, and `test/quality/test_aqua.jl`'s Aqua
   `unbound_args = false` justification cites it as the reason -- all three
   are now stale (the justification is not wrong, `_acc_lane` still exists
   and is still unbound-arg-shaped, but its "still in use" premise no longer
@@ -4103,7 +4133,7 @@ free labels sorted by `|stride|` in `C`, guarded M/N orientation swap);
   with unit-stride rows but scattered/irregular *columns* (`ScatterAxis`
   cols) -- found at T8 review as a coverage gap: this combination is newly
   routed to `_store_tile_vector!` and is exercised for allocation by
-  `test/test_target.jl`'s sliced-C fixture, but that test only asserts zero
+  `test/hardware/test_target.jl`'s sliced-C fixture, but that test only asserts zero
   allocation, not numerical correctness, for this specific combination.
 
 ## Label-order milestone
@@ -4116,7 +4146,7 @@ of the fix's dtype guard).
 
 ### The mechanism
 
-`_classify_labels` (`src/driver.jl:19`) splits free labels into the M list
+`_classify_labels` (`src/planning/labels.jl`) splits free labels into the M list
 (A's free labels) and N list (B's free labels) in A's/B's own incidental
 physical axis order -- an accident of how the caller happened to lay out its
 operands, not a property of the contraction. `fill_offsets!` then walks
@@ -4125,25 +4155,25 @@ so that incidental order was silently deciding the memory-access pattern of
 the store into `C`, which is the tensor whose layout actually matters for the
 store.
 
-`plan_contract` (`src/driver.jl:795`) now inserts two planning-time,
+`plan_contract` (`src/planning/plan.jl`) now inserts two planning-time,
 allocation-free steps between `_classify_labels` and building the
 `AxisGroup`s:
 
-1. `_order_free_labels` (`src/driver.jl:127-133`) stable-sorts each of the M
+1. `_order_free_labels` (`src/planning/labels.jl`) stable-sorts each of the M
    and N label lists by `abs(stride(C))` of that label's own axis, ascending,
    ties keeping the operand's incidental order. This runs unconditionally,
    for every dtype and every kernel -- there is no guard, because there is no
    plausible downside to walking `C` with its own fastest axis fastest.
-2. `_prefer_swap` (`src/driver.jl:174-180`), built on `_leading_unit_run`
-   (`src/driver.jl:142-156`), decides whether to additionally swap which
+2. `_prefer_swap` (`src/planning/labels.jl`), built on `_leading_unit_run`
+   (`src/planning/labels.jl`), decides whether to additionally swap which
    operand plays the M role and which plays the N role (B feeds M, A feeds N,
    with the K maps, storage/base fields and `atransform`/`btransform` moving
-   together -- `src/driver.jl:858-870`). `_leading_unit_run` measures, for an
+   together -- `src/planning/labels.jl`). `_leading_unit_run` measures, for an
    already-sorted label list, how many leading elements form a unit-stride
    run in `C`; the swap fires only when the as-is orientation's M list falls
    short of a full `mr(kernel)`-wide register sliver while the swapped
    orientation would clear it. This is guarded to real dtypes only (`T <:
-   Real`, `src/driver.jl:858`): `PlanarKernel`/`OneMKernel` (complex) always
+   Real`, `src/planning/labels.jl`): `PlanarKernel`/`OneMKernel` (complex) always
    ship the scattered/scalar store regardless of layout (`_vector_store_eligible`
    only exists on the real/`SIMDKernel` path), so the swap has nothing to win
    for them and was measured to cost the as-is orientation's N-side locality
@@ -4258,7 +4288,7 @@ expected to be unchanged at `35168/35168`, 0 failed/errored).
 - **The 18 microsecond-scale regressions' mechanism is unconfirmed.** A
   plausible, but *unverified*, candidate: `plan_contract` now resolves
   `_default_kernel` twice unconditionally (`kernel_asis` and
-  `kernel_swapped`, `src/driver.jl:849-850`) before the `T <: Real` guard
+  `kernel_swapped`, `src/planning/kernel_selection.jl`) before the `T <: Real` guard
   even runs, so when the M/N composite ranks differ between the two
   candidate orientations, `execute!`/`_plan_contract` can end up with two
   distinct `ContractPlan` specializations reachable across a program's
@@ -4272,13 +4302,13 @@ expected to be unchanged at `35168/35168`, 0 failed/errored).
   `parent(B)` after a swap** (a future maintainer relying on
   `plan.Astorage === parent(A)` would be misled by the field name alone).
   Fixed this milestone with one added sentence on the struct's docstring
-  (`src/driver.jl`) -- a doc-only change, not a logic change.
+  (`src/planning/plan.jl`) -- a doc-only change, not a logic change.
 - **`benchmark/bench_ccsd_t_store.jl`'s Arms 3/4-*/5 comments described
   pre-fix semantics** -- they read as if permuting an operand's axes by hand
   still changes what the engine does, but `plan_contract` now performs that
   same sort (and, for Arm 5's swap, the same orientation decision)
   internally and unconditionally, so those arms no longer change engine
-  behaviour on current `src/driver.jl`; they remain useful only as the
+  behaviour on current `src/planning/plan.jl`; they remain useful only as the
   working record of what motivated the fix. One clarifying paragraph was
   added near the top of that script's Arms list this milestone, without
   rewriting the arms themselves.
@@ -4308,7 +4338,7 @@ GitHub auto-detected and closed PR #5 as merged.
 before proceeding**: the branch is not purely benchmark tooling. A later
 commit on it (`3428c61`, "QuasiStridedBackend: fall back to StridedNative
 for tensoradd!/tensortrace!") reverses clause 1 of "Hard-reject, never fall
-back" (see "Amendment 7" above) -- a real `src/tensoroperations.jl` behavior
+back" (see "Amendment 7" above) -- a real `src/integrations/tensoroperations.jl` behavior
 change, done "at the user's explicit direction" per its own commit message
 in an earlier session, tested (34656/34656 passing at the time) and
 documented (Amendment 7, above), but never reflected in PR #5's own GitHub
@@ -4338,7 +4368,7 @@ every small/skewed case, which should be impossible for a plain dense
 matmul. The `.flat.txt` dump's self-time column showed the actual hot leaf
 frames were `@SIMD/…/LLVM_intrinsics.jl` (`fmuladd`, `vload`, vector
 construction) directly beneath `_accumulate_step`/`accumulate`
-(`src/kernels/simd.jl:80,138`) in the tree profile -- i.e. genuine FMA-loop
+(`src/microkernels/simd.jl`) in the tree profile -- i.e. genuine FMA-loop
 work, but attributed to zero named bucket because the leaf instruction lives
 in the `SIMD.jl` *package's own* source file, which carries neither
 "kernels/" nor "accumulate" in its path. Leaf-only self-time systematically
@@ -4355,7 +4385,7 @@ substrings together, first-match-wins, has the same problem one level up:
 `profile_buckets.jl`'s `"microkernel"` bucket has a bare `"kernels/"`
 file-path catch-all, and `"planning"` has a bare `"driver.jl"` catch-all.
 A generic, unnamed frame (e.g. a `macro expansion` thunk inside
-`_store_tile_vector!`'s generated body, still in `src/kernels/simd.jl`)
+`_store_tile_vector!`'s generated body, still in `src/microkernels/simd.jl`)
 would match `"kernels/"` immediately and stop the walk right there --
 never reaching `_store_tile_vector!` itself one frame further up, which
 should have classified it as `"store"`. Quantified by the reviewer against
@@ -4533,7 +4563,7 @@ code itself be made faster -- loop structure, vectorization, bounds-check
 placement -- *without* changing when or whether packing happens? (The
 "should we pack at all" question -- Octavian-style `dontpack`/`maybeinline`
 dispatch tiers -- is a separate track and was not touched.) Scope pinned in
-advance: `src/kernels/*.jl`, `src/target.jl`, `QuasiStridedBackend`'s
+advance: `src/kernels/*.jl`, `src/hardware/target.jl`, `QuasiStridedBackend`'s
 hard-reject invariant and the complex packing loop all off-limits; a fix
 ships only if it is roughly <=50 lines in one `src/` file, has a *measured*
 win, and is fully verified (full suite, new tests against the scalar path
@@ -4564,7 +4594,7 @@ unit-stride-fastest multi-index) and a `Memory{Float64}` storage, kernel
 rows filling a full MR sliver, straight copy, `PackedPanel` destination" is
 the common A case, not a special one.
 
-### Change (`src/packing.jl` only; 40 non-comment lines)
+### Change (`src/packing/pack.jl` only; 40 non-comment lines)
 
 1. **`_pack_panel!` full/tail split.** The physical dim (MR or NR) is now a
    `Val{PD}` compile-time constant, and the body has two branches: a full
@@ -4598,7 +4628,7 @@ negative-stride "contiguous" run is not a forward vector load). `conj` on a
 real eltype is the identity, so the copy is exact; on a complex eltype
 `_copies_unchanged` is `false` (pinned by test). The destination is the
 borrowed `PackedPanel` pointer `execute!` already `GC.@preserve`s; the source
-is `GC.@preserve`d locally. `_unit_stride_rows` (src/kernels/simd.jl) has
+is `GC.@preserve`d locally. `_unit_stride_rows` (src/microkernels/simd.jl) has
 methods for exactly the three `Axis` kinds and deliberately no fallback, so
 an unknown axis type is a `MethodError`, never a silent default.
 `_pack_panel_complex!` is untouched (its header comment now says so).
@@ -4637,7 +4667,7 @@ is memory traffic that only "don't pack A for small N" removes. Note the
 the 2x micro-timings are far outside that noise and were reproduced in three
 separate micro-runs.
 
-### Tests added (`test/test_packing.jl`)
+### Tests added (`test/packing/test_pack_real.jl`)
 
 Gate-predicate unit tests (incl. `conj` on `ComplexF64` is NOT a straight
 copy); a PackedPanel-vs-direct-indexing oracle over `{Float64,Float32} x MR
@@ -4673,7 +4703,7 @@ depend on the `pack_a!` ancestor frame surviving inlining.
 - **Complex packing** (`_pack_panel_complex!`) has the same per-element
   `if t < valid` and would take the same full/tail split, plus a
   deinterleaving vector path for planar A with unit-stride rows; untouched,
-  needs its own tests against `test/test_packing_complex.jl`'s oracle.
+  needs its own tests against `test/packing/test_pack_complex.jl`'s oracle.
 - `ao2mo_2_dim16`'s largest non-kernel bucket is now `driver_loop` (28.7%:
   `fill_offsets!`/`describe_block`/`_classify_slivers!`), outside this task.
 
@@ -4700,7 +4730,7 @@ emits a duplicate case id for them; every other id is new. `DIRECT_CASES`
 gained two `OneMKernel` entries (`onem_256`/`onem_512`, both complex dtypes)
 that call `plan_contract(...; kernel = ...)` directly with
 `kernel_shapes(T, OneMMethod())[end]` -- the only way to reach `1m` at all,
-since `src/driver.jl`'s `_default_complex_method` always returns
+since `src/planning/kernel_selection.jl`'s `_default_complex_method` always returns
 `PlanarMethod()` for a plain label/dims contraction, so none of the new
 complex `CASES` above ever exercise it. **Correction**: an earlier draft
 called `[end]` "the shipped default register shape"; there is no shipped
@@ -5023,7 +5053,7 @@ behind `ccsd_t_1_dim16`/`ccsd_t_1_dim16_f32` being store-dominated/kernel-
 stalled. This pass implements both, in `src/`, each verified with real
 before/after numbers on `ccqlin038`.
 
-### F2: run-length-aware kernel-shape demotion (`src/driver.jl`)
+### F2: run-length-aware kernel-shape demotion (`src/execution/execute.jl`)
 
 **Mechanism.** `QuasiStridedBackend`'s vectorized store
 (`_store_tile_vector!`) requires EVERY register sliver of a macro block to be
@@ -5037,7 +5067,7 @@ kernel is `(32,6,16)` (`mr=32`), while C's leading run there is only 16:
 `16 % 32 != 0`, so every M-sliver falls to the slow scattered store path,
 which measured at ~75% of total time in the prior pass's profile.
 
-**Fix.** In `plan_contract` (`src/driver.jl`), a new `_demote_for_run(T,
+**Fix.** In `plan_contract` (`src/planning/plan.jl`), a new `_demote_for_run(T,
 kernel, run, Qm)` helper runs DOWNSTREAM of the existing `_default_kernel`
 call and the `_prefer_swap` M/N-orientation decision, keyed on whichever
 orientation was actually chosen to feed M (its own run length against the
@@ -5048,10 +5078,10 @@ picks the LARGEST matching `mr` -- not the smallest: measured directly, at
 targets are already-compiled menu entries (`_kernel_from_shape`), so this
 adds no new `SIMDKernel` specialization. Real dtypes only (`T <: Real`); the
 `T` fallback method is a no-op, matching the complex path's unconditional
-scattered store. ~30 lines in `src/driver.jl` (`_demote_for_run` plus the two
+scattered store. ~30 lines in `src/planning/kernel_selection.jl` (`_demote_for_run` plus the two
 call sites after the swap decision).
 
-**Pinning-test interaction, checked not assumed.** `test/test_driver.jl`'s
+**Pinning-test interaction, checked not assumed.** `test/planning/test_plan_contract.jl`'s
 swap-decision pinning test (`"label order: pinning test on the ccsd_t
 shapes..."`) reads `MRk = mr(plan.kernel)` AFTER `plan_contract` returns --
 i.e. from the (possibly F2-demoted) final kernel -- and compares it against
@@ -5068,11 +5098,11 @@ test would have been fixing a problem that measurement showed does not exist.
 
 **`_default_kernel`/`test_target.jl` pinning.** F2 is a new function called
 after `_default_kernel`'s result is already resolved, never folded into it;
-`_default_kernel(T, 9, 8)`'s `===`-pinned identity in `test/test_driver.jl`
-and `test/test_target.jl`'s Qm-based demotion tests are unaffected by
+`_default_kernel(T, 9, 8)`'s `===`-pinned identity in `test/planning/test_plan_contract.jl`
+and `test/planning/test_kernel_selection.jl`'s Qm-based demotion tests are unaffected by
 construction (neither exercises `plan_contract`'s post-swap step).
 
-**New correctness test** (`test/test_driver.jl`, `"F2: run-length-aware
+**New correctness test** (`test/planning/test_plan_contract.jl`, `"F2: run-length-aware
 kernel demotion"`): for the `ccsd_t_1` fixture at `dim=16` (both dtypes),
 asserts `mr(plan.kernel)` resolves to the expected value (16 for Float32,
 demoted from 32; 16 for Float64, unchanged since the default already
@@ -5106,7 +5136,7 @@ pass's finding) to **21.73%** of `QuasiStridedBackend`'s own samples, with
 `microkernel` rising to 57.47%. Artefact:
 `benchmark/results/ccqlin038.flatironinstitute.org-2026-09-21/profiles/buckets_summary-A2-post-f2.txt`.
 
-### F1: inline `Base.accumulate` (`src/kernels/simd.jl`)
+### F1: inline `Base.accumulate` (`src/microkernels/simd.jl`)
 
 **Mechanism.** `Base.accumulate(kernel::SIMDKernel{MR,NR,T,W}, ...)` built and
 returned its 768-byte (at the shipped `(16,6,8)`/`(32,6,16)` shapes)
@@ -5116,12 +5146,12 @@ micro-tile call instead of keeping it register-resident, per the prior
 pass's LLVM/native codegen dump.
 
 **Fix.** One line: `function Base.accumulate(...)` -> `@inline function
-Base.accumulate(...)` in `src/kernels/simd.jl`. No semantic change --
+Base.accumulate(...)` in `src/microkernels/simd.jl`. No semantic change --
 `accumulate` already delegated every K-step to the `@generated`,
 already-`@inline`d `_accumulate_step`; only the outer wrapper's own inlining
 status changed.
 
-**Allocation-cliff check.** `test/test_simd_kernel.jl`'s "allocation:
+**Allocation-cliff check.** `test/microkernels/test_simd_kernel.jl`'s "allocation:
 `accumulate` and `execute_tile!` are steady-state allocation-free" and "...
 WITH TAIL ROWS ..." testsets already sweep register shapes up to `NV = 24`
 (`(16,6,4)`) and `NV = 28` (`(16,7,4)`) -- the documented dynamic-tuple-
@@ -5160,7 +5190,7 @@ figure of record for this pass. Artefact:
 ### Full-suite and ABBA guard results
 
 - `Pkg.test()`: 35180/35180 pass (was 35170 before this pass's +10 new F2
-  tests), including `test/test_driver.jl`'s and `test/test_target.jl`'s
+  tests), including `test/planning/test_plan_contract.jl`'s and `test/hardware/test_target.jl`'s
   pinning tests, unedited.
 - `benchmark/bench_real_path_guard.jl`, ABBA order (`new(A1)`, `base(B1)`,
   `base(B2)`, `new(A2)`, `MAIN_SHAPES`+`SMALL_SHAPES`+scattered, both
@@ -5208,7 +5238,7 @@ An independent review of the first commit (`a0b337a`) found one blocking
 issue and three should-fix items, addressed as follows.
 
 **Blocking, fixed: the F2 correctness test was ISA-specific.** The original
-`test/test_driver.jl` F2 testset hardcoded `expect_mr = 16` for BOTH
+`test/planning/test_plan_contract.jl` F2 testset hardcoded `expect_mr = 16` for BOTH
 Float64 and Float32 on the `ccsd_t_1` dim=16 fixture -- true only on this
 machine's `:avx512` profile. On `:avx2` (`_derived_shape` gives Float64
 `(8,6,4)`, and `16 % 8 == 0` so F2 correctly no-ops there, leaving `mr = 8`,
@@ -5496,7 +5526,7 @@ claimed an 8x win where the real one is 1.67x.
 
 ### 1. `plan_contract`: 4.1-6.4 us and 5.0-7.0 KB per call, now 1.0-2.3 us and 1.8-2.6 KB
 
-Three changes in `src/driver.jl`, all behaviour-preserving:
+Three changes in `src/planning/labels.jl`, all behaviour-preserving:
 
 * **`_classify_labels` no longer builds three `Set`s.** The label tuples'
   LENGTH is a compile-time constant (the `NA`/`NB`/`NC` type parameters -- one
@@ -5519,7 +5549,7 @@ Three changes in `src/driver.jl`, all behaviour-preserving:
   stable insertion sort of a single copy.** These lists have at most `ndims(C)`
   entries, so `O(n^2)` with `n <= 6` is free and three `Vector` allocations
   become one. A fresh vector is still returned: sorting `labels` in place would
-  mutate `_classify_labels`'s output, which `test/test_driver.jl`'s label-order
+  mutate `_classify_labels`'s output, which `test/planning/test_plan_contract.jl`'s label-order
   pinning reads afterwards.
 
 Measured end to end (`plan_contract` with a warm reused workspace):
@@ -5537,7 +5567,7 @@ RANK is a value property of the label sets, so the three `AxisGroup`s and the
 function barrier; the residual ~1.8 KB is the three label `Vector`s, the boxed
 groups, and that barrier's return. Removing it needs the label tuples to carry
 their classification in their types, which is a `@tensor`-macro-level change,
-not a driver one. `test/test_per_call_floor.jl` pins a 3 KB ceiling (against
+not a driver one. `test/planning/test_per_call_overhead.jl` pins a 3 KB ceiling (against
 the old 5-7 KB) rather than zero, so a regression to the `Set` / runtime-
 `ntuple` construction is caught without pretending the floor is zero.
 
@@ -5547,8 +5577,8 @@ Authorized explicitly, including the change to `pack_a!`'s documented "all
 validation happens before any write" contract, on condition that any entry
 point that skips a check a caller would expect is named `unsafe_*`. That
 condition is met: the new entry points are `unsafe_pack_a!`, `unsafe_pack_b!`
-(`src/packing.jl`), `unsafe_execute_tile!` (`src/kernel.jl`) and
-`unsafe_execute_micro_tile!` (`src/driver.jl`), and they are spelled out at
+(`src/packing/pack.jl`), `unsafe_execute_tile!` (`src/microkernels/interface.jl`) and
+`unsafe_execute_micro_tile!` (`src/execution/macrokernel.jl`), and they are spelled out at
 every call site -- `_pack_sliver!(unsafe_pack_b!, ...)`, not a boolean flag.
 `pack_a!`/`pack_b!`/`execute_tile!` and all four kernels' `execute_tile!`
 bodies are **unchanged**; the only edit to the checked path is that the check
@@ -5589,7 +5619,7 @@ provably the conjunction of the per-sliver / per-tile checks it replaces:
    (block rows) x (block columns).
 
    Combining 1-3: block-check-passes <=> every-sliver-check-passes. Not a tight
-   superset -- an equality. `test/test_per_call_floor.jl` asserts it as a
+   superset -- an equality. `test/planning/test_per_call_overhead.jl` asserts it as a
    randomized property over 400 cases with positive/negative/zero strides and
    scattered axes, comparing the two decisions directly.
 4. *Ordering is preserved.* Each hoisted check precedes every read of, or
@@ -5615,7 +5645,7 @@ is cross-checked against `execute_tilewise!` raising too.
 
 ### 3. Closed-form block description for affine-ramp composites
 
-New `affine_ramp(g::AxisGroup{D,P})` in `src/axis_group.jl` answers whether
+New `affine_ramp(g::AxisGroup{D,P})` in `src/layout/axis_group.jl` answers whether
 every map of `g` satisfies `offsets(g, q)[p] == q * step[p]` over the whole
 domain -- exactly the condition under which `normalize_group` would fold `g` to
 rank `<= 1`, tested with the same `Int128` comparison so a non-representable
@@ -5630,7 +5660,7 @@ holds, replaces `fill_offsets!` + `describe_block` with `_ramp_slivers!` /
 no buffer is scanned. `_ramp_descriptor` reproduces `describe_block`'s output
 *field for field*, including its `stride == 0` convention for a count-1 block,
 so the two paths are comparable with `==` and not merely behaviourally
-equivalent -- `test/test_per_call_floor.jl` asserts exactly that over 300
+equivalent -- `test/planning/test_per_call_overhead.jl` asserts exactly that over 300
 randomized (group, block, sliver-size) triples.
 
 **Deliberately not generalized.** Anything not provably a ramp falls back to
@@ -5642,7 +5672,7 @@ field or type parameter changed and no existing pinning test moved.
 Doing so would widen the ramp path to every *foldable* composite (e.g.
 `ccsd_t_1`'s N composite folds from rank 3 to rank 2; `dim15_2_2_2`'s fold to
 contiguous), but it rewrites `plan.mgroup`/`ngroup`'s rank, and
-`test/test_driver.jl:1194-1195` pins `plan.mgroup.lengths == ntuple(_->d, 3)`
+`test/planning/test_plan_contract.jl` pins `plan.mgroup.lengths == ntuple(_->d, 3)`
 as part of the *label-order* milestone's contract. Changing a pin that belongs
 to another milestone to buy a performance path is a separate decision, and the
 `affine_ramp` predicate above is itself the fold test, so the extension is
@@ -5684,7 +5714,7 @@ only (the plan is built once outside the loop), so it sees item 2 + item 3 and
 *none* of item 1.
 
 Full suite green: **52679 passed, 0 failed** (47224 before this pass; 5455 new
-in `test/test_per_call_floor.jl`). Forced-ISA runs (`QS_FAKE_ISA=avx2/32/16`
+in `test/planning/test_per_call_overhead.jl`). Forced-ISA runs (`QS_FAKE_ISA=avx2/32/16`
 and `unknown/0/0`) pass with only the two residues
 `test/forced_isa_runner.jl`'s own header documents (`test_target.jl:38`'s
 re-detection assertion, and the Bumper-dependent allocator testsets being
@@ -5736,7 +5766,7 @@ the reviewer tried and failed to construct a counterexample to the equivalence
 argument above, for negative strides, zero strides, irregular/scattered
 slivers and all four kernel types -- but flagged one real hole in how it was
 *tested*, specifically in the silently-under-validated direction. Both gaps
-are now closed in `test/test_per_call_floor.jl`.
+are now closed in `test/planning/test_per_call_overhead.jl`.
 
 **Gap 1: the equivalence property test supplied its own aggregate range.** It
 computed `blockrange = (minimum(rowoffs), maximum(rowoffs))` and fed that to
@@ -5807,13 +5837,13 @@ Two of the original
 five comparison items were found moot before this milestone opened: the
 allocation-light label classification (already shipped as the per-call-floor
 milestone above) and an opt-in cache-blocking model (already measured and
-rejected, `src/blocking.jl`'s own docstring). Three items remained in scope,
+rejected, `src/planning/blocking.jl`'s own docstring). Three items remained in scope,
 each gated on its own measurement before implementation, per this project's
 standing evidence-first convention.
 
 ### Item 1: unified real/complex packing (shipped)
 
-**Gate (before implementing).** `src/packing.jl` kept two structurally
+**Gate (before implementing).** `src/packing/pack.jl` kept two structurally
 separate packing loops: `_pack_panel!` (real, had the full/tail vectorized
 split from the "Packing speed" milestone above) and `_pack_panel_complex!`
 (complex, still had that milestone's original per-element `t < valid ? load
@@ -5835,17 +5865,17 @@ theirs from the complex-element-type milestone); real callers pass
 `packed_b_offset`; complex callers pass `Val(MR)`/`Val(NR)` in place of the
 old `Int physical_dim`. `_pack_panel_complex!` deleted. Untouched (test-bound
 or out of scope): `_pack_a_contiguous_eligible`, `_pack_a_contiguous!`,
-`_copies_unchanged`, `src/complex_format.jl`, `src/kernel_descriptor.jl`, any
-kernel file, `src/driver.jl`.
+`_copies_unchanged`, `src/microkernels/interface.jl`, `src/packing/format.jl`, any
+kernel file, `src/execution/execute.jl`.
 
 **Shipped as commit `69f8e4f`**, "Unify real/complex packing into one loop,
-format-dispatched" (`src/packing.jl` +106/-44 net across the diff;
-`test/test_packing.jl` +38, `test/test_packing_complex.jl` +39 -- Float32
+format-dispatched" (`src/packing/pack_contiguous.jl` +106/-44 net across the diff;
+`test/packing/test_pack_real.jl` +38, `test/packing/test_pack_complex.jl` +39 -- Float32
 tail-width coverage and `kc==1` full/tail coverage for Planar A, Planar B,
 and 1e A under `conj`, closing gaps the evidence-gate work had left
 unexercised). Full suite **54431/54431 passing** (baseline 54203 + 228 new),
 0 failed. Runic-clean on every added/touched line (two pre-existing,
-unrelated diffs in `test/test_packing.jl`/`test/test_per_call_floor.jl`,
+unrelated diffs in `test/packing/test_pack_real.jl`/`test/planning/test_per_call_overhead.jl`,
 present since before this milestone, deliberately left alone). Both
 forced-ISA runs (`avx2`, `unknown`) show only the residues
 `test/forced_isa_runner.jl`'s own header documents.
@@ -5999,7 +6029,7 @@ threshold (up to 37.4%) even with the Qk-cutoff guard in place -- recorded as
 a known, accepted residual (U2), not something this item fixes.
 
 **Design.** `_demote_for_run(::Type{T}, kernel, run::Int, Qm::Int, Qk::Int)
-where {T<:Real}` (`src/driver.jl:299`) gained a `Qk` parameter. Two new
+where {T<:Real}` (`src/planning/kernel_selection.jl`) gained a `Qk` parameter. Two new
 guards run BEFORE the existing `Qm == run || run % mr(kernel) == 0`
 short-circuit and search: return `kernel` unchanged if `Qk >
 F2_DEMOTE_KMAX_F64`/`F2_DEMOTE_KMAX_F32` (by `T`), or if
@@ -6008,21 +6038,21 @@ F2_DEMOTE_KMAX_F64`/`F2_DEMOTE_KMAX_F32` (by `T`), or if
 `cld(Qm, mr)` register slivers that lie entirely inside one run of length
 `run` -- by construction exactly `1.0` iff the existing predicate holds,
 checked over a 5000-point randomized grid
-(`test/test_driver.jl`, `"F2 K-depth guard: _unbroken_fraction
+(`test/planning/test_plan_contract.jl`, `"F2 K-depth guard: _unbroken_fraction
 equivalence"`) rather than a couple of hand-picked cases. Three new
 constants next to `KERNEL_SHAPES_F64`/`KERNEL_SHAPES_F32`
-(`src/driver.jl:442-454`): `F2_DEMOTE_KMAX_F64 = 32`, `F2_DEMOTE_KMAX_F32 =
+(`src/planning/kernel_selection.jl`): `F2_DEMOTE_KMAX_F64 = 32`, `F2_DEMOTE_KMAX_F32 =
 64`, `F2_BROKEN_ENOUGH = 1.0` (inert -- a fraction in `[0,1]` can never
 exceed `1.0`, so this guard is dead code today, deliberately left wired in
 rather than simplified away so a future pass can activate it by changing
 one constant). Both `plan_contract` call sites
-(`src/driver.jl:1117`/`1125`) updated to pass `Qk` (already in scope). The
+(`src/planning/plan.jl`/`1125`) updated to pass `Qk` (already in scope). The
 generic complex no-op fallback (`:314`) got the same signature extension,
 still a no-op. Nothing else touched (`_prefer_swap`, `_leading_unit_run`,
 `_default_kernel`, the kernel-shape menus, `_plan_contract`, the five-loop
 nest, and every kernel file are unmodified).
 
-**New tests** (`test/test_driver.jl`, both additive, no existing testset
+**New tests** (`test/planning/test_plan_contract.jl`, both additive, no existing testset
 body edited): (1) the `_unbroken_fraction` equivalence property test above;
 (2) `"F2 K-depth guard: deep-K no longer demotes, shallow-K still does"`,
 reusing the sweep's own fixture family for `(Float64, a=8)` and `(Float32,
@@ -6040,7 +6070,7 @@ either new testset.
 - `Pkg.test()`: baseline (unmodified tree, HEAD `d27286e`) **54431/54431**;
   post-change **64443/64443** (delta = 5000x2 property-test assertions + 6x2
   new assertions in the deep/shallow-K testset per dtype, matching exactly).
-- Runic: `runic --check src/driver.jl` and `runic --check test/test_driver.jl`
+- Runic: `runic --check src/execution/execute.jl` and `runic --check test/execution/test_execute.jl`
   both exit 0 (clean) on the changed lines.
 - Forced-ISA (`test/forced_isa_runner.jl`): `avx2/32/16` -- 62435 passed, 1
   failed (`test_target.jl` "runs on this host without throwing", the
@@ -6052,7 +6082,7 @@ either new testset.
   draft of this paragraph guessed "a standing Aqua ambiguity-check artifact"
   without checking): both are the pre-existing `skip =
   (target_profile().nregisters == 0)` condition in
-  `test/test_planar_kernel.jl`/`test/test_onem_kernel.jl`, which fires only
+  `test/microkernels/test_planar_kernel.jl`/`test/microkernels/test_onem_kernel.jl`, which fires only
   under `QS_FAKE_NREG=0` (the `unknown` profile) and not under `avx2`'s
   `QS_FAKE_NREG=16` -- unrelated to any F2/driver code path touched here.
   The AVX2 run is also what caught the hardcoded-assumption test bug noted
@@ -6156,7 +6186,7 @@ contracted extent (item 2)".
 described this as "three independent re-derivations of run length in C" and
 proposed consolidating them behind a new shared primitive. Neither is
 accurate: there was already exactly ONE derivation, `_leading_unit_run`
-(`src/driver.jl`) -- `_prefer_swap` called it twice (once per composite) and
+(`src/planning/labels.jl`) -- `_prefer_swap` called it twice (once per composite) and
 the two `_demote_for_run` call sites in `plan_contract` called it a third
 time, for whichever orientation was actually chosen. The only real
 redundancy was that `plan_contract` recomputed the same two values
@@ -6177,7 +6207,7 @@ holding the actual logic, and the pre-existing label-list signature
 (`morder::Vector{Int}, norder::Vector{Int}, indC, C, mr_asis, mr_swapped`)
 kept as a one-line wrapper that derives the same two run lengths and calls
 the core -- so the existing external test coverage of the label-list form
-(`test/test_driver.jl`, `"label order: _leading_unit_run / _prefer_swap"`)
+(`test/planning/test_plan_contract.jl`, `"label order: _leading_unit_run / _prefer_swap"`)
 needed no changes, and a new testset
 (`"label order: the two _prefer_swap methods agree"`) cross-checks the two
 methods directly on four label/mr combinations rather than just trusting the
@@ -6196,10 +6226,10 @@ scattered) does not. Testing the literal proposal would have produced a
 test that fails whenever A doesn't happen to ramp, for reasons having
 nothing to do with `_leading_unit_run`. The corrected, provably-equivalent
 primitive is a SINGLE-map (`P=1`) `AxisGroup` built from C's own map alone
-(`src/driver.jl`'s `_build_pair_group`-style construction, but with one map
+(`src/layout/pair_group.jl`'s `_build_pair_group`-style construction, but with one map
 instead of two): `(run == Qm) == (isramp && steps[1] == 1)` holds exactly,
 verified over 2000 randomized `(D, lengths, strides, order)` draws with zero
-mismatches (`test/test_driver.jl`, `"label order: _leading_unit_run's
+mismatches (`test/planning/test_plan_contract.jl`, `"label order: _leading_unit_run's
 full-coverage condition is a single-map affine_ramp on C's own strides"`).
 Two edge cases needed excluding from the random draw, both reproduced as
 real (not hypothetical) mismatches before being excluded: an empty `order`
@@ -6218,7 +6248,7 @@ planning record, not a new mechanism.
 **Verification.** Full suite **66447/66447** (baseline before this item
 64443 + 2004 new assertions: the 2000-point relation property test + 4
 cross-check assertions in the two-methods-agree testset). Runic clean
-(`src/driver.jl`, `test/test_driver.jl`). Both forced-ISA profiles show
+(`src/planning/plan.jl`, `test/execution/test_execute.jl`). Both forced-ISA profiles show
 only their by-now-documented residues (`avx2`: 1 failed + 1 errored;
 `unknown`: same two + 2 broken from the pre-existing `nregisters == 0`
 `skip=` condition, unrelated to this item).
@@ -6270,7 +6300,7 @@ no decision change".
 | store | 267/12948 = 2.1% | 641/10374 = 6.2% |
 | driver_loop | 861/12948 = 6.6% | 235/10374 = 2.3% |
 
-**Root cause, confirmed by reading the source, not just the profile.** `src/kernels/planar.jl`'s `store_tile!` docstring says outright: "Ships the scattered/scalar path only... The unit-stride plane-to-interleave fast path is a deliberately deferred, measurement-gated follow-on and is NOT built here." `_store_tile_planar!` writes every output element through a per-lane call to `_axpby_tile!` (src/kernel.jl) inside a `for lane in 1:W` loop, recombining `Complex(revec[lane], imvec[lane])` one scalar at a time -- there is no equivalent of the real path's `_store_tile_vector!` (src/kernels/simd.jl) for the planar format, at any eligibility condition. `_axpby_tile!` is already `@inline` and already has its `alpha`/`beta` branch resolved once by `_store_prologue!` outside the loop, so there is no cheap hoist left to find here -- the cost is the fundamental one of `MR*NR` scalar scatter-stores instead of `MV*NR` vectorized `W`-wide ones. Complex packing has the analogous gap one layer down: `_pack_panel_complex!` (src/packing.jl:401) is, per its own comment, "a parallel loop rather than a generalisation of `_pack_panel!`", and has no counterpart to `_pack_a_contiguous!` (the vectorized fast path the real path got in this session's "Packing speed" milestone above) -- consistent with `ccsd_6`'s packing share growing 31.0% -> 40.4% under ComplexF64 even though its store share barely moves.
+**Root cause, confirmed by reading the source, not just the profile.** `src/microkernels/planar.jl`'s `store_tile!` docstring says outright: "Ships the scattered/scalar path only... The unit-stride plane-to-interleave fast path is a deliberately deferred, measurement-gated follow-on and is NOT built here." `_store_tile_planar!` writes every output element through a per-lane call to `_axpby_tile!` (src/microkernels/interface.jl) inside a `for lane in 1:W` loop, recombining `Complex(revec[lane], imvec[lane])` one scalar at a time -- there is no equivalent of the real path's `_store_tile_vector!` (src/microkernels/simd.jl) for the planar format, at any eligibility condition. `_axpby_tile!` is already `@inline` and already has its `alpha`/`beta` branch resolved once by `_store_prologue!` outside the loop, so there is no cheap hoist left to find here -- the cost is the fundamental one of `MR*NR` scalar scatter-stores instead of `MV*NR` vectorized `W`-wide ones. Complex packing has the analogous gap one layer down: `_pack_panel_complex!` (src/packing/pack.jl) is, per its own comment, "a parallel loop rather than a generalisation of `_pack_panel!`", and has no counterpart to `_pack_a_contiguous!` (the vectorized fast path the real path got in this session's "Packing speed" milestone above) -- consistent with `ccsd_6`'s packing share growing 31.0% -> 40.4% under ComplexF64 even though its store share barely moves.
 
 **Disposition: not fixed, written up instead.** Both gaps are exactly the "deliberately deferred, measurement-gated follow-on" work the planar kernel's own docstring flagged when it was built -- a real vectorized planar store path needs a correct interleave-into-`Complex{T}` write (plane-pair -> struct-of-complex, not a same-format copy) under the same alpha/beta/edge-tile contract `_store_tile_vector!` already meets for real, plus its own unit-stride eligibility predicate; a vectorized complex pack path needs the equivalent generalization one layer down. Both are comparable in scope to the real path's Phase H store work and this session's real-packing milestone, not a "tens of lines" patch, and per this investigation's own scoping instruction, a change of that size is a decision for sign-off, not something to ship under time pressure. No `src/` change was made this pass; the four new `profile_to_suite.jl` cases are the only diff. **Recommended next step**, if the ComplexF64 gap is worth closing: a `docs/proposals/`-style design note (mirroring `dispatch-tiers.md`'s format) scoping a vectorized planar store fast path first (bigger single-case win per the `ccsd_t_1_dim16` numbers above), with the complex packing fast path as a candidate follow-on once that lands and is re-measured.
 
@@ -6278,8 +6308,8 @@ no decision change".
 
 **What was built** (the recommended next step from the entry immediately above, followed through). `docs/proposals/complex-fast-paths.md` is the design note; two phases shipped on the `complex-packing-fastpath` branch (commits `4a0f942`, `f62ff28`):
 
-  * A vectorized complex A-panel packing fast path (`_pack_complex_contiguous!`/`_pack_complex_contiguous_eligible`, `src/packing.jl`) for `PlanarFormat`, gated on unit-stride `AffineAxis` rows into dense `Complex` storage on a shipped ISA (avx512 today -- `_isa_vector_bytes(Val(:avx512)) == 64`), with an `identity`/`conj` transform and the `RealFormat`/`OneEFormat` exclusions the gate already documents.
-  * A vectorized planar store fast path (`_store_tile_planar_vector!`/`_complex_vector_eligible`, `src/kernels/planar.jl`), same ISA/format/unit-stride gating, on the `PlanarKernel` store side (`store_tile!`).
+  * A vectorized complex A-panel packing fast path (`_pack_complex_contiguous!`/`_pack_complex_contiguous_eligible`, `src/packing/pack_contiguous.jl`) for `PlanarFormat`, gated on unit-stride `AffineAxis` rows into dense `Complex` storage on a shipped ISA (avx512 today -- `_isa_vector_bytes(Val(:avx512)) == 64`), with an `identity`/`conj` transform and the `RealFormat`/`OneEFormat` exclusions the gate already documents.
+  * A vectorized planar store fast path (`_store_tile_planar_vector!`/`_complex_vector_eligible`, `src/microkernels/planar.jl`), same ISA/format/unit-stride gating, on the `PlanarKernel` store side (`store_tile!`).
 
 `OneMKernel` (the `1m`/`1e` format) is unaffected by the store-side phase -- it never had a vectorized store on this branch -- and the packing phase covers only the `PlanarFormat` A-panel, not `OneEFormat` or the B-panel, matching the design doc's stated scope.
 
@@ -6300,11 +6330,11 @@ Two "after" runs (not two "before" runs -- one `f7fa490` run was taken given the
 | store | 9418/15546 = 60.6% | 7756/13187 = 58.8% |
 | microkernel | 5380/15546 = 34.6% | 4837/13187 = 36.7% |
 
-A ~2 point shift, within noise for a single profiling run each side -- effectively unmoved, despite this branch shipping exactly the planar store fast path the previous entry's root cause pointed at. **Traced to `_demote_for_run`'s `T <: Real` guard** (`src/driver.jl`): `ccsd_t_1_dim16`'s A/B index structure does not give the default complex kernel's `mr` a leading unit-stride C run that's already a multiple of it, which is precisely the condition `_demote_for_run` exists to fix for real dtypes by picking a smaller-`mr` menu shape (`docs/decisions.md`, "F2" -- see the entry above the store-fastpath section). Because `_demote_for_run`'s specific method is `where {T <: Real}` with a real-only fallback, `ComplexF64` never gets demoted, the store-eligible unit-stride run condition is never satisfied for this shape's default kernel, and `_complex_vector_eligible` (this branch's new gate) correctly falls back to the scalar path -- not because the new fast path is broken, but because the kernel it would apply to is never selected here. The store fast path is real and measured on shapes where the default kernel's `mr` already divides the run (per the `bench_complex_efficiency.jl` numbers above); `ccsd_t_1_dim16` simply isn't one of them.
+A ~2 point shift, within noise for a single profiling run each side -- effectively unmoved, despite this branch shipping exactly the planar store fast path the previous entry's root cause pointed at. **Traced to `_demote_for_run`'s `T <: Real` guard** (`src/planning/kernel_selection.jl`): `ccsd_t_1_dim16`'s A/B index structure does not give the default complex kernel's `mr` a leading unit-stride C run that's already a multiple of it, which is precisely the condition `_demote_for_run` exists to fix for real dtypes by picking a smaller-`mr` menu shape (`docs/decisions.md`, "F2" -- see the entry above the store-fastpath section). Because `_demote_for_run`'s specific method is `where {T <: Real}` with a real-only fallback, `ComplexF64` never gets demoted, the store-eligible unit-stride run condition is never satisfied for this shape's default kernel, and `_complex_vector_eligible` (this branch's new gate) correctly falls back to the scalar path -- not because the new fast path is broken, but because the kernel it would apply to is never selected here. The store fast path is real and measured on shapes where the default kernel's `mr` already divides the run (per the `bench_complex_efficiency.jl` numbers above); `ccsd_t_1_dim16` simply isn't one of them.
 
 **Two now-measurably-justified follow-ups**, per this design's own Decision 3 (ship the store fast path first, measure, extend the demotion/swap guards as separate later changes):
 
-  1. **Extend `_demote_for_run` to complex** (higher expected value for `:tccg`-like cases such as `ccsd_t_1_dim16`): per the landmine now recorded at its definition site (`src/driver.jl`), this is not a simple `T <: Real` bound relaxation -- the function's demotion search reads the single-argument `kernel_shapes(T)`, whose complex fallback is `_legacy_shape(T)` at register pressure 30 (over AVX2's 16 ymm register budget). A correct extension must route through the two-argument `kernel_shapes(T, method::ComplexMethod)`/`_complex_kernel_from_shape` construction path instead. Needs its own before/after measurement on `ccsd_t_1_dim16`-shaped cases once built.
-  2. **Extend `_prefer_swap` to complex**: now that `PlanarKernel` has a vector store to potentially win with a swap, the old "nothing to win" rationale (recorded stale at `_prefer_swap`'s definition and call site, `src/driver.jl`) no longer holds by construction, but whether the swap is actually a net win for complex on real workloads is unmeasured. Needs its own before/after measurement, separate from (1) -- the two guards interact (a swap changes which orientation's `mr`/run-length `_demote_for_run` would need to fix) and should not be bundled into one unvalidated change.
+  1. **Extend `_demote_for_run` to complex** (higher expected value for `:tccg`-like cases such as `ccsd_t_1_dim16`): per the landmine now recorded at its definition site (`src/planning/kernel_selection.jl`), this is not a simple `T <: Real` bound relaxation -- the function's demotion search reads the single-argument `kernel_shapes(T)`, whose complex fallback is `_legacy_shape(T)` at register pressure 30 (over AVX2's 16 ymm register budget). A correct extension must route through the two-argument `kernel_shapes(T, method::ComplexMethod)`/`_complex_kernel_from_shape` construction path instead. Needs its own before/after measurement on `ccsd_t_1_dim16`-shaped cases once built.
+  2. **Extend `_prefer_swap` to complex**: now that `PlanarKernel` has a vector store to potentially win with a swap, the old "nothing to win" rationale (recorded stale at `_prefer_swap`'s definition and call site, `src/planning/labels.jl`) no longer holds by construction, but whether the swap is actually a net win for complex on real workloads is unmeasured. Needs its own before/after measurement, separate from (1) -- the two guards interact (a swap changes which orientation's `mr`/run-length `_demote_for_run` would need to fix) and should not be bundled into one unvalidated change.
 
 **Merge note (2026-09-23, tensorcontract-rs-comparison / complex-fast-paths reconciliation).** These two follow-ups and the "tensorcontract-rs comparison" milestone above landed independently on separate branches, both touching `_demote_for_run`/`_prefer_swap`. No conflict in substance: this branch's `_demote_for_run` extension (item 2, the `Qk` cutoff) stayed real-dtype-only, exactly per the landmine warning in follow-up (1) above, and item 3's run-length dedup is orthogonal to both follow-ups (it changes how `run_m`/`run_n` are computed and threaded, not the real-vs-complex scope of either guard). Both follow-ups above remain open and unmeasured after this merge.

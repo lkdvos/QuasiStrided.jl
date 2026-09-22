@@ -1,4 +1,4 @@
-# Exercises src/kernels/planar.jl: the planar (split-complex, BLIS "1r")
+# Exercises src/microkernels/planar.jl: the planar (split-complex, BLIS "1r")
 # microkernel.
 #
 # The oracle is deliberately *test-local*. Packed panels are built here by an

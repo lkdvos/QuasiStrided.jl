@@ -17,14 +17,15 @@ using Printf
 # `_classify_backtrace`), NOT a single first-match-wins pass over one bucket
 # list: `SPECIFIC_QS_BUCKETS` matches on function names (unambiguous: a
 # frame named `pack_a!` is packing, wherever it lives), `FALLBACK_QS_BUCKETS`
-# matches on bare file-path substrings (`"kernels/"`, `"driver.jl"`, ...),
+# matches on file-path substrings (the `src/` stage folders: `"microkernels/"`,
+# `"planning/"`, ...),
 # used only if NO frame anywhere in the sample's stack matched a specific
 # name. This two-pass split matters: a stack's leaf is very often a generic
 # or third-party frame (an inlined `SIMD.jl` intrinsic, a `macro expansion`
 # thunk, `Base.range`'s `iterate`) that itself matches nothing specific, and
 # that leaf's *file* can be misleading -- e.g. a `macro expansion` frame
 # inside `_store_tile_vector!`'s generated body lives in the same file
-# (`src/kernels/simd.jl`) as the FMA microkernel, so checking file
+# (`src/microkernels/simd.jl`) as the FMA microkernel, so checking file
 # substrings before walking further up the stack to the actual
 # `_store_tile_vector!` frame would misclassify the whole sample as
 # "microkernel" instead of "store". Running the specific-name pass across
@@ -40,7 +41,7 @@ const SPECIFIC_QS_BUCKETS = [
         [
             "plan_contract", "_plan_contract", "_classify_labels", "_order_free_labels",
             "_prefer_swap", "_default_kernel", "_kernel_from_shape",
-            "_kernel_from_shape", "default_blocking",
+            "default_blocking",
             # Per-call-floor milestone (2026-09-21). These already landed in
             # "planning" through the ancestor walk -- `plan_contract` is their
             # only caller -- so naming them makes the attribution explicit
@@ -78,11 +79,11 @@ const SPECIFIC_QS_BUCKETS = [
 ]
 const FALLBACK_QS_BUCKETS = [
     ("gc/alloc", ["gc"]),
-    ("adapter/prepare", ["tensoroperations.jl", "StridedView"]),
-    ("packing", ["packing.jl"]),
-    ("microkernel", ["kernels/"]),
-    ("driver_loop", ["axis_group.jl"]),
-    ("planning", ["driver.jl"]),
+    ("adapter/prepare", ["integrations/", "StridedView"]),
+    ("packing", ["packing/"]),
+    ("microkernel", ["microkernels/"]),
+    ("driver_loop", ["execution/", "layout/"]),
+    ("planning", ["planning/"]),
 ]
 
 const SPECIFIC_BLAS_BUCKETS = [

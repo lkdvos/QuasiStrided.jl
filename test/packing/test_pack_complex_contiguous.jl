@@ -1,4 +1,4 @@
-# The vectorized complex packing fast path (src/packing.jl,
+# The vectorized complex packing fast path (src/packing/pack_contiguous.jl,
 # `_pack_complex_contiguous!`): Phase 1 of docs/proposals/complex-fast-paths.md,
 # Sections 4.3 (PlanarFormat) / 4.4 (OneEFormat A) / 4.5 (1m's B is planar's).
 #

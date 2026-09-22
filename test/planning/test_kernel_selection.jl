@@ -51,7 +51,7 @@ using QuasiStrided: TargetProfile, CacheLevel, target_profile, cache_topology,
         # than an invented one -- the rule would pick MR = 2W = 4 on 128-bit
         # lanes, narrower and smaller than legacy with nothing to justify it.
         # This is also what keeps the shipped default identical on aarch64,
-        # which test_driver.jl's "SIMDKernel is the default" testset pins.
+        # which execution/test_workspace.jl's "SIMDKernel is the default" testset pins.
         for T in (Float64, Float32)
             @test _derived_shape(synthetic(:neon, 16), T) === _fallback_shape(T)
             @test _derived_shape(synthetic(:unknown, 0), T) === _fallback_shape(T)

@@ -1,11 +1,11 @@
-# Exercises src/kernels/simd.jl: SIMDKernel vs. ScalarKernel on identical
+# Exercises src/microkernels/simd.jl: SIMDKernel vs. ScalarKernel on identical
 # inputs (numerical tolerance, never bitwise equality).
 using QuasiStrided: SIMDKernel, ScalarKernel, lanewidth, avecs_per_column,
     _vector_store_eligible
 using Random
 using SIMD: Vec
 # `parent(::StridedView)` is how the driver obtains a destination's storage
-# (src/driver.jl, `Cstorage = parent(C)`): `Memory{T}` on Julia >= 1.11, a
+# (src/execution/execute.jl, `Cstorage = parent(C)`): `Memory{T}` on Julia >= 1.11, a
 # `Vector{T}` sharing memory on 1.10. The store-path testsets below build
 # their destinations the same way rather than assuming either one.
 using StridedViews: StridedView
@@ -490,7 +490,7 @@ using StridedViews: StridedView
             # milestone review (T8): this is the case QuasiStrided exists
             # for (irregular/permuted output axes), and it depends on
             # `colbase` being computed from `axis_offset(cols, j)` only
-            # inside the `j < n` guard (src/kernels/simd.jl).
+            # inside the `j < n` guard (src/microkernels/simd.jl).
             m, n = MR - 3, NR - 1
             col_offsets = collect(0:2:(2 * (n - 1)))  # a non-affine (but here regular) permutation-style column map
             rows = AffineAxis(0, 1, m)
@@ -515,10 +515,10 @@ using StridedViews: StridedView
     @testset "allocation: execute_tile! on dense 1-D storage WITH TAIL ROWS is allocation-free" begin
         # The reason the vectorized store's tail had to become statically
         # indexed: a dynamically indexed accumulator tuple heap-allocates
-        # above NV = 16 (GUARDRAIL, src/kernels/simd.jl), and widening the
+        # above NV = 16 (GUARDRAIL, src/microkernels/simd.jl), and widening the
         # guard made that branch reachable on Julia >= 1.11. Covers every
         # shipped register shape plus NV = 24 and NV = 28, i.e. past the
-        # cliff and up to the register budget test_target.jl allows.
+        # cliff and up to the register budget planning/test_kernel_selection.jl allows.
         function run_execute(k, dst, pa, pb, kc)
             execute_tile!(k, dst, pa, pb, kc, 1.0, 0.5)
             return nothing

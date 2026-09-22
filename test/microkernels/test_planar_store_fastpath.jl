@@ -1,4 +1,4 @@
-# The vectorized planar complex store fast path (src/kernels/planar.jl,
+# The vectorized planar complex store fast path (src/microkernels/planar.jl,
 # `_store_tile_planar_vector!`): Phase 2 of docs/proposals/complex-fast-paths.md,
 # Section 3.3.
 #
@@ -70,7 +70,7 @@ const STORE_FASTPATH_ON = QSS._complex_fastpath_isa_eligible()
 # ---------------------------------------------------------------------------
 # Independent reference for one output element.
 #
-# Written from Base's definitions (`complex.jl`), NOT from src/kernels/planar.jl:
+# Written from Base's definitions (`complex.jl`), NOT from src/microkernels/planar.jl:
 #
 #   *(z,w)        = Complex(zr*wr - zi*wi, zr*wi + zi*wr)
 #   muladd(z,w,x) = Complex(muladd(zr, wr, -muladd(zi, wi, -xr)),
@@ -420,7 +420,7 @@ end
 # 6. End to end, including conjugation.
 #
 # `store_tile!` itself takes no `transform` -- conjugation is a PACKING-time
-# concept (`atransform`/`btransform`, src/driver.jl), which is why there is no
+# concept (`atransform`/`btransform`, src/execution/execute.jl), which is why there is no
 # `conj` argument to vary in sections 1-3 above. It is covered here instead, at
 # the level where it exists, so that "conj still works with the store fast path
 # live" is asserted rather than argued.

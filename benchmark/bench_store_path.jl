@@ -1,5 +1,5 @@
 # Tile-level cost of the scattered-store path (`_store_tile_scattered!`) vs.
-# the vectorized fast path in `store_tile!` (src/kernels/simd.jl), across
+# the vectorized fast path in `store_tile!` (src/microkernels/simd.jl), across
 # destination-storage variants (`Vector{T}`, `Memory{T}`, strided-hot,
 # strided-cold, and MR-tail versions of the first two). Also attempts to
 # reproduce the "SIMDKernel reaches 101-103 GFLOP/s" accumulate-only claim
@@ -50,7 +50,7 @@ const KC_VALUES = parse_ints(argopt("kc", "16,256"))
 
 shape_label(MR, NR, W) = "$(MR)x$(NR)x$(W)"
 
-# Packed-panel construction: mirrors test/test_simd_kernel.jl's
+# Packed-panel construction: mirrors test/microkernels/test_simd_kernel.jl's
 # `packed_from_matrices` (same offset formulas/order).
 
 function build_packed(::Type{T}, kernel, kc::Int, rng) where {T}

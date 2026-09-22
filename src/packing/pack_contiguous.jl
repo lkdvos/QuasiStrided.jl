@@ -2,7 +2,7 @@
 # deinterleave-and-copy for complex A/B, each used only for the one sliver
 # shape it can serve.
 
-# `transform` is `identity` or `conj` (src/driver.jl, `plan_contract`). On a
+# `transform` is `identity` or `conj` (src/planning/plan.jl, `plan_contract`). On a
 # real element type `conj` is the identity, so both admit a straight copy.
 # This is only the *value* half of the eligibility test: a straight copy is
 # vectorizable only in conjunction with the eltype/storage/destination
@@ -13,9 +13,9 @@
 
 # Gate for `_pack_a_contiguous!`, kept as its own function so a test can
 # assert it fires for the driver's argument types and stays off for every
-# ineligible shape (test/test_packing.jl). All but `m == MR` and the stride
+# ineligible shape (test/layout/test_tiles.jl). All but `m == MR` and the stride
 # test fold at compile time (they inspect types only). `_unit_stride_rows`
-# (src/kernels/simd.jl) has methods for exactly the three `Axis` kinds and
+# (src/microkernels/simd.jl) has methods for exactly the three `Axis` kinds and
 # deliberately NO fallback: an unknown axis type must be a MethodError here,
 # never a silent `true`/`false`.
 @inline function _pack_a_contiguous_eligible(
@@ -38,7 +38,7 @@ end
 # on the driver's argument types (ccqlin038 / Julia 1.13; `smallN_256x256x12`
 # went from 62% to 33% packing share and 16 to 35 GFLOP/s; docs/decisions.md,
 # "Packing speed"). Same eligibility shape as `_vector_store_eligible`
-# (src/kernels/simd.jl).
+# (src/microkernels/simd.jl).
 @inline function _pack_a_contiguous!(
         packed::PackedPanel{T}, storage::DenseVector{T}, rowbase::Int, cols::C,
         ::Val{MR}, kc::Int
@@ -84,9 +84,9 @@ end
 # ---------------------------------------------------------------------------
 
 # The value half of the gate, mirroring `_copies_unchanged` above: the two
-# transforms the driver can produce (src/driver.jl, `plan_contract`) are the
+# transforms the driver can produce (src/planning/plan.jl, `plan_contract`) are the
 # two the shuffle patterns below cover. Anything else -- including the
-# arbitrary closures test/test_packing_complex.jl packs with -- is a MUST-fall-
+# arbitrary closures test/packing/test_pack_complex.jl packs with -- is a MUST-fall-
 # back, not a MAY: `_pack_alt` has no method for it.
 @inline _complex_pack_transform_eligible(::typeof(identity)) = true
 @inline _complex_pack_transform_eligible(::typeof(conj)) = true
@@ -154,7 +154,7 @@ end
 # never a runtime gather. `PD` is `mr(kernel)`/`nr(kernel)`, which the driver
 # derives from `kernel_shapes`; the patterns therefore follow the shipped menus
 # automatically (proposal Section 6.2). These are `@generated` for the same
-# reason the store paths in src/kernels/simd.jl are: `shufflevector` needs a
+# reason the store paths in src/microkernels/simd.jl are: `shufflevector` needs a
 # literal `Val` index tuple, and `Val(ntuple(...))` is not reliably one.
 #
 # `src` is `[re_0, im_0, ..., re_{PD-1}, im_{PD-1}]`, the `PD` source elements
@@ -162,7 +162,7 @@ end
 
 # PlanarFormat ("1r"), one whole K step: `[re_0 .. re_{PD-1} | im_0 .. im_{PD-1}]`.
 # Both halves are one contiguous `2PD`-real run at `p * packed_*_per_k`
-# (src/complex_format.jl, `packed_a_plane_offset`: plane 0 at `+0`, plane 1 at
+# (src/microkernels/interface.jl, `packed_a_plane_offset`: plane 0 at `+0`, plane 1 at
 # `+PD`, adjacent), so the whole K step is a single store -- the destination
 # needs no shuffle of its own, only the source needs deinterleaving.
 @generated function _planar_pack_shuffle(

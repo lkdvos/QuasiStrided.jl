@@ -28,7 +28,7 @@ end
 # Extent bound, nonnegative `kc`, packed capacity, then (Phase 2b) the
 # one-time storage-bounds check before any `@inbounds` loop. Returns
 # `(valid, kc)`; `kc == 0` is the no-op the caller returns from. One bound type
-# parameter per argument, as at `pack_a!` in src/kernel.jl.
+# parameter per argument, as at `pack_a!` in src/microkernels/interface.jl.
 #
 # `packed_a_length`/`packed_b_length` count ELEMENTS for a real descriptor and
 # REALS for a complex one, at the logical `kc` in both cases, so the same check
@@ -39,7 +39,7 @@ end
 # the `checked_tile_storage_bounds` call is folded away entirely. Only
 # `unsafe_pack_a!`/`unsafe_pack_b!` ever pass `Val(false)`, and only from a
 # caller that has already validated the WHOLE macro block this sliver belongs
-# to (src/driver.jl, `_execute_nest!`). Every other check -- extents, the
+# to (src/execution/execute.jl, `_execute_nest!`). Every other check -- extents, the
 # packed-buffer capacity, the `kc == 0` no-op -- is kept in both modes.
 @inline _check_pack_a(packed::V, source::QSTile, kernel::K) where {V, K} =
     _check_pack_a(packed, source, kernel, Val(true))

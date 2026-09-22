@@ -184,7 +184,7 @@ end
 # 1024x256x1024 at ComplexF64 is a >1 GB fixture and not needed for coverage
 # here). These go through the default complex kernel the driver picks for
 # a plain label/dims contraction -- the "planar" method
-# (`_default_method` in src/driver.jl always returns `PlanarMethod()`
+# (`_default_method` in src/planning/kernel_selection.jl always returns `PlanarMethod()`
 # unless a kernel is explicitly named, which only the DIRECT_CASES 1m entries
 # below do). `_c64`/`_c32` suffix distinguishes these from the real-dtype ids.
 const _COMPLEX_GRID = [
@@ -232,7 +232,7 @@ const DIRECT_CASES = Any[
 ]
 
 # 1m (`OneMKernel`) is reachable ONLY by explicitly naming the kernel to
-# `plan_contract` (src/driver.jl: `_default_method` always returns
+# `plan_contract` (src/planning/kernel_selection.jl: `_default_method` always returns
 # `PlanarMethod()`), so the label/dims `CASES` above -- which all go through
 # the default kernel -- never exercise it. Exercise it here via
 # `plan_contract(...; kernel = ...)` on a couple of MAIN_SHAPES, both complex

@@ -12,9 +12,9 @@ says so.
 
 Frozen and untouched by anything proposed here, per the standing list in
 `.claude/orchestration/profiling-followups.md`: `QuasiStridedBackend`'s
-hard-reject invariant (`src/tensoroperations.jl:358-366`, `:304-357`),
-`src/target.jl`'s register-shape derivation, and the beta-applied-once /
-conjugation numerical semantics (`src/driver.jl:1095`, `:821-836`,
+hard-reject invariant (`src/integrations/tensoroperations.jl`, `:304-357`),
+`src/hardware/target.jl`'s register-shape derivation, and the beta-applied-once /
+conjugation numerical semantics (`src/execution/execute.jl`, `:821-836`,
 `:651-688`). Section 6 proposes nothing that modifies any of them, and says so
 at each point where a reader might expect it to.
 
@@ -90,7 +90,7 @@ end
   else (`maybeinline(::Any, ::Any, ::Any, ::Any) = false`, line 210). The
   static test is `sizeof(T)*M*N < 176*mᵣ*nᵣ` for a column-major `A`. **This
   tier has no analog in QuasiStrided at all**: `plan_contract` receives
-  runtime extents from `StridedView`s (`src/driver.jl:801-814`), and the
+  runtime extents from `StridedView`s (`src/planning/plan.jl`), and the
   TensorOperations adapter never sees a static size. The runtime version of
   the idea -- "a problem so small the fixed per-call cost dominates" -- is a
   different lever, discussed in Section 5.2.
@@ -119,10 +119,10 @@ end
 - Octavian's `Mc`/`Kc`/`Nc` come from a cache-size model with per-arch
   fitted constants (`block_sizes.jl:4-33`, `global_constants.jl:23-60`).
   This project's `default_blocking` deliberately uses measured constants and
-  not a cache model (`src/blocking.jl:33-38`, decisions.md "Why cache
+  not a cache model (`src/planning/blocking.jl`, decisions.md "Why cache
   geometry is still not used"), so `dontpack`'s `M·K ≤ Mc·Kc` arm would be
   read here against `mc·kc = 128·256 = 32768` (`Float64`) and `96·768 =
-  73728` (`Float32`) on AVX-512 (`src/blocking.jl:85-86`).
+  73728` (`Float32`) on AVX-512 (`src/planning/blocking.jl`).
 
 Octavian's block sizes were **not** evaluated on this host for this document
 (no local environment has Octavian as a dependency; the Phase H comparison
@@ -145,7 +145,7 @@ triage of `ccsd_t_1_dim16` put the store path at 75.30% / 88.36%
 results"). Every subsequent step confirmed that attribution:
 
 - The label-order milestone (`_order_free_labels`, `_prefer_swap`,
-  `src/driver.jl:127-180`, `:864-876`) turned the class into a **1.96x-6.91x
+  `src/planning/labels.jl`, `:864-876`) turned the class into a **1.96x-6.91x
   win** over `StridedBLAS` at `dim=16` across all eight case/dtype cells
   (decisions.md, "Label-order milestone", table under "The four regression
   cases"). At `dim=8`, two `Float32` cells (`ccsd_t_2`, `ccsd_t_4`) remain
@@ -157,7 +157,7 @@ results"). Every subsequent step confirmed that attribution:
   (`ccsd-t-stall` branch, decisions.md there, "Kernel-stalled/store-dominated
   fix") confirmed two causes with LLVM/native dumps and structural sliver
   dumps:
-  - **F1**: `Base.accumulate` for `SIMDKernel` (`src/kernels/simd.jl:131`)
+  - **F1**: `Base.accumulate` for `SIMDKernel` (`src/microkernels/simd.jl`)
     was not inlined into `execute_tile!`, so the 768-byte accumulator went
     through a real `memset` and a stack round-trip per micro-tile. One
     `@inline`: **+8.9%** on `ccsd_t_1` `dim=16` `Float64`, +3.4% (no
@@ -167,7 +167,7 @@ results"). Every subsequent step confirmed that attribution:
     -- not `mr ≤ run` (refuted by counterexample sweep,
     `benchmark/probes/probe_ccsd_t_stall_f2rule.jl`). The `Float32` default
     `(32,6,16)` against a run of 16 sent every store down the scattered
-    path. `_demote_for_run` (`ccsd-t-stall`, `src/driver.jl:197-209`, called
+    path. `_demote_for_run` (`ccsd-t-stall`, `src/planning/kernel_selection.jl`, called
     at `:904-906` and `:912-914` after the swap decision) picks the largest
     menu shape whose `mr` divides the run: **2.17x** (`dim=16` `Float32`),
     **1.92x** (`dim=8` `Float32`), store share 75% to 21.73%.
@@ -183,7 +183,7 @@ Two bookkeeping facts for the coordinator: `_demote_for_run` is **not on
 `main`** at `ebfbeb3` (it is on `ccsd-t-stall` at `1da0ef7`), and that branch
 was cut from `f318eb9`, so it does **not** contain the packing fix `8dd01dd`
 (verified with `git merge-base --is-ancestor`). The two touch disjoint files
-(`src/driver.jl` + `src/kernels/simd.jl` vs. `src/packing.jl`), so a rebase is
+(`src/planning/kernel_selection.jl` + `src/microkernels/simd.jl` vs. `src/packing/pack.jl`), so a rebase is
 expected to be clean, but the combined tree has not been measured.
 
 ### 3.2 Finding 2: the packing code was slow, and that is already fixed
@@ -193,7 +193,7 @@ real packing loop as it exists today"). The mechanism was a per-element
 conditional load (`v = i < valid ? load(i,p) : zero(T)`) that LLVM cannot
 if-convert without a masked load, so `_pack_panel!` never vectorized:
 0.74-0.94 ns/element for `A` at `Float64` against 0.26-0.28 for `copyto!` of
-the same bytes. The fix, all in `src/packing.jl`: a full/tail split of
+the same bytes. The fix, all in `src/packing/pack.jl`: a full/tail split of
 `_pack_panel!` (`:102-123`) and a gated contiguous fast path
 `_pack_a_contiguous!` (`:162-175`, gate `_pack_a_contiguous_eligible`
 `:141-146`: `PackedPanel` destination, `DenseVector` source, `identity`/real
@@ -421,7 +421,7 @@ residual loss lives:
 - `plan_contract` allocates ~3.8-4.4 KB per call (README, decisions.md
   "T10/T11", complex milestone close) and costs ~4.4-6.7 us (STATUS.md,
   "What works, measured"): `_classify_labels` builds three `Set`s and three
-  `Vector{Int}`s (`src/driver.jl:30-34`), `_order_free_labels` allocates a
+  `Vector{Int}`s (`src/planning/labels.jl`), `_order_free_labels` allocates a
   `sortperm` (`:131-132`), `_build_pair_group` and the swap path build
   another `kgroup`. Labels are `NTuple`s of static length; all of this can be
   tuple arithmetic. The T4 grid puts `planning` at 17-27% on `plain_64` and
@@ -429,11 +429,11 @@ residual loss lives:
   hypothesises the double `_default_kernel` resolution (`:855-856`) behind
   its 18 microsecond-scale regressions (1.15-2.48x at 4-38 us).
 - Per-sliver validation (`_check_pack_a/b` + `checked_tile_storage_bounds`,
-  `src/packing.jl:45-83`, `src/tiles.jl:263-272`) at 7.4% of
+  `src/packing/pack.jl`, `src/layout/tiles.jl`) at 7.4% of
   `ao2mo_2_dim16`, and `_execute_tile_prologue!`'s per-tile
-  `checked_tile_storage_bounds` (`src/kernel.jl:188`). Hoisting to
+  `checked_tile_storage_bounds` (`src/microkernels/interface.jl`). Hoisting to
   once-per-macro-block changes `pack_a!`'s documented "all validation before
-  any write" contract (`src/packing.jl:177-187`) -- the D1 record flagged
+  any write" contract (`src/packing/pack.jl`) -- the D1 record flagged
   this as "a separate decision", and it is one of the decisions requested in
   Section 7.
 - `driver_loop` at 28.7% of `ao2mo_2_dim16`: `fill_offsets!` +
@@ -470,7 +470,7 @@ the accumulator -- `store_tile!`, `beta_eff`, the scattered/vector store
 choice -- is untouched.
 
 Decided once per plan, at plan time, on quantities `plan_contract` already
-has (`src/driver.jl:838-856`):
+has (`src/planning/plan.jl`):
 
 | condition | source | why |
 |---|---|---|
@@ -480,8 +480,8 @@ has (`src/driver.jl:838-856`):
 | `cld(Qn, nr) ≤ N_SLIVERS_MAX` (proposed `2`) | `Qn`, `nr(kernel)` | the reuse trigger. Each `A` sliver is consumed `cld(Qn,nr)` times per K-block; below ~2-3 the packed copy is read fewer times than it cost to write. Deliberately *not* Octavian's `Qm·Qk ≤ mc·kc` arm, which Table 4.1 shows firing on 1%-packing wins |
 | `run_A == Qm || run_A % mr == 0`, with `run_A = _leading_unit_run(morder, indA, A)` | reuse of `:142-156` on `A`'s strides (currently only applied to `C`) | exactly F2's predicate, on the source side: every M-sliver of `A` is a unit-stride run of `mr` rows, so a `Vec{W}` load per row-vector is legal without padding |
 | `Qm % mr == 0` (increment 1 only) | `Qm`, `mr` | a tail sliver has `m < mr` valid rows; the kernel loads all `mr`, and unpacked memory has no zero padding to read -- over-reading past the tail is a memory-safety bug, not a rounding one. Increment 2 may pack only the tail sliver (per-sliver decision, Section 6.3) |
-| `A`'s K composite is rank-1 affine in `A` | `normalize_group` over `kgroup`'s `A` map alone (a one-map variant of `src/axis_group.jl:277-327`) | the kernel needs one runtime `lda` per plan; a multi-label K that does not fold has no single stride. Re-checked at run time from `dK_A.regular` (`:1090`) as a belt-and-braces fallback to packing |
-| `parent(A) isa DenseVector{T}` | `Astorage` | same storage class `_pack_a_contiguous_eligible` and `_vector_store_eligible` already require (`src/packing.jl:144`, `src/kernels/simd.jl:180-181`) |
+| `A`'s K composite is rank-1 affine in `A` | `normalize_group` over `kgroup`'s `A` map alone (a one-map variant of `src/layout/axis_group.jl`) | the kernel needs one runtime `lda` per plan; a multi-label K that does not fold has no single stride. Re-checked at run time from `dK_A.regular` (`:1090`) as a belt-and-braces fallback to packing |
+| `parent(A) isa DenseVector{T}` | `Astorage` | same storage class `_pack_a_contiguous_eligible` and `_vector_store_eligible` already require (`src/packing/pack_contiguous.jl`, `src/microkernels/simd.jl`) |
 
 Every condition is a plan-time scalar comparison; `_classify_slivers!`
 (`:609-621`) is *not* needed for the decision because the eligibility is
@@ -492,10 +492,10 @@ per-sliver refinement.
 ### 6.2 Is an unpacked operand even a legal kernel input? (the prerequisite gate)
 
 The kernel reads `A` through `panel_vload(Vec{W,T}, packed_a,
-packed_a_offset(kernel, v*W, p))` (`src/kernels/simd.jl:96-99`), where
+packed_a_offset(kernel, v*W, p))` (`src/microkernels/simd.jl`), where
 `packed_a_offset(kernel, i, p) = i + MR*p` is a frozen format
-(`src/kernel_descriptor.jl:1-2`, `:43`). `panel_vload` on a `PackedPanel` is
-`vload(Vec{W,T}, p.ptr + sizeof(T)*o)` (`src/panel.jl:37-38`) -- it accepts
+(`src/packing/format.jl`, `:43`). `panel_vload` on a `PackedPanel` is
+`vload(Vec{W,T}, p.ptr + sizeof(T)*o)` (`src/packing/panel.jl`) -- it accepts
 any address. So a `StridedAPanel{T}(ptr::Ptr{T}, lda::Int)` with an offset
 rule `i + lda*p` is representable **without redefining the descriptor's
 formula**: the generated body's `packed_a_offset(kernel, $(v*W), p)` becomes
@@ -533,18 +533,18 @@ without touching `src/` and this document's Section 1 stands unqualified.
 
 ### 6.3 Code paths, if G6.2 passes
 
-- `src/panel.jl`: `struct StridedAPanel{T}; ptr::Ptr{T}; lda::Int; rows::Int; kc::Int; end`
+- `src/packing/panel.jl`: `struct StridedAPanel{T}; ptr::Ptr{T}; lda::Int; rows::Int; kc::Int; end`
   (isbits), a `strided_a_panel(storage, base0, lda, rows, kc)` constructor,
   `panel_vload` method (identical to `PackedPanel`'s), and `Base.length`
   returning `rows + lda*(kc-1)` so `_execute_tile_prologue!`'s capacity check
-  (`src/kernel.jl:195-196`) still means "the last address the kernel will
+  (`src/microkernels/interface.jl`) still means "the last address the kernel will
   touch is inside the span the caller validated" -- or, cleaner, a
   `_check_a_capacity(kernel, panel, kc)` method pair so the packed check is
   untouched and the strided one asserts `panel.kc >= kc`.
-- `src/kernels/simd.jl:96-99`: `_a_offset(packed_a, kernel, i, p)` as
+- `src/microkernels/simd.jl`: `_a_offset(packed_a, kernel, i, p)` as
   described in 6.2. One new function, one changed expression in the
   generated body, zero change for existing callers.
-- `src/driver.jl`: `ContractPlan` gains a type parameter or `Val` field
+- `src/planning/plan.jl`: `ContractPlan` gains a type parameter or `Val` field
   `ADirect` (a `Bool` field would work too, but the nest's branch should be
   a compile-time constant so the packed path is byte-identical when it is
   off -- the project's established pattern for "the real path is unchanged
@@ -555,12 +555,12 @@ without touching `src/` and this document's Section 1 stands unqualified.
   `strided_a_panel(plan.Astorage, plan.Abase + ws.m_buf_A[rfirst+1] +
   ws.k_buf_A[1], dK_A.stride, MRk, kblock)` after one
   `checked_tile_storage_bounds(plan.Abase, rowsA, colsA_k,
-  length(plan.Astorage))` per sliver (O(1) for affine axes, `src/tiles.jl:263`)
+  length(plan.Astorage))` per sliver (O(1) for affine axes, `src/layout/tiles.jl`)
   -- the same guarantee `pack_a!` gives today, and exactly the argument
-  `_pack_a_contiguous!`'s safety note makes (`src/packing.jl:150-156`). Two
+  `_pack_a_contiguous!`'s safety note makes (`src/packing/pack_contiguous.jl`). Two
   concretely-typed `_execute_micro_tile!` call sites under the compile-time
   branch, never a `Union`-typed panel argument (GUARDRAIL at `:536-543`).
-- `src/workspace.jl`: `packed_a` still allocated (a plan may be re-planned
+- `src/execution/workspace.jl`: `packed_a` still allocated (a plan may be re-planned
   into the same pooled workspace with a different verdict; `reserve!` is
   grow-only, `:249-282`). No change needed; noted so nobody "optimises" it
   away and breaks the pool invariant.
@@ -578,7 +578,7 @@ without touching `src/` and this document's Section 1 stands unqualified.
   (`:1095`) and the K-block loop structure are not modified; the tier
   changes where the kernel *reads* `A`, not when or how it *writes* `C`.
   The existing "beta applied exactly once across multiple M/N/K blocks" and
-  "beta=0 with NaN-filled C" testsets (`test/test_macro_driver.jl:156-185`)
+  "beta=0 with NaN-filled C" testsets (`test/execution/test_macro_blocking.jl`)
   apply verbatim to an A-direct plan.
 - **Values**: the accumulator receives `A[m, k]` from the same address the
   packer would have read (`base + rows.base + i + col_offset(p)`, packing.jl
@@ -594,16 +594,16 @@ without touching `src/` and this document's Section 1 stands unqualified.
   `op` folding changes. The complex path is excluded (6.5), so no
   `transform` is ever applied in-kernel.
 - **Bounds**: one `checked_tile_storage_bounds` per direct sliver, before
-  any `@inbounds`/pointer read -- the Phase 2b review rule (`src/tiles.jl:221-222`).
+  any `@inbounds`/pointer read -- the Phase 2b review rule (`src/layout/tiles.jl`).
 - **Adapter invariant**: `QuasiStridedBackend` neither knows nor needs to
   know about the tier; eligibility never causes a rejection or a fallback,
   only a different internal path. The hard-reject contract at
-  `src/tensoroperations.jl:358-366` is not touched.
+  `src/integrations/tensoroperations.jl` is not touched.
 
 ### 6.5 Complex: excluded from increment 1, and structurally
 
 `PlanarKernel` reads `A` as two real planes (`re` at `t`, `im` at `vr + t`,
-`src/packing.jl:264-271`) and `OneMKernel` reads the 1e 2x2 real block
+`src/packing/pack.jl`) and `OneMKernel` reads the 1e 2x2 real block
 (`:273-297`); complex data in memory is interleaved `(re, im)`. An unpacked
 complex `A` would need a de-interleaving vector load path -- a new kernel
 body, not a new panel type -- and would have to apply `conj` in-kernel,
@@ -628,7 +628,7 @@ proposal".
 - **`_prefer_swap`**: after a swap, "`A`" is the original `B`
   (`ContractPlan` docstring, `:704-708`); the predicate is evaluated on
   whichever operand ended up in the A role, using its own `ind`/strides.
-  The pinning test at `test/test_driver.jl:1140-1203` reads `mr(plan.kernel)`
+  The pinning test at `test/planning/test_plan_contract.jl` reads `mr(plan.kernel)`
   post-plan (`:1200`) against a pre-demotion swap decision; A-direct does not
   change `mr`, so it cannot disturb that assertion further than F2 already
   might.
@@ -638,9 +638,9 @@ proposal".
   statement of the tier's marginal value: it removes a fast memcpy, not a
   slow loop.
 - **`_default_kernel`'s `Qm < mr` demotion** (`:515-520`) and its `===` pin
-  (`test/test_driver.jl:479`, `test/test_target.jl:189-195`): untouched;
+  (`test/planning/test_plan_contract.jl`, `test/planning/test_kernel_selection.jl`): untouched;
   A-direct is downstream of kernel resolution and never constructs a kernel.
-- **Allocator path** (`src/tensoroperations.jl:332-357`): the workspace is
+- **Allocator path** (`src/integrations/tensoroperations.jl`): the workspace is
   still acquired and released identically; `packed_a` is merely not written.
 - **Threading (deferred)**: `StridedAPanel` borrows a pointer into user
   storage, so the `GC.@preserve` scope (`:1047`) must also cover
@@ -657,7 +657,7 @@ proposal".
   it (a regression there would mean the branch is not compile-time).
 - **Allocation**: the new panel is isbits; the compile-time branch adds no
   Union; the added `GC.@preserve` does not allocate. Must be asserted on the
-  scattered fixture (`test/test_target.jl:175-184`) and on an eligible
+  scattered fixture (`test/planning/test_kernel_selection.jl`) and on an eligible
   fixture, both dtypes, and on Julia 1.10 LTS where the `NTuple` accumulator
   is already fragile (STATUS.md, "Published").
 - **Specialisation count**: one extra `_execute_nest!` specialisation per
@@ -669,7 +669,7 @@ proposal".
   `test/forced_isa_runner.jl` with `avx2` and `unknown` -- the F2 review's
   blocking finding was exactly this mistake.
 - **Not a correctness risk but a record risk**: the frozen packed format
-  comment in `src/kernel_descriptor.jl:1-2` says "do not redefine". The
+  comment in `src/packing/format.jl` says "do not redefine". The
   design does not redefine it; the new offset rule lives on the new panel
   type. The comment should gain one sentence saying so, or a future reader
   will think it was violated.
@@ -677,7 +677,7 @@ proposal".
 ### 6.8 Verification plan
 
 1. **G6.2** first (Section 6.2). No `src/` change until it passes.
-2. **Oracle tests** (`test/test_macro_driver.jl` style): randomized
+2. **Oracle tests** (`test/execution/test_macro_blocking.jl` style): randomized
    agreement vs. dense matmul and vs. `execute_tilewise!` on eligible
    shapes (`Qn ∈ {1, 6, 12}`, `Qm ∈ {mr, 2mr, 16mr}`, `Qk ∈ {1, 16, 256,
    1000}` to cross `kc`), alpha/beta in {0, 1, -0.5/2.5}, NaN-poisoned `C`
@@ -751,10 +751,10 @@ this document without an explicit go-ahead on the items below.**
 
 Sliver counts are `cld(Qm, mr)` and `cld(Qn, nr)` at the resolved shape
 (`Float64` `(16,6,8)`, `Float32` `(32,6,16)` on AVX-512; `_default_kernel`
-demotes to `(8,6,4)`/`(8,6,8)` when `Qm < mr`, `src/driver.jl:515-520`).
+demotes to `(8,6,4)`/`(8,6,8)` when `Qm < mr`, `src/planning/kernel_selection.jl`).
 `kc_eff = min(kc, Qk)` with `kc = 256` (`Float64`) / `768` (`Float32`). The
 Octavian trigger's `mc·kc` uses `default_blocking(::Val{:avx512}, T)`
-(`src/blocking.jl:85-86`). Packing shares are from decisions.md's "Packing
+(`src/planning/blocking.jl`). Packing shares are from decisions.md's "Packing
 speed" table (post-fix) or the "Profiling pass" T3 table (pre-fix, marked).
 The `smallN` per-call decomposition: `Qn = 12 -> 2` N-slivers, `Qk = 256 ->
 1` K-block, `Qm = 256 / mc = 128 -> 2` M-blocks, so `A` is packed once in
@@ -763,7 +763,7 @@ element loaded.
 
 ## Appendix B. Files and lines this document relies on (`main` @ `ebfbeb3`)
 
-- `src/driver.jl`: `_classify_labels` 19-88; `_order_free_labels` 127-133;
+- `src/planning/labels.jl`: `_classify_labels` 19-88; `_order_free_labels` 127-133;
   `_leading_unit_run` 142-156; `_prefer_swap` 174-180; menus 300-301;
   `_kernel_from_shape` 356-365; `_default_kernel(T,Qm,Qn)` 515-520;
   `_axis_of` 544-547; `_pack_sliver!` 560-566; `_execute_micro_tile!`
@@ -772,31 +772,31 @@ element loaded.
   `_plan_contract` 887-937; `execute!` 1016-1053; `_execute_nest!`
   1056-1157 (B pack 1098-1106, A pack 1120-1128, micro-tiles 1131-1144,
   `beta_eff` 1095); `execute_tilewise!` 1175-1259.
-- `ccsd-t-stall` @ `1da0ef7`, `src/driver.jl`: `_demote_for_run` 197-209;
+- `ccsd-t-stall` @ `1da0ef7`, `src/planning/kernel_selection.jl`: `_demote_for_run` 197-209;
   call sites 904-906, 912-914.
-- `src/packing.jl`: `_check_pack_a/b` 45-83; `_pack_panel!` 102-123;
+- `src/packing/pack.jl`: `_check_pack_a/b` 45-83; `_pack_panel!` 102-123;
   `_copies_unchanged` 130-132; `_pack_a_contiguous_eligible` 141-146;
   `_pack_a_contiguous!` 162-175; `pack_a!` 188-205; `pack_b!` 218-230;
   complex packing 232-392.
-- `src/panel.jl`: `PackedPanel` 17-20; `panel_vload` 37-40; `panel_load` 42-43.
-- `src/kernels/simd.jl`: `_accumulate_step` 80-119 (A loads 96-99, B loads
+- `src/packing/panel.jl`: `PackedPanel` 17-20; `panel_vload` 37-40; `panel_load` 42-43.
+- `src/microkernels/simd.jl`: `_accumulate_step` 80-119 (A loads 96-99, B loads
   100-103); `accumulate` 131-141; `_unit_stride_rows` 145-147;
   `_vector_store_eligible` 180-181; `_store_tile_vector!` 244-301;
   `store_tile!` 314-326; `execute_tile!` 336-345.
-- `src/kernel.jl`: `_execute_tile_prologue!` 173-201.
-- `src/kernel_descriptor.jl`: frozen formats 1-2, 43, 51, 64-65.
-- `src/workspace.jl`: `ContractWorkspace` 42-105; `reserve!` 249-282.
-- `src/tiles.jl`: `PtrScatterAxis` 56-65; `QSTile` 128-133;
+- `src/microkernels/interface.jl`: `_execute_tile_prologue!` 173-201.
+- `src/packing/format.jl`: frozen formats 1-2, 43, 51, 64-65.
+- `src/execution/workspace.jl`: `ContractWorkspace` 42-105; `reserve!` 249-282.
+- `src/layout/tiles.jl`: `PtrScatterAxis` 56-65; `QSTile` 128-133;
   `checked_tile_storage_bounds` 263-272.
-- `src/axis_group.jl`: `fill_offsets!` 136-199; `BlockDescriptor` 211-216;
+- `src/layout/axis_group.jl`: `fill_offsets!` 136-199; `BlockDescriptor` 211-216;
   `describe_block` 227-251; `normalize_group` 277-327.
-- `src/blocking.jl`: measured AVX-512 rows 85-86; "not a cache model" 33-38.
-- `src/tensoroperations.jl`: `_qs_prepare` 248-276; `tensorcontract!`
+- `src/planning/blocking.jl`: measured AVX-512 rows 85-86; "not a cache model" 33-38.
+- `src/integrations/tensoroperations.jl`: `_qs_prepare` 248-276; `tensorcontract!`
   304-357; hard-reject note 358-366.
-- Tests: `test/test_driver.jl:479` (kernel `===` pin), `:1140-1203` (swap
-  pinning; `mr(plan.kernel)` read at 1200); `test/test_target.jl:175-184`
+- Tests: `test/planning/test_plan_contract.jl` (kernel `===` pin), `:1140-1203` (swap
+  pinning; `mr(plan.kernel)` read at 1200); `test/planning/test_kernel_selection.jl`
   (scattered zero-alloc), `:189-195` (Qm demotion pin);
-  `test/test_macro_driver.jl:156-185`, `:237`, `:274` (beta-once, staleness,
+  `test/execution/test_macro_blocking.jl`, `:237`, `:274` (beta-once, staleness,
   tilewise oracle); `test/forced_isa_runner.jl`.
 - Benchmarks: `benchmark/results/dontpack-C0-feature-table.csv`;
   `benchmark/profile_to_suite.jl`, `benchmark/profile_buckets.jl`;

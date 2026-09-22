@@ -59,7 +59,7 @@ export QuasiStridedBackend
 
 # Hardware detection runs once per process, never at precompile time: a .ji
 # cached on one node class of a shared depot must not carry another node's
-# feature set (src/target.jl).
+# feature set (src/hardware/target.jl).
 function __init__()
     _init_target!()
     return nothing

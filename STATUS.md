@@ -113,7 +113,7 @@ One thing CI caught that local testing (Julia 1.12.6 only) had missed:
 capability gap (the `NTuple{NV,Vec{W,T}}` accumulator isn't kept
 register-resident on the older compiler), not a correctness issue. Handled
 by marking the two allocation assertions `skip=(VERSION < v"1.11")` in
-`test/test_simd_kernel.jl` rather than weakening or deleting them, so the
+`test/microkernels/test_simd_kernel.jl` rather than weakening or deleting them, so the
 gap stays visible rather than hidden. `julia = "1.10"` compat is otherwise
 honored (all 13026 correctness assertions pass on 1.10).
 
@@ -141,9 +141,9 @@ milestone. Disposition recorded in `docs/decisions.md`'s "Phase D" section.
       `AbstractVector{T}`. 12777/12777 passing.
 - [x] **Phase C** (macro-kernel rewrite + independent oracle): `execute!`
       rewritten as a BLIS five-loop (`NC`/`KC`/`MC`) nest with packed-panel
-      reuse (`src/blocking.jl`, `src/driver.jl`); `execute_tilewise!` kept
+      reuse (`src/planning/blocking.jl`, `src/execution/oracle.jl`); `execute_tilewise!` kept
       unexported as the pre-existing-behavior oracle; independent
-      `test/test_macro_driver.jl` written blind to the implementation and
+      `test/execution/test_macro_blocking.jl` written blind to the implementation and
       integrated. Closed the Phase A allocation bug as a side effect:
       `execute!` measured 0 B (SIMDKernel) / 176 B-per-tile-only
       (ScalarKernel, the already-accepted `zero_accumulator` cost) — no
@@ -169,7 +169,7 @@ milestone. Disposition recorded in `docs/decisions.md`'s "Phase D" section.
       `Pkg.test()` after the constant swap: 12903/12903 passing.
 - [x] **Phase F** (final review, docs, CI, merge): Sonnet-High review of
       everything since Phase D — no blocking findings; two should-fix
-      items (a stale "provisional" docstring in `src/blocking.jl` after
+      items (a stale "provisional" docstring in `src/planning/blocking.jl` after
       Phase E's constants landed, and a committed benchmark CSV whose
       `reps` column was mislabeled `5` instead of the actual `9` used)
       fixed and verified; independently re-derived and confirmed the
@@ -217,11 +217,11 @@ bookkeeping, since fixed) is in `docs/decisions.md`'s close section.
 - [x] **Phase B** (four-way parallel, disjoint files, all depending on T0
       only): **T1** un-export internals + version-guarded `public` tier +
       fix all consumers (behavior-neutral, pass count held at
-      12903/12903); **T3** `ContractWorkspace` (`src/workspace.jl`, new) +
+      12903/12903); **T3** `ContractWorkspace` (`src/execution/workspace.jl`, new) +
       allocator-backed buffer reuse + lazy oracle buffers + default-kernel
       flip to `SIMDKernel`; **T4** backend struct, `_qs_labels`,
       eligibility, hard-reject `tensoradd!`/`tensortrace!`
-      (`src/tensoroperations.jl`, new); **T6** independent TO-comparison
+      (`src/integrations/tensoroperations.jl`, new); **T6** independent TO-comparison
       test suite, authored blind against `StridedNative`/`StridedBLAS`;
       **T7** `Project.toml` deps/compat + CI matrix. The anticipated T1/T4
       collision on `src/QuasiStrided.jl` was reconciled at integration as
@@ -233,7 +233,7 @@ bookkeeping, since fixed) is in `docs/decisions.md`'s close section.
       `allocator_checkpoint!`/`allocator_reset!` on the explicit-allocator
       path; **T2** edge-case/invariant tests after integration, including
       both allocator paths and a Bumper arena; **T8** Aqua quality gate
-      (`test/test_quality.jl`, new) — no piracy or method ambiguity from
+      (`test/quality/test_aqua.jl`, new) — no piracy or method ambiguity from
       adding methods to TO's generics.
 - [x] **Phase D** (T9): head-to-head `@tensor` benchmark across
       `StridedNative()`/`StridedBLAS()`/`QuasiStridedBackend()` over the
@@ -299,14 +299,14 @@ one, is authoritative for *why*.
 
 Shipped:
 
-- `src/target.jl` (new): runtime hardware detection with **no new
+- `src/hardware/target.jl` (new): runtime hardware detection with **no new
   dependency** — `Sys.CPU_NAME` against a recognition table of LLVM uarch
   names, falling back to a `Base.BinaryPlatforms.CPUID` probe, then to
   `:unknown`. Plus `cache_topology()`, which reads Linux sysfs / macOS
   `sysctl` on demand and reports cache size, ways, line size and **sharing**.
   Detection runs once per process in `__init__`, never at precompile time.
   `Project.toml` `[deps]` is unchanged.
-- A single capability-derived register-shape rule in `src/driver.jl`:
+- A single capability-derived register-shape rule in `src/planning/kernel_selection.jl`:
   `W = vector_bytes/sizeof(T)`, `MR = 2W`, `NR = 6` (so `NV = 12`). It
   reproduces the swept optimum for both dtypes independently on AVX-512, and
   reduces to the old hardcoded `(8,6,4)` on AVX2. Applied only on those two
@@ -324,7 +324,7 @@ Shipped:
   validated spill detector), `benchmark/bench_default_vs_legacy.jl` (new,
   the shipped-vs-previous regression guard). `bench_driver.jl` now sweeps at
   the derived shape.
-- `test/test_target.jl` (new, 128 tests).
+- `test/planning/test_kernel_selection.jl` (new, 128 tests).
 
 Measured, single machine (ccqlin038, Cascade Lake), complete new
 configuration against the complete previous one: **geomean 1.264x (Float64)
@@ -333,7 +333,7 @@ and 1.274x (Float32)**, up to 1.78x/1.91x at 512³, worst point 0.963x
 are larger (1.79x/1.87x) and both paths stay allocation-free.
 
 Test suite green on both CI Julia versions: Julia 1.12.6 (13171 pre-existing
-tests all still passing, plus 128 new in `test/test_target.jl`), and Julia
+tests all still passing, plus 128 new in `test/hardware/test_target.jl`), and Julia
 1.10.11 LTS (13687 pass, 9 broken — the pre-existing
 `skip=(VERSION < v"1.11")` allocation assertions, unchanged by this work).
 
@@ -345,22 +345,22 @@ addressing milestone: Phase H".
 
 Shipped:
 
-- `src/panel.jl` (new): `PackedPanel`, a borrowed `(Ptr{T}, len)` handed to
+- `src/packing/panel.jl` (new): `PackedPanel`, a borrowed `(Ptr{T}, len)` handed to
   the kernel instead of `view(ws.packed_a, range)`, with
   `panel_vload`/`panel_load`/`panel_store!` accessors that also have
   `AbstractVector` methods so every existing caller keeps working. Needs **no
   new dependency** — `SIMD.vload` already accepts a `Ptr{T}`. `execute!` wraps
   the nest in one `GC.@preserve ws`; the nest moved to `_execute_nest!`.
-- `PtrScatterAxis` in `src/tiles.jl` (new): `Ptr{Int} + count`, so it is
+- `PtrScatterAxis` in `src/layout/tiles.jl` (new): `Ptr{Int} + count`, so it is
   `isbits` and `Union{AffineAxis,PtrScatterAxis}` needs no heap box.
   `ScatterAxis` is unchanged and stays the vector-backed public form; only
   `_axis_of` switched.
 - A generated, statically-indexed scattered store path in
-  `src/kernels/simd.jl`, replacing dynamic `NTuple` indexing in
+  `src/microkernels/simd.jl`, replacing dynamic `NTuple` indexing in
   `store_tile!`'s fallback.
 - `benchmark/bench_default_vs_legacy.jl` and the register-shape sweep re-run;
   `_shape_override` added as a hook and left deliberately **empty**.
-- `test/test_target.jl` grew a zero-allocation assertion through a
+- `test/planning/test_kernel_selection.jl` grew a zero-allocation assertion through a
   permuted-A / negative-stride-B / sliced-C fixture.
 
 **A Phase G default was allocating and the suite missed it.** The Float32
@@ -383,7 +383,7 @@ On the `ccsd-t-stall` worktree/branch (based on `main` @ `f318eb9`, before
 `8dd01dd`'s packing fast-path landed on `main` -- rebase before merging):
 both mechanisms found by the profiling pass below (F2, run-length-aware
 kernel-shape demotion; F1, `@inline` on `SIMDKernel`'s `Base.accumulate`)
-are now implemented in `src/driver.jl`/`src/kernels/simd.jl`, each with a
+are now implemented in `src/execution/execute.jl`/`src/microkernels/simd.jl`, each with a
 measured before/after (~2x on `ccsd_t_1_dim16_f32`; ~9% on the isolated
 small-`kc` case), full suite green, and an ABBA guard showing no regression.
 Post-review: a blocking ISA-specific test hardcoding was fixed and verified
@@ -501,7 +501,7 @@ Sonnet-High over everything since Phase A. Neither is spent yet;
 
 - [x] **Phase A** (direction freeze): `docs/decisions.md` milestone section +
       Amendment 3 + the second addendum to the frozen argcheck order;
-      `STATUS.md` entry; `src/complex_format.jl` (new) with declarations and
+      `STATUS.md` entry; `src/packing/format.jl` (new) with declarations and
       total real-side defaults only — `PackFormat`/`ComplexMethod` singletons,
       `reals_per_element`, `a_reals`/`b_reals`/`accumulator_planes`,
       `ComplexKernelDescriptor` and its accessors, and the
@@ -511,11 +511,11 @@ Sonnet-High over everything since Phase A. Neither is spent yet;
       edit to an existing source file is one `include` line in
       `src/QuasiStrided.jl`.
 - [ ] **Phase B** (five-way parallel, disjoint files, all depending on A only):
-      **B1** plumbing (`src/workspace.jl`, `src/driver.jl`, `src/blocking.jl`) —
+      **B1** plumbing (`src/execution/workspace.jl`, `src/execution/macrokernel.jl`, `src/planning/blocking.jl`) —
       the `VT` bound relaxation, `realtype`-driven buffer allocation, the four
       `_sliver_panel` call sites, `_pack_sliver!`'s `TF` parameter,
       `ContractPlan`'s `TA`/`TB`, the complex shape rule and menus, and the
-      3-argument `default_blocking`. `src/driver.jl` is **exclusive** to B1.
+      3-argument `default_blocking`. `src/planning/plan.jl` is **exclusive** to B1.
       **B2** packing (additive only; `_pack_panel!` untouched). **B3** the
       planar kernel. **B4** the adapter. **B5** adapter tests, authored blind
       against the Phase A freeze.
@@ -532,7 +532,7 @@ Sonnet-High over everything since Phase A. Neither is spent yet;
       fallback was over AVX2's register budget; and B1's seam scaffolding test
       was replaced by its inverse. **20586/20586 passing** (Julia 1.12.6), Runic
       clean, 0 failed / 0 errored.
-- [x] **Phase D** (1m): `src/kernels/onem.jl` (new). The freeze's "nearly free"
+- [x] **Phase D** (1m): `src/microkernels/onem.jl` (new). The freeze's "nearly free"
       claim holds — the FMA loop, packing, lengths, sliver addressing, blocking
       and `execute_tilewise!` are all reused unchanged, and the only genuinely
       new logic is a ~25-line generated `OneM` tile reader. Two freeze defects
@@ -542,7 +542,7 @@ Sonnet-High over everything since Phase A. Neither is spent yet;
       corrupt the tile reader silently rather than error. Both fixed and tested.
       Every shipped 1m shape is spill-free; 1m is *better* behaved than planar
       on Julia 1.10.
-- [x] **Phase E** (end-to-end randomized oracle): `test/test_macro_driver.jl`
+- [x] **Phase E** (end-to-end randomized oracle): `test/execution/test_macro_blocking.jl`
       gained the fourth oracle layer — 501 randomized complex cases against a
       dense-matmul oracle with its **own** conjugation table, the conj/`op`
       cross-product drawn rather than enumerated under a fixed seed. Pins the
@@ -599,18 +599,18 @@ and `@tensor backend = QuasiStridedBackend()`, with `conjA`/`conjB` and
 
 ### What shipped
 
-- `src/complex_format.jl` (new): the packed formats (`RealFormat`,
+- `src/packing/format.jl` (new): the packed formats (`RealFormat`,
   `PlanarFormat` = BLIS "1r", `OneEFormat` = BLIS "1e"), the method singletons,
   `ComplexKernelDescriptor`, and the accessors that keep every generic total on
   the real path (`realtype`, `packed_a_per_k`, `packed_b_per_k`,
-  `complex_method`). `src/kernel_descriptor.jl` is **untouched**: the frozen
+  `complex_method`). `src/packing/format.jl` is **untouched**: the frozen
   packed format is preserved as the `RealFormat` instance of a more general
   offset formula, not redefined.
-- `src/kernels/planar.jl` (new): the default. A genuinely complex microkernel,
+- `src/microkernels/planar.jl` (new): the default. A genuinely complex microkernel,
   four real FMAs per (A-vector, B-scalar) pair with no shuffles, flat
   `NTuple{2NV,Vec{W,real(T)}}` accumulator, every body `@generated` with
   literal tuple indices.
-- `src/kernels/onem.jl` (new): Van Zee's induced method, reusing the **real**
+- `src/microkernels/onem.jl` (new): Van Zee's induced method, reusing the **real**
   `SIMDKernel` verbatim over `2*kc` real steps. Selectable only by naming it.
 - Conjugation through the `transform` seam that already existed, folded with
   `.op` at plan time and stored as `ContractPlan`'s `TA`/`TB`; a conjugated
@@ -752,8 +752,8 @@ six-index-output cases, 6.6-14.2x slower than `StridedBLAS` and 2.0-4.4x
 slower than plain `StridedNative` too (the only case class where that
 happens at a non-trivial absolute size) -- triaged by profiling to two
 separable, unverified causes: (A) the vectorized store fast-path guard
-(`src/kernels/simd.jl:217`) is unsatisfiable for any `Array`-backed
-destination, not just on the TensorOperations path (`src/driver.jl:815`
+(`src/microkernels/simd.jl`) is unsatisfiable for any `Array`-backed
+destination, not just on the TensorOperations path (`src/execution/execute.jl`
 hands it `Memory{T}`, never `Vector{T}`, on every plan-construction call)
 and so every case pays for the scattered-store path unconditionally; (B)
 `ccsd_t_1`'s 134.2 MB output has a non-monotonic GEMM-M stride pattern,
@@ -779,7 +779,7 @@ benchmark-suite comparison (`https://github.com/lkdvos/QuasiStrided.jl/pull/5`,
 branch `upstream-bench`), which found and triaged one regression class
 (`ccsd_t_*_dim16`, six-index output, 6.6-14.2x slower than `StridedBLAS`) to
 two separable, unverified causes. Goal here: resolve Cause A (the vectorized
-store fast-path guard in `src/kernels/simd.jl:217` appears unsatisfiable for
+store fast-path guard in `src/microkernels/simd.jl` appears unsatisfiable for
 any `Array`-backed destination on Julia >= 1.11) with evidence, execute
 whichever of (a) fix / (b) docs-only correction / (c) escalate the evidence
 actually supports, then re-measure the four regression cases with controls
@@ -792,13 +792,13 @@ for *why*.
 
 This milestone is **complete as a real `src/` fix**, not just a benchmarking
 exercise: the evidence-gated decision (T1-T3) selected "(a) fix", T4 shipped
-it (`src/kernels/simd.jl`, `test/test_simd_kernel.jl`, `test/test_driver.jl`),
+it (`src/microkernels/simd.jl`, `test/microkernels/test_simd_kernel.jl`, `test/execution/test_execute.jl`),
 and T5 measured its effect both in isolation and through the real
 `ccsd_t_*_dim16` regression this milestone exists to investigate. T8 review
 and T9/T10 close/PR are the remaining next steps (see checklist below).
 
 Non-goals: `QuasiStridedBackend`'s hard-reject invariant, the macro-blocking
-five-loop structure, `src/target.jl`'s register-shape derivation, a general
+five-loop structure, `src/hardware/target.jl`'s register-shape derivation, a general
 fix for Cause B, a wider profiling sweep, repointing the `TensorOperationsBenchmarks`
 dependency (PR #303 upstream still unmerged, confirmed 2026-09-15).
 
@@ -809,8 +809,8 @@ dependency (PR #303 upstream still unmerged, confirmed 2026-09-15).
 - [x] **T3** (ccsd_t regression + control script, no timing run yet).
 - [x] **Decision gate** (fix / docs-only / escalate, per the evidence — chose
       "(a) fix").
-- [x] **T4** (fix — `src/kernels/simd.jl` + `test/test_simd_kernel.jl` + one
-      `test/test_driver.jl` testset only).
+- [x] **T4** (fix — `src/microkernels/simd.jl` + `test/microkernels/test_simd_kernel.jl` + one
+      `test/planning/test_plan_contract.jl` testset only).
 - [x] **T5** (measurement campaign).
 - [x] **T7** (docs — this section and `docs/decisions.md`'s "T4-T5: the fix
       and its measured effect").
@@ -823,13 +823,13 @@ dependency (PR #303 upstream still unmerged, confirmed 2026-09-15).
       store path).
 - [x] **T10** (close, PR). Full suite 34856/34856 passing.
 
-**What shipped (T4).** `src/kernels/simd.jl`'s store fast-path guard
+**What shipped (T4).** `src/microkernels/simd.jl`'s store fast-path guard
 (`_vector_store_eligible`) widened from an inline `isa Vector{T}` check to
 any concrete `DenseVector{T}` (covering `Memory{T}`, the type the real driver
 actually hands the kernel on Julia >= 1.11), with a `@generated`,
 statically-indexed `_store_tile_vector!` replacing the old runtime-indexed
 tail (an allocation-cliff risk once the branch became reachable). Test
-additions in `test/test_simd_kernel.jl` and `test/test_driver.jl`.
+additions in `test/microkernels/test_simd_kernel.jl` and `test/execution/test_execute.jl`.
 
 **Measured.** Full suite 34853/34853 passing (was 34654; +199 assertions, no
 regressions) -- re-verified independently by the coordinator. Post-fix, the
@@ -865,7 +865,7 @@ upstream benchmark-suite categories.
 > cases, for both Float64 and Float32 — far larger than anything this
 > milestone's own scope (the store fast-path) could ever have delivered for
 > this case class. This points at a different, product-level lever
-> (`_classify_labels`'s label ordering in `src/driver.jl`, currently pinned
+> (`_classify_labels`'s label ordering in `src/planning/labels.jl`, currently pinned
 > by an existing test) that this milestone's task graph did **not**
 > authorize touching, per its own frozen "replanning trigger" language
 > (`docs/decisions.md`, "Store fast-path investigation: Phase A"). **No code
@@ -889,8 +889,8 @@ four cases.
 ## Per-call floor milestone — complete (2026-09-21)
 
 Authorized off `docs/proposals/dispatch-tiers.md` section 5.2 ("Next task",
-above). Three items, all shipped in one pass, `src/driver.jl` +
-`src/axis_group.jl`: (1) `_classify_labels`/`_build_pair_group`/
+above). Three items, all shipped in one pass, `src/planning/labels.jl` +
+`src/layout/axis_group.jl`: (1) `_classify_labels`/`_build_pair_group`/
 `_order_free_labels` no longer build `Set`s or call runtime `ntuple(f,
 ::Int)` -- `plan_contract` 4.1-6.4 us/5.0-7.0 KB -> 1.0-2.3 us/1.8-2.6 KB;
 (2) storage-bounds validation hoisted to once per macro block behind
@@ -922,7 +922,7 @@ before any `src/` change, per this project's evidence-first convention --
 none were implemented speculatively.
 
 - **Item 1** (shipped): unified `_pack_panel!` for real and complex packing
-  (`src/packing.jl`), replacing the complex path's per-element conditional
+  (`src/packing/pack.jl`), replacing the complex path's per-element conditional
   load with the real path's full/tail split. Gate: packing share up to
   62.8% on some shapes, complex loop 1.58x slower per real-emitted than the
   real fallback. Real-dtype LLVM IR proved structurally identical pre/post.

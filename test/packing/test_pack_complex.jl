@@ -27,13 +27,13 @@ using QuasiStrided: ComplexKernelDescriptor, PlanarFormat, OneEFormat,
     @test reinterpret(Float64, [ComplexF64(1, 2)]) == [1.0, 2.0]
     @test reinterpret(Float32, [ComplexF32(1, 2)]) == [1.0f0, 2.0f0]
     @test sizeof(ComplexF64) == 2 * sizeof(Float64)
-    # ... and the accessors this file (and src/packing.jl) actually use agree.
+    # ... and the accessors this file (and src/packing/pack.jl) actually use agree.
     z = ComplexF64(1, 2)
     @test real(z) === 1.0 && imag(z) === 2.0
 end
 
 # =====================================================================
-# Test-local reference layouts, written independently of src/packing.jl.
+# Test-local reference layouts, written independently of src/packing/pack.jl.
 # `g(t, p)` returns the logical source element at lane `t`, K step `p`.
 # `vr` is the register-tile extent (MR for A, NR for B). Lanes `>= valid`
 # are padding and are left at literal zero.

@@ -18,7 +18,7 @@
 #   measured in Phase H. Planar at 16x6 is NV_total = 24, so the cliff is live
 #   from the first line of code. Therefore *every* accumulate and store here is
 #   `@generated` with literal tuple indices, including the lane tail -- the real
-#   path's runtime-indexed `_acc_lane` helper (src/kernels/simd.jl) must not be
+#   path's runtime-indexed `_acc_lane` helper (src/microkernels/simd.jl) must not be
 #   used here.
 
 using SIMD: Vec, vload, vstore, shufflevector
@@ -37,7 +37,7 @@ per column per K step.
 
 The field is named `descriptor`, so `mr`/`nr`/`scalartype`/`packed_a_length`/
 `packed_b_length`/`realtype`/`packed_a_per_k` all forward through the existing
-`DescriptorKernel` methods in src/kernel.jl and src/complex_format.jl; this
+`DescriptorKernel` methods in src/microkernels/interface.jl and src/microkernels/interface.jl; this
 kernel adds no forwarding of its own beyond the two plane-offset accessors.
 
 The 3-argument form defaults `W` via `_default_lanewidth(real(T))`.
@@ -131,7 +131,7 @@ function zero_accumulator(kernel::PlanarKernel{MR, NR, T, W}) where {MR, NR, T, 
 end
 
 # Fully unrolled, closure-free K-step body, mirroring `_accumulate_step` in
-# src/kernels/simd.jl: per logical K step, MV A vector loads per plane, NR B
+# src/microkernels/simd.jl: per logical K step, MV A vector loads per plane, NR B
 # scalar loads per plane, 4*MV*NR FMAs, literal tuple indices throughout
 # (Cliff B).
 #
@@ -258,7 +258,7 @@ end
 # ----------------------------------------------------------------------------
 
 # Scattered/scalar store, `@generated` so every `acc[...]` is a compile-time
-# index (Cliff B; see src/kernels/simd.jl's `_store_tile_scattered!` for the
+# index (Cliff B; see src/microkernels/simd.jl's `_store_tile_scattered!` for the
 # measured number). Only the lane index inside a single `Vec` is a runtime
 # value.
 #
@@ -272,7 +272,7 @@ end
 # plane-to-interleave fast path that used to be described here as "deliberately
 # deferred" now exists as `_store_tile_planar_vector!` below; this function is
 # unchanged, still serves every ineligible destination, and is what the fast
-# path is tested against (test/test_planar_store_fastpath.jl).
+# path is tested against (test/microkernels/test_planar_store_fastpath.jl).
 @generated function _store_tile_planar!(
         destination::QSTile, acc::NTuple{NA, Vec{W, R}},
         alpha::T, beta::T, kernel::PlanarKernel{MR, NR, T, W},
@@ -327,7 +327,7 @@ end
 # Vectorized unit-stride store fast path (Phase 2 of
 # docs/proposals/complex-fast-paths.md, Section 3.3)
 #
-# The mirror image of the complex PACK fast path (src/packing.jl, Phase 1):
+# The mirror image of the complex PACK fast path (src/packing/pack.jl, Phase 1):
 # packing deinterleaves `Complex{T}`'s native `[re,im,re,im,...]` layout into
 # two planes, and this interleaves two planes back into it. Unlike packing,
 # this also has to do real arithmetic -- `alpha*r + beta*C_old` with COMPLEX
@@ -360,7 +360,7 @@ end
 #
 # HOW CLOSE THE TWO PATHS ACTUALLY AGREE, measured rather than assumed
 # (16205 elements over every shipped shape, both dtypes, seven alpha/beta
-# regimes; test/test_planar_store_fastpath.jl re-runs the measurement):
+# regimes; test/microkernels/test_planar_store_fastpath.jl re-runs the measurement):
 #
 #   * Every VECTORIZED FULL BLOCK is bit-exact to the tree above -- zero
 #     misses against an independently written, optimization-barriered
@@ -384,7 +384,7 @@ end
 #
 # The `beta` regimes are the SAME three `_axpby_tile!` has, chosen by the same
 # `iszero`/`isone` tests on the same per-call scalar: the beta-applied-once
-# contract (src/kernel.jl's `_store_prologue!`/`_axpby_tile!`) is untouched,
+# contract (src/microkernels/interface.jl's `_store_prologue!`/`_axpby_tile!`) is untouched,
 # and in particular `beta == 0` never loads the destination here either.
 #
 # NOT an `unsafe_` path: it skips no validation a caller would otherwise get.
@@ -401,10 +401,10 @@ end
 Whether `tile` can take a vectorized complex store/load: unit-stride
 `AffineAxis` rows into rank-1 dense `Complex` storage, on an ISA this ships
 for. The complex counterpart of [`_vector_store_eligible`](@ref)
-(src/kernels/simd.jl) and, per the proposal's Section 5, deliberately ONE
+(src/microkernels/simd.jl) and, per the proposal's Section 5, deliberately ONE
 predicate -- the same shape question asked of a destination tile here and
 (through `_pack_complex_contiguous_eligible`'s clauses) of a source tile in
-src/packing.jl, sharing the ISA half literally via
+src/hardware/target.jl, sharing the ISA half literally via
 `_complex_fastpath_isa_eligible`.
 
 Unit stride plus rank-1 dense storage is what makes `reinterpret`ing the
@@ -423,7 +423,7 @@ predicate folds to `_unit_stride_rows(tile.rows) && <isa check>` or to `false`.
 
 # --- interleave / deinterleave ---------------------------------------------
 #
-# GUARDRAIL, the same one src/packing.jl's shuffle primitives carry: every
+# GUARDRAIL, the same one src/packing/pack.jl's shuffle primitives carry: every
 # index tuple is built HERE from `W` at specialization time, never hardcoded to
 # the AVX-512 shape this was written against. `W` is `lanewidth(kernel)`, which
 # the driver derives from `kernel_shapes`, so the patterns follow the shipped
@@ -494,7 +494,7 @@ end
 end
 
 # Vectorized planar store. Structurally the same `@generated` unroll as the
-# real path's `_store_tile_vector!` (src/kernels/simd.jl) -- same `(v, j)`
+# real path's `_store_tile_vector!` (src/microkernels/simd.jl) -- same `(v, j)`
 # unrolling for Cliff B (every `acc[...]` a literal tuple index), same
 # full-block vs. row-tail split, same `j < n` column guard -- differing only in
 # that a "row block" is `2W` reals rather than `W`, and that the arithmetic is
@@ -624,7 +624,7 @@ Two paths, chosen by [`_complex_vector_eligible`](@ref):
   * Fallback, `_store_tile_planar!`: everything else -- scattered or strided
     rows, non-dense storage, an un-shipped ISA. Recombines
     `Complex(re[lane], im[lane])` and delegates to the generic `_axpby_tile!`
-    (src/kernel.jl), which provides the `beta` shortcuts.
+    (src/microkernels/interface.jl), which provides the `beta` shortcuts.
 
 The fast path is bitwise identical (`isequal`, so `-0.0`/NaN payloads count)
 to a from-scratch, optimization-barriered transcription of the expression

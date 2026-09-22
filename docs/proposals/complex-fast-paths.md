@@ -4,18 +4,18 @@
 authority of this document.** It answers the question `docs/decisions.md`'s
 "ComplexF64 `:tccg` slowdown" section (2026-09-22) left open: is it worth
 building the "deliberately deferred, measurement-gated follow-on" that
-`src/kernels/planar.jl`'s own docstring names -- a vectorized unit-stride store
+`src/microkernels/planar.jl`'s own docstring names -- a vectorized unit-stride store
 for the planar complex kernel -- and the analogous fast path for complex
 packing? It was written 2026-09-22 against `main` at `f7fa490`. Every number
 below is either re-derived here from a file in the tree or cited to a
 `docs/decisions.md` section by name.
 
 Frozen and untouched by anything proposed here: `QuasiStridedBackend`'s
-hard-reject invariant (`src/tensoroperations.jl:358-366`), the frozen packed
-format formula in `src/kernel_descriptor.jl` (`i + MR*p`) and its documented
-generalization in `src/complex_format.jl` (`p * per_k + plane * reg_tile + i`,
-:245-256), the beta-applied-once contract (`src/kernel.jl`'s `_store_prologue!`
-/ `_axpby_tile!`), and `_execute_nest!`'s loop structure (`src/driver.jl`). No
+hard-reject invariant (`src/integrations/tensoroperations.jl`), the frozen packed
+format formula in `src/packing/format.jl` (`i + MR*p`) and its documented
+generalization in `src/microkernels/interface.jl` (`p * per_k + plane * reg_tile + i`,
+:245-256), the beta-applied-once contract (`src/microkernels/interface.jl`'s `_store_prologue!`
+/ `_axpby_tile!`), and `_execute_nest!`'s loop structure (`src/execution/execute.jl`). No
 part of this proposal touches any of them; where a design choice could be
 mistaken for doing so, this document says so explicitly.
 
@@ -130,7 +130,7 @@ skewed shapes this package exists for.
 
 ### 3.1 What `store_tile!` does today for a `PlanarKernel`
 
-`src/kernels/planar.jl:281-329`, `_store_tile_planar!`: for each output
+`src/microkernels/planar.jl`, `_store_tile_planar!`: for each output
 column `j < n` and each register-tile row-vector `v`, the two accumulator
 planes for that `(v,j)` are read (`revec = acc[idx]`, `imvec =
 acc[NV+idx]`), and **every lane is stored one at a time**:
@@ -143,12 +143,12 @@ for lane in 1:W
 end
 ```
 
-`_axpby_tile!` (`src/kernel.jl:137-142`) is generic in the value type and
+`_axpby_tile!` (`src/microkernels/interface.jl`) is generic in the value type and
 already `@inline`, and its `alpha`/`beta` branch (`iszero(beta)`/`isone(beta)`
 / general) is resolved once per call by `_store_prologue!`
-(`src/kernel.jl:156-166`), not per lane -- so **there is no cheap hoist left
+(`src/microkernels/interface.jl`), not per lane -- so **there is no cheap hoist left
 inside the existing scalar loop**; the cost is the `MR*NR` count of scalar
-`tile_store!` writes (`src/tiles.jl:205-208`, one bounds-free array write and
+`tile_store!` writes (`src/layout/tiles.jl`, one bounds-free array write and
 one `axis_offset` computation per element) against the real path's `MV*NR`
 count of `W`-wide vector writes. This matches the file's own docstring:
 "Ships the scattered/scalar path only ... The unit-stride plane-to-interleave
@@ -157,13 +157,13 @@ built here" (`:279-280`).
 
 There is **no eligibility check at all** on the planar store path -- unlike
 the real path, which branches on `_vector_store_eligible`
-(`src/kernels/simd.jl:180-181`) between `_store_tile_vector!` and
+(`src/microkernels/simd.jl`) between `_store_tile_vector!` and
 `_store_tile_scattered!`. Every planar store, regardless of destination
 layout, takes the scalar path.
 
 ### 3.2 What the real path's fast store actually requires (the template)
 
-`_store_tile_vector!` (`src/kernels/simd.jl:244-301`) is gated by
+`_store_tile_vector!` (`src/microkernels/simd.jl`) is gated by
 `_vector_store_eligible` (`:180-181`):
 
 ```julia
@@ -191,7 +191,7 @@ cross-lane mixing, no interleave. That is exactly the part complex adds.
 ### 3.3 What a vectorized planar store needs, concretely
 
 **The destination's binary layout.** `destination.storage` for a complex
-`QSTile` is a `DenseVector{Complex{T}}` (`src/tiles.jl:128-133`, `tile_load`/
+`QSTile` is a `DenseVector{Complex{T}}` (`src/layout/tiles.jl`, `tile_load`/
 `tile_store!` at `:185-208` index it as an ordinary `AbstractVector`).
 `Complex{T}` is an `isbits` struct of two `T` fields with no padding, so `n`
 contiguous `Complex{T}` values occupy `2n` contiguous `T`s in memory as
@@ -199,7 +199,7 @@ contiguous `Complex{T}` values occupy `2n` contiguous `T`s in memory as
 layout BLIS itself targets, and Julia's own default binary representation
 for the type, not something this package has to construct. Nothing in the
 codebase currently reads or writes through this reinterpretation --
-`src/packing.jl:332` states as a design note that "the source is never
+`src/packing/pack.jl` states as a design note that "the source is never
 `reinterpret`ed, because a `QSTile` addresses arbitrary strided (possibly
 scattered) storage for which that would be unsound" -- which is exactly why
 the fast path below needs its own eligibility gate at least as strict as
@@ -220,7 +220,7 @@ new_im = ai*revec + ar*imvec + bi*or + br*oi
 ```
 
 -- the same four-real-FMA structure `_accumulate_step_planar`
-(`src/kernels/planar.jl:157-238`) already uses for `A*B`, just applied
+(`src/microkernels/planar.jl`) already uses for `A*B`, just applied
 once per output element instead of `kc` times per K step, and with the
 **guardrail that file already states** for FMA grouping (its own comment at
 `:147-151`: `c - ai*bi` is REJECTED because Julia's `muladd` chain does not
@@ -234,8 +234,8 @@ by inspection.
 Old `C` (`or`, `oi`) is only needed when `beta != 0`: at `beta == 0` the
 `br*or - bi*oi` / `bi*or + br*oi` terms are never computed and `C_old` is
 never read (preserving the existing "beta == 0 never reads old C"
-contract, `src/kernel.jl:137-142`'s ternary and the NaN-poisoning test at
-`test/test_planar_kernel.jl:367-410` that pins it for the *scalar* path
+contract, `src/microkernels/interface.jl`'s ternary and the NaN-poisoning test at
+`test/microkernels/test_planar_kernel.jl` that pins it for the *scalar* path
 today -- the fast path must pass the identical test).
 
 **The interleave/deinterleave.** Reading old `C` (`beta != 0`) means loading
@@ -268,11 +268,11 @@ reason.
 **This section exists because Decision 2 (Section 8) pulled `OneEFormat`/
 `OneMMethod` into scope after this document's first draft, which had scoped
 them out (the original Section 4.4, now superseded below).** Reading
-`src/kernels/onem.jl` in full changes the picture from "the same store problem
+`src/microkernels/onem.jl` in full changes the picture from "the same store problem
 on a doubled layout" to a structurally different one, in both directions --
 easier in one respect, harder and novel in another.
 
-**Current state.** `_store_tile_onem!` (`src/kernels/onem.jl:230-279`) is the
+**Current state.** `_store_tile_onem!` (`src/microkernels/onem.jl`) is the
 1m counterpart of `_store_tile_planar!`, same scalar `_axpby_tile!` loop, same
 "deliberately deferred" framing in its own header comment (`:227-229`). But
 the accumulator it reads from is not two split planes -- it is **the real
@@ -324,11 +324,11 @@ result  = signpat .* (aR_bcast .* vec) + signpat2 .* (aI_bcast .* swapped)
 family of techniques that maps directly onto hardware `fmaddsub`/`fmsubadd`
 instructions where available. **This is exactly the family of technique this
 codebase's own planar file explicitly rejects for its `accumulate` step**:
-`src/kernels/planar.jl:1-5` states the design choice in its very first lines
+`src/microkernels/planar.jl` states the design choice in its very first lines
 -- planar's data is kept in split planes specifically "so the data is already
 in the right lanes and the body is four real FMAs ... -- no shuffles, no
 `fmaddsub`, no duplicated lanes" -- and `PlanarMethod`'s own docstring
-(`src/complex_format.jl:99-105`) repeats the same phrase almost verbatim as
+(`src/microkernels/interface.jl`) repeats the same phrase almost verbatim as
 the method's defining property. Both citations are about planar's hot
 *accumulate* loop, not a store epilogue, and neither gives the underlying
 numerical reason shuffle/`fmaddsub` was rejected there (that reasoning is not
@@ -352,7 +352,7 @@ as license to treat this as the smaller task. See Section 6.5 for the
 resulting build-order recommendation.
 
 **Value proposition, a genuinely separate question from difficulty.**
-`OneMMethod` is "selected only by naming the kernel" (`src/driver.jl:602-604`)
+`OneMMethod` is "selected only by naming the kernel" (`src/execution/execute.jl`)
 and no case in `bench_to_suite.jl`, `profile_to_suite.jl`, or any default
 `tensorcontract!` call path ever constructs a `OneMKernel` without a caller
 explicitly asking for one by name. Unlike Planar's store fast path (which
@@ -371,10 +371,10 @@ equally urgent to the default-path work.
 
 ### 4.1 What `_pack_panel_complex!` does today
 
-`src/packing.jl:401-417`, called from the `ComplexKernelDescriptor` overloads
+`src/packing/pack.jl`, called from the `ComplexKernelDescriptor` overloads
 of `_pack_a!`/`_pack_b!` (`:454-466`, `:496-508`): for each logical K step and
 each row/column index, one complex element is loaded via the fully generic
-`tile_load` (`src/tiles.jl:185-187`), `transform`ed (`identity` or `conj`,
+`tile_load` (`src/layout/tiles.jl`), `transform`ed (`identity` or `conj`,
 never per-real-half -- the file's own contract comment at `:321-329`), then
 split into the packed format by `_pack_emit!` (`:343-349` for
 `PlanarFormat`, one `panel_store!` per plane, i.e. **two scalar stores per
@@ -387,7 +387,7 @@ method.
 
 ### 4.2 What the real path's fast pack requires (the template)
 
-`_pack_a_contiguous!` (`src/packing.jl:179-192`), gated by
+`_pack_a_contiguous!` (`src/packing/pack_contiguous.jl`), gated by
 `_pack_a_contiguous_eligible` (`:158-163`):
 
 ```julia
@@ -440,7 +440,7 @@ but checking `source.storage isa DenseVector{Complex{T}}`, `m == MR`,
 4. Two `vstore`s: `revec` at `packed_a_plane_offset(kernel, 0, 0, p) ==
    p*per_k + i` for `i = 0` (i.e. the base of the real plane's `MR`-wide
    contiguous region for this K step) and `imvec` at plane `1`'s
-   equivalent offset (`src/complex_format.jl:257-258`: `p*packed_a_per_k(d)
+   equivalent offset (`src/microkernels/interface.jl`: `p*packed_a_per_k(d)
    + plane*MR + i`, both `MR`-contiguous in `i` for fixed `p`, `plane`) --
    i.e. **the destination is already laid out as two separate `MR`-wide
    contiguous regions per K step**, so no destination-side interleave is
@@ -457,7 +457,7 @@ packing is the same shape with `NR` replacing `MR`.
 
 **This section originally scoped `OneEFormat` out** (Decision 2, Section 8,
 overrode that after this document's first draft). On rereading
-`_pack_emit!` for `OneEFormat` (`src/packing.jl:365-375`) closely rather than
+`_pack_emit!` for `OneEFormat` (`src/packing/pack.jl`) closely rather than
 characterizing it from a distance, the actual layout turns out to be **at
 least as tractable as `PlanarFormat`'s, and for one of its two halves,
 literally trivial** -- the opposite of "fundamentally different, doesn't
@@ -524,12 +524,12 @@ document** -- a literal `vload`/`vstore` copy with no arithmetic, on par with
 destination bandwidth of `PlanarFormat` (two `2vr`-real regions instead of one
 `2vr`-real region) -- unavoidable, since `OneEFormat` has twice `PlanarFormat`'s
 packed footprint by construction (`reals_per_element(OneEFormat) = 4` vs. `2`,
-`src/complex_format.jl:64-68`), not a fast-path inefficiency.
+`src/packing/format.jl`), not a fast-path inefficiency.
 
 ### 4.5 `OneMMethod`'s B operand needs no new design: it is already `PlanarFormat`, verbatim
 
 `OneMMethod`'s descriptor is `ComplexKernelDescriptor{MR,NR,T,OneEFormat,
-PlanarFormat}` (`src/kernels/onem.jl:61`, `b_format(OneMMethod()'s descriptor)
+PlanarFormat}` (`src/microkernels/onem.jl`, `b_format(OneMMethod()'s descriptor)
 == PlanarFormat()`) -- **bit-identical** to `PlanarMethod`'s own B-panel
 format (`PlanarFormat`'s own docstring already says the planar/1m panels "are
 bit-identical, not merely similar"). `_pack_b!`'s dispatch (Section 5) keys
@@ -590,33 +590,33 @@ needed for either):**
 
 - Packing: exactly the branch `_pack_a!`/`_pack_b!` for
   `ComplexKernelDescriptor` already has one arm of
-  (`src/packing.jl:454-466`, `:496-508`) -- add an eligibility check before
+  (`src/packing/pack.jl`, `:496-508`) -- add an eligibility check before
   the `_pack_panel_complex!` fallback, identical in shape to the real
   path's `_pack_a!` (`:244-261`, `if _pack_a_contiguous_eligible(...) ...
   else _pack_panel!(...)`). `_execute_nest!` calls `pack_a!`/`pack_b!`
   through the same generic reference regardless of kernel type
-  (`src/driver.jl:651`, `pack!` variable), so **no driver change is
+  (`src/execution/execute.jl`, `pack!` variable), so **no driver change is
   needed** -- this is a leaf-level change entirely inside
   `packing.jl`.
 - Store: exactly the branch `store_tile!(destination, acc, alpha, beta,
-  kernel::PlanarKernel)` (`src/kernels/planar.jl:345-352`) should gain,
-  mirroring the real path's `store_tile!` (`src/kernels/simd.jl:314-326`):
+  kernel::PlanarKernel)` (`src/microkernels/planar.jl`) should gain,
+  mirroring the real path's `store_tile!` (`src/microkernels/simd.jl`):
   `if _complex_vector_eligible(destination, T) ... else
   _store_tile_planar!(...) end`. `_execute_micro_tile!`/
-  `unsafe_execute_micro_tile!` (`src/driver.jl:689-694` and its sibling)
+  `unsafe_execute_micro_tile!` (`src/execution/macrokernel.jl` and its sibling)
   dispatch to `execute_tile!` generically per kernel type already, so
   **this is also a leaf-level change entirely inside `planar.jl`** -- with
   one exception, Section 6.1.
 - `OneEFormat` A-pack: same branch point as Planar's pack above -- the
   `ComplexKernelDescriptor{MR,NR,T,OneEFormat,B}` arm of `_pack_a!`
-  (`src/packing.jl:454-466`) gains its own eligibility check ahead of the
+  (`src/packing/pack.jl`) gains its own eligibility check ahead of the
   `_pack_panel_complex!` fallback, dispatching on `a_format(kernel)` being
   `OneEFormat` rather than `PlanarFormat`. No new call site anywhere else --
   `_pack_a!`'s existing dispatch on the descriptor's format parameter already
   routes correctly; this is Section 4.4's design slotting into machinery
   Section 5 already describes for Planar.
 - `OneMKernel`'s store: exactly the branch `store_tile!(destination, acc,
-  alpha, beta, kernel::OneMKernel)` (`src/kernels/onem.jl:301-308`) gains an
+  alpha, beta, kernel::OneMKernel)` (`src/microkernels/onem.jl`) gains an
   eligibility check ahead of `_store_tile_onem!`, mirroring both of the above.
   Same "no driver change needed" property: `execute_tile!` for `OneMKernel`
   (`:320-329`) already calls the generic `store_tile!` name.
@@ -625,7 +625,7 @@ needed for either):**
 
 ### 6.1 The store fast path reopens a question `_prefer_swap` currently closes for complex, and this is the real design risk
 
-`src/driver.jl:1048-1054`:
+`src/planning/labels.jl`:
 
 ```julia
 # Complex kernels (`PlanarKernel`/`OneMKernel`) always scatter-store --
@@ -660,7 +660,7 @@ exactly as is -- correct and safe, strictly additive, but leaves exactly the
 kind of unmeasured gap this proposal exists to close; or (b) extend
 `_prefer_swap`'s gate to complex kernels once the fast-store predicate
 exists, which requires re-deriving `_prefer_swap`'s cost model for the
-complex case (its current thresholds, `src/driver.jl:247-266`, were tuned
+complex case (its current thresholds, `src/planning/labels.jl`, were tuned
 against real vectorized-store eligibility and register-tile shapes; complex
 tiles have a different `mr`/`W` relationship at every shipped shape, Section
 6.2) and re-measuring the `~2-4%` `ccsd_t_3` regression this document quotes
@@ -674,7 +674,7 @@ conditional Section 6 behind a gate rather than building it inline.
 
 The store fast path's `W`-wide vector operations must exist at every shipped
 complex `(MR, NR, W)` combination, and unlike the real path (two menus,
-`KERNEL_SHAPES_F64`/`_F32`, `src/driver.jl:402-403`) there are two complex
+`KERNEL_SHAPES_F64`/`_F32`, `src/planning/kernel_selection.jl`) there are two complex
 menus (`KERNEL_SHAPES_C64_PLANAR`, `KERNEL_SHAPES_C32_PLANAR`,
 `:424-430`) plus per-ISA overrides (`:313-347`) and a `_legacy_shape`
 fallback (`:292-297`, `(8,6,W)` on unmeasured ISAs). Concretely, on
@@ -695,14 +695,14 @@ a scalar loop over already-live `revec`/`imvec` with a vector operation over
 the same two values, plus (when `beta != 0`) one additional loaded
 `Vec{2W,real(T)}` per full block, live only briefly before its deinterleave
 -- no new accumulator-resident state, so `planar_register_pressure`'s
-existing formula (`src/kernels/planar.jl:117-118`) and the Cliff A analysis
+existing formula (`src/microkernels/planar.jl`) and the Cliff A analysis
 built on it are unaffected. This should be confirmed, not assumed, by the
 same `@code_native` spot-check the file already asks for its FMA count.
 
 ### 6.3 `GC.@preserve` and pointer scope
 
 `_pack_a_contiguous!`'s pointer arithmetic is already wrapped in
-`GC.@preserve storage begin ... end` (`src/packing.jl:183-190`); a
+`GC.@preserve storage begin ... end` (`src/packing/pack_contiguous.jl`); a
 `reinterpret`-based store/pack fast path reading/writing through raw
 `Ptr{real(T)}` arithmetic on `destination.storage`/`source.storage` needs
 the identical discipline, scoped to whichever buffer the fast path
@@ -730,7 +730,7 @@ packer already discharges correctly.
   `_axpby_tile!`'s scalar grouping) -- compare with a tolerance, the same
   discipline `Base.accumulate`'s own docstring already states for planar
   ("Not bitwise identical to a scalar complex dot product ... compare with a
-  tolerance, never `==`", `src/kernels/planar.jl:246`).
+  tolerance, never `==`", `src/microkernels/planar.jl`).
 - **Padding**: `store_tile!`'s existing `m`/`n` guards (`_store_prologue!`)
   must still gate which rows/columns the fast path is even offered for --
   the fast path's own "full block" test (`(v+1)*W <= m`, mirroring
@@ -738,7 +738,7 @@ packer already discharges correctly.
   scalar tail, exactly as the real path does, so no padding lane is ever
   read through the vectorized branch.
 - **Conjugation**: the store side never applies `conj` (that is
-  `atransform`/`transform`, a *packing*-time concept, `src/driver.jl`); the
+  `atransform`/`transform`, a *packing*-time concept, `src/execution/execute.jl`); the
   packing side's `conj` handling is Section 4.3's point 3, a plane-only
   negate, and must be verified against the padding contract (`:377-380`
   padding is a literal zero, never `-0.0`, on the fast path exactly as
@@ -746,7 +746,7 @@ packer already discharges correctly.
 - **Adapter invariant**: `QuasiStridedBackend` neither knows nor needs to
   know about either fast path; eligibility never causes a rejection or a
   fallback to a different backend, only a different internal path. The
-  hard-reject contract at `src/tensoroperations.jl:358-366` is untouched.
+  hard-reject contract at `src/integrations/tensoroperations.jl` is untouched.
 
 ### 6.5 Build order across all four pieces, and why `OneMKernel`'s store goes last
 
@@ -787,7 +787,7 @@ silently assumed.
 ## 7. Verification plan
 
 1. **Oracle/contract tests**, mirroring the existing `test/
-   test_planar_kernel.jl`/`test/test_packing_complex.jl` structure (both
+   test_planar_kernel.jl`/`test/packing/test_pack_complex.jl` structure (both
    already test the scalar paths this proposal adds a second path
    alongside, at `:263-295` and `:367-433` for the alpha/beta contract and
    NaN-poisoning, respectively): re-run every existing `store_tile!`/
@@ -813,9 +813,9 @@ silently assumed.
    grouping from Section 3.3 compiles to the fused form (no stray `vmulsd`+
    `vsubsd` pair where a `vfnmadd`/`vfmadd` was intended) -- the same
    discipline `_accumulate_step_planar`'s header comment already requires
-   of itself (`src/kernels/planar.jl:152-156`).
+   of itself (`src/microkernels/planar.jl`).
 4. **Zero allocation**: `@allocated` through `execute!` on an eligible
-   complex plan, both dtypes, mirroring `test/test_planar_kernel.jl:434-483`'s
+   complex plan, both dtypes, mirroring `test/microkernels/test_planar_kernel.jl`'s
    existing Cliff B check -- the new code path must not reintroduce a
    heap-allocated accumulator or a boxed closure.
 5. **Forced-ISA runs**: `test/forced_isa_runner.jl` under `avx512`, `avx2`,
@@ -937,47 +937,47 @@ this document without an explicit go-ahead on the items below.**
 
 ## Appendix. Files and lines this document relies on (`main` @ `f7fa490`)
 
-- `src/kernels/planar.jl`: file-header "no shuffles, no `fmaddsub`" guardrail
+- `src/microkernels/planar.jl`: file-header "no shuffles, no `fmaddsub`" guardrail
   1-5; `PlanarKernel` 45-55; plane-offset forwarding 90-93;
   `planar_register_pressure` 96-118; `zero_accumulator` 124-140;
   `_accumulate_step_planar` (FMA-grouping guardrail) 142-238;
   `Base.accumulate` 253-263; `_store_tile_planar!` 269-329 (deferred-fast-path
   docstring 279-280); `store_tile!` 331-352; `execute_tile!` 354-372.
-- `src/kernels/onem.jl`: `OneMKernel` struct and even-`W`/`2*mr` constructor
+- `src/microkernels/onem.jl`: `OneMKernel` struct and even-`W`/`2*mr` constructor
   guardrails 60-98; `complex_method`/`lanewidth`/`avecs_per_column` 113-129;
   `onem_register_pressure` 144-166; `zero_accumulator`/`accumulate` (verbatim
   delegation to the real kernel) 172-208; `_store_tile_onem!`
   (adjacency comment, deferred-fast-path header) 214-279; `store_tile!`
   281-308; `execute_tile!` 310-329.
-- `src/kernels/simd.jl`: `_unit_stride_rows` 145-147; `_vector_store_eligible`
+- `src/microkernels/simd.jl`: `_unit_stride_rows` 145-147; `_vector_store_eligible`
   162-181; `_store_tile_scattered!` 194-222; `_store_tile_vector!` 224-301;
   `store_tile!` 303-326.
-- `src/packing.jl`: `_pack_panel!` 106-140; `_copies_unchanged` 147-149;
+- `src/packing/pack.jl`: `_pack_panel!` 106-140; `_copies_unchanged` 147-149;
   `_pack_a_contiguous_eligible` 151-163; `_pack_a_contiguous!` 165-192; real
   `_pack_a!`/`_pack_b!` 244-261, 296-308; complex packing section header
   310-334; `_pack_emit!` (`PlanarFormat`) 342-349, (`OneEFormat`) 351-375;
   `_pack_emit_zero!` 377-397; `_pack_panel_complex!` 399-417; complex
   `_pack_a!`/`_pack_b!` 454-466, 496-508.
-- `src/complex_format.jl`: `PackFormat`/`RealFormat`/`PlanarFormat`/
+- `src/packing/format.jl`: `PackFormat`/`RealFormat`/`PlanarFormat`/
   `OneEFormat` 18-68 (`reals_per_element` 66-68); `ComplexMethod`/`RealMethod`/
   `PlanarMethod` ("no shuffles, no `fmaddsub`" docstring, 99-105)/`OneMMethod`
   70-131 (`a_reals`/`b_reals` 126-131); `ComplexKernelDescriptor` 146-232;
   `packed_a_plane_offset`/`packed_b_plane_offset` 244-261.
-- `src/kernel.jl`: `_axpby_tile!`/`_axpby_at!` 134-147; `_store_prologue!`
+- `src/microkernels/interface.jl`: `_axpby_tile!`/`_axpby_at!` 134-147; `_store_prologue!`
   156-166.
-- `src/tiles.jl`: `QSTile` 120-133; `tile_offset`/`tile_load`/`tile_store!`
+- `src/layout/tiles.jl`: `QSTile` 120-133; `tile_offset`/`tile_load`/`tile_store!`
   158-208.
-- `src/panel.jl`: `PackedPanel` 9-20; `panel_vload`/`panel_load`/
+- `src/packing/panel.jl`: `PackedPanel` 9-20; `panel_vload`/`panel_load`/
   `panel_store!` 34-47.
-- `src/driver.jl`: `_prefer_swap` gate and complex-scatter-store note
+- `src/planning/labels.jl`: `_prefer_swap` gate and complex-scatter-store note
   1048-1054; `_demote_for_run` real-only gate 267-282; complex shape
   overrides 292-347; `_derived_shape` (complex) 385-399; complex kernel
   menus 405-431 (`KERNEL_SHAPES_C64_ONEM`/`_C32_ONEM` 427-431);
   `_default_complex_method` 602-604; `_kernel_for`/`_default_kernel` (complex)
   606-636; `OneMMethod` named-kernel construction 506-524.
-- Tests: `test/test_planar_kernel.jl` (alpha/beta contract 263-295,
+- Tests: `test/microkernels/test_planar_kernel.jl` (alpha/beta contract 263-295,
   padded-lane isolation 367-433, Cliff B zero-alloc 434-483);
-  `test/test_packing_complex.jl`; `test/forced_isa_runner.jl`.
+  `test/packing/test_pack_complex.jl`; `test/forced_isa_runner.jl`.
 - Benchmarks: `benchmark/bench_complex_efficiency.jl` (arm 1/`time_default`,
   `PlanarMethod`-only headline geomean, re-run in Section 2, lines ~46-53;
   arm 2/`arm_methods`, exercises both `PlanarMethod`/`OneMMethod` across all

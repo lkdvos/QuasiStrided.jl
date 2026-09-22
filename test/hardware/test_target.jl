@@ -1,4 +1,4 @@
-# Hardware detection (src/target.jl) and the register shape / blocking it
+# Hardware detection (src/hardware/target.jl) and the register shape / blocking it
 # selects. Two properties matter most: detection never throws, and every
 # failure path resolves to exactly the pre-detection constants.
 

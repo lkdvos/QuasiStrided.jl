@@ -1,10 +1,10 @@
 # T2a evidence-gathering microbenchmark, updated post-unification (commit
 # 69f8e4f, "Unify real/complex packing into one loop, format-dispatched"):
 # originally measured whether the per-element `if t < valid` branch inside
-# the now-deleted `_pack_panel_complex!` (src/packing.jl, pre-69f8e4f) cost
+# the now-deleted `_pack_panel_complex!` (src/packing/pack.jl, pre-69f8e4f) cost
 # enough on real workloads to justify unifying it with the real path's
 # full/tail-split `_pack_panel!`. That unification has since happened --
-# `_pack_panel!` (src/packing.jl) now handles both real and complex formats,
+# `_pack_panel!` (src/packing/pack.jl) now handles both real and complex formats,
 # dispatched via `_pack_emit!`/`_pack_emit_zero!` -- so this script now
 # re-measures the SAME cases against the unified loop, as AC4c evidence
 # (docs/decisions.md, "tensorcontract-rs comparison"), and its `code_llvm`
@@ -18,8 +18,8 @@
 # the real/complex default cases, an explicitly named `OneMKernel` for the 1m
 # case, mirroring `benchmark/profile_to_suite.jl`'s `_onem_default_kernel`),
 # and `plan.kernel` is what every timed `pack_a!`/`pack_b!` call is dispatched
-# on (src/kernel.jl:37-40 forwards `DescriptorKernel` to its `.descriptor`,
-# which is where src/packing.jl's real/complex methods live).
+# on (src/microkernels/interface.jl forwards `DescriptorKernel` to its `.descriptor`,
+# which is where src/packing/pack.jl's real/complex methods live).
 #
 # Fixtures are built directly against `QSTile`/`PackedPanel` (as
 # `test/test_packing*.jl` do), NOT via `execute!`, so each case isolates one
@@ -31,8 +31,8 @@
 # at 256 for every case, per the task's ask.
 #
 # Real-dtype A is packed from a deliberately NON-contiguous (stride-2 rows)
-# source, so `_pack_a_contiguous_eligible` (src/packing.jl:158-163) can never
-# fire -- `_unit_stride_rows` (src/kernels/simd.jl:145) requires stride == 1
+# source, so `_pack_a_contiguous_eligible` (src/packing/pack_contiguous.jl) can never
+# fire -- `_unit_stride_rows` (src/microkernels/simd.jl) requires stride == 1
 # exactly -- and `pack_a!` falls into `_pack_panel!`'s scalar fallback body,
 # the real counterpart this task compares the complex loop against. Real B
 # has no contiguous fast path to dodge either way, so it is packed from an
@@ -90,7 +90,7 @@ end
 # ---------------------------------------------------------------------------
 
 # Default kernel (real SIMDKernel, or complex PlanarKernel -- the driver's
-# unconditional complex default; src/driver.jl:604) at a plain 256^3 shape.
+# unconditional complex default; src/execution/execute.jl) at a plain 256^3 shape.
 function default_plan_kernel(::Type{T}) where {T}
     rng = Random.MersenneTwister(0x0007A616)
     fx = build_plain(T, SHAPE_FOR_PLAN, rng)
@@ -172,7 +172,7 @@ end
 # ---------------------------------------------------------------------------
 # Code inspection: since the tensorcontract-rs unification (commit 69f8e4f),
 # `_pack_panel_complex!` no longer exists -- real and complex packing share
-# one loop, `_pack_panel!` (src/packing.jl), dispatched on `PackFormat` via
+# one loop, `_pack_panel!` (src/packing/pack.jl), dispatched on `PackFormat` via
 # `_pack_emit!`/`_pack_emit_zero!`. This dumps that unified loop at the
 # Planar-A call's own (complex) argument types, i.e. `format = PlanarFormat()`,
 # `Val(PD) = Val(MR)`. Report, don't assume: the per-element `t < valid ?

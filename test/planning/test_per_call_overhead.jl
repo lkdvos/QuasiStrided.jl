@@ -81,7 +81,7 @@ end
         got = QS._order_free_labels(labels, indC, C)
         want = labels[sortperm([abs(st[l]) for l in labels]; alg = Base.Sort.DEFAULT_STABLE)]
         @test got == want
-        # Never mutates its input (test_driver.jl's label-order pinning reads
+        # Never mutates its input (planning/test_plan_contract.jl's label-order pinning reads
         # `_classify_labels`'s output after ordering it).
         @test length(got) == length(labels)
     end

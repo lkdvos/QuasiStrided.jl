@@ -1,5 +1,5 @@
 # Independent verification of AxisGroup indexing, written without reading
-# src/axis_group.jl: an oracle built from Julia's `CartesianIndices`, never
+# src/layout/axis_group.jl: an oracle built from Julia's `CartesianIndices`, never
 # calling offsets/fill_offsets!/block_descriptors! themselves.
 
 using Test

@@ -480,8 +480,8 @@ end
     # NOT hardware-derived: `mr(plan.kernel)`'s expected value below is
     # computed from `_default_kernel`/`kernel_shapes(T)` themselves, never a
     # literal -- a literal `mr` (or lack of demotion) is exactly the
-    # ISA-specific hardcoding this file's own header note (`plan_contract:
-    # SIMDKernel is the engine-wide default kernel`, above) warns against, and
+    # ISA-specific hardcoding the `plan_contract: SIMDKernel is the engine-wide
+    # default kernel` testset (execution/test_workspace.jl) warns against, and
     # is portable across avx512/avx2/neon/unknown-ISA hosts, checked via
     # `test/forced_isa_runner.jl` for avx2 and unknown/neon.
     d = 16
@@ -747,8 +747,8 @@ end
     # PlanarKernel/OneMKernel (complex) always scatter-stored, so the swap had
     # nothing to win and measurably cost the as-is orientation's N-side
     # locality (~2-4%). PlanarKernel now has a vectorized store fast path
-    # (src/kernels/planar.jl), so that rationale is stale, but the guard
-    # itself (`_prefer_swap`'s call site, `T <: Real` in driver.jl) has NOT
+    # (src/microkernels/planar.jl), so that rationale is stale, but the guard
+    # itself (`_prefer_swap`'s call site, `T <: Real` in src/planning/plan.jl) has NOT
     # been re-evaluated for the complex path yet -- extending it is a
     # deliberately deferred, unmeasured follow-up
     # (docs/proposals/complex-fast-paths.md Decision 3). This test only

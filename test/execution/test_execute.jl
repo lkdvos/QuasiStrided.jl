@@ -393,7 +393,7 @@ end
 # Zero steady-state allocation on the default (DefaultAllocator) path, with
 # the default kernel. SIMDKernel's accumulator is not kept register-resident
 # by Julia 1.10's compiler (docs/decisions.md, Amendment 2's caveat), so this
-# is skipped there exactly as test/test_simd_kernel.jl skips its own -- never
+# is skipped there exactly as test/microkernels/test_simd_kernel.jl skips its own -- never
 # weakened or deleted.
 # =====================================================================
 

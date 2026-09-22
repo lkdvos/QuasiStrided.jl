@@ -76,7 +76,7 @@ function build_plain(::Type{T}, spec::ShapeSpec, rng) where {T}
 end
 
 # 3-index / scattered-C fixture (permuted A, negative-stride B,
-# sliced-with-offset C), sized up from test/test_macro_driver.jl's version.
+# sliced-with-offset C), sized up from test/execution/test_macro_blocking.jl's version.
 function build_scattered(::Type{T}, rng) where {T}
     a_n, k_n, b_n, n_n = 64, 64, 16, 64
     A2 = randn(rng, T, a_n, k_n)

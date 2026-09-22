@@ -416,7 +416,7 @@ end
 # NOTE: this test only covers pack_a!/pack_b! called directly against a
 # `KernelDescriptor`, matching this file's ownership scope. Calling
 # through the `ScalarKernel`/`SIMDKernel` forwarding one-liners in
-# src/kernel.jl / src/kernels/simd.jl still allocates (confirmed
+# src/microkernels/scalar.jl / src/microkernels/simd.jl still allocates (confirmed
 # separately): those forwarding methods declare `kernel::ScalarKernel`
 # (resp. `SIMDKernel`) and `transform` with no `where` clause of their
 # own, so the same widening happens one layer up, in files this task
@@ -485,7 +485,7 @@ end
 # Main-process follow-up: the diagnosis above fixed pack_a!/pack_b! called
 # with a bare KernelDescriptor, but the identical missing-`where`-clause bug
 # recurred one layer up in ScalarKernel's and SIMDKernel's own pack_a!/
-# pack_b! forwarding methods (src/kernel.jl, src/kernels/simd.jl) — fixed
+# pack_b! forwarding methods (src/microkernels/interface.jl, src/microkernels/simd.jl) — fixed
 # there too (same pattern: bind the kernel's type parameters and give
 # `transform` its own free type parameter). Regression-test both forwarding
 # paths, not just the direct-KernelDescriptor path above.

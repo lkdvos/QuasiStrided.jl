@@ -17,12 +17,12 @@ PR: https://github.com/lkdvos/QuasiStrided.jl/pull/6 (branch `store-fastpath-inv
 ## Open follow-ups (not started, need a decision)
 1. Label-ordering lever (Arm 3 finding) — potentially the biggest win
    available for the ccsd_t_* case class, 3-20x. Needs scoping: touches
-   `_classify_labels` in `src/driver.jl`, currently pinned by an existing
+   `_classify_labels` in `src/planning/labels.jl`, currently pinned by an existing
    test. Product-level decision, not mechanical.
 2. Repointing `TensorOperationsBenchmarks` dependency — blocked until
    upstream PR #303 merges (still open as of 2026-09-15).
-3. Stale `_acc_lane` comments in `src/kernels/planar.jl`/`onem.jl`/
-   `test/test_quality.jl` (cosmetic, low priority, out of this PR's scope).
+3. Stale `_acc_lane` comments in `src/microkernels/planar.jl`/`onem.jl`/
+   `test/quality/test_aqua.jl` (cosmetic, low priority, out of this PR's scope).
 4. Remaining upstream benchmark-suite categories (:permute, :trace,
    :mixed_precision, :mps, :ctmrg, :trg) — not run.
 

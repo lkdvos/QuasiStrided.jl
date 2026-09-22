@@ -91,7 +91,7 @@ total.
 complex_method(::Any) = RealMethod()
 
 # ----------------------------------------------------------------------------
-# DescriptorKernel forwarding, mirroring the block in src/kernel.jl
+# DescriptorKernel forwarding, mirroring the block in src/microkernels/interface.jl
 # ----------------------------------------------------------------------------
 
 realtype(k::DescriptorKernel) = realtype(k.descriptor)
@@ -122,7 +122,7 @@ packed_b_length(k::DescriptorKernel, kc::Int) = packed_b_length(k.descriptor, kc
 # GUARDRAIL: every forwarded argument needs its OWN bound type parameter (`V`,
 # `K`, `F`). Leaving one unbound here reintroduces Phase 2b finding 5's
 # ~80 B/call of dynamic dispatch. `V` is unconstrained rather than
-# `<: AbstractVector{T}` so that a `PackedPanel` (src/panel.jl) forwards too;
+# `<: AbstractVector{T}` so that a `PackedPanel` (src/packing/panel.jl) forwards too;
 # `T` comes from `K` instead.
 pack_a!(
     packed::V, source::QSTile, kernel::K, transform::F
@@ -133,7 +133,7 @@ pack_b!(
 ) where {V, MR, NR, T, K <: DescriptorKernel{MR, NR, T}, F} =
     pack_b!(packed, source, kernel.descriptor, transform)
 
-# Same forwarding for the bounds-check-skipping siblings (src/packing.jl), with
+# Same forwarding for the bounds-check-skipping siblings (src/packing/pack.jl), with
 # the same per-argument type parameters for the same reason.
 unsafe_pack_a!(
     packed::V, source::QSTile, kernel::K, transform::F
@@ -328,7 +328,7 @@ Everything else `_execute_tile_prologue!` validates is still validated: the
 destination extent against the kernel's `(MR, NR)`, `kc >= 0`, both packed
 capacities, and the empty / `kc == 0` / `alpha == 0` short-circuits.
 
-The one caller in this package is `_execute_nest!` (src/driver.jl), which
+The one caller in this package is `_execute_nest!` (src/execution/execute.jl), which
 validates the union of an entire (ic, jc) macro block's micro-tiles in one
 [`checked_span_bounds`](@ref) call before running any of them. That is an
 exactly equivalent test: the block's micro-tiles are the full cross product of
