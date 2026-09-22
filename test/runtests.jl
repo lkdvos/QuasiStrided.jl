@@ -29,6 +29,7 @@ using QuasiStrided: AxisGroup, axis_length, offsets, fill_offsets!, BlockDescrip
     include("test_kernel.jl")
     include("test_simd_kernel.jl")
     include("test_planar_kernel.jl")
+    include("test_planar_store_fastpath.jl")
     include("test_onem_kernel.jl")
     include("test_phase2_integration.jl")
     include("test_driver.jl")

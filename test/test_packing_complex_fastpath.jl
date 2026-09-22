@@ -37,7 +37,7 @@ const QS = QuasiStrided
 
 # Whether the host (or the forced profile) is one the fast path ships for.
 # Read once here so every expectation below is derived, never literal.
-const FASTPATH_ON = QS._complex_pack_isa_eligible()
+const FASTPATH_ON = QS._complex_fastpath_isa_eligible()
 
 # ---------------------------------------------------------------------------
 # Independently written reference layouts (same shape as the ones in
@@ -371,15 +371,15 @@ end
 @testset "complex pack fast path: ISA gate is a register-width question" begin
     # Derived from the same table the target detector uses, so this stays true
     # if a width ever changes; `:avx512` is the only key that opens the gate.
-    @test QS._complex_pack_isa_eligible(
+    @test QS._complex_fastpath_isa_eligible(
         TargetProfile(:avx512, Sys.ARCH, "t", 64, 32, CacheLevel(), CacheLevel(), CacheLevel())
     )
     for (key, vb, nreg) in ((:avx2, 32, 16), (:neon, 16, 32), (:unknown, 0, 0))
-        @test !QS._complex_pack_isa_eligible(
+        @test !QS._complex_fastpath_isa_eligible(
             TargetProfile(key, Sys.ARCH, "t", vb, nreg, CacheLevel(), CacheLevel(), CacheLevel())
         )
     end
-    @test !QS._complex_pack_isa_eligible(unknown_target())
+    @test !QS._complex_fastpath_isa_eligible(unknown_target())
     # The live gate agrees with the live profile: this is what makes every
     # `== FASTPATH_ON` assertion above meaningful under forced_isa_runner.jl.
     @test FASTPATH_ON == (target_profile().vector_bytes == 64)

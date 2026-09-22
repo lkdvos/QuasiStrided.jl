@@ -457,9 +457,18 @@ end
 # stores; `_isa_vector_bytes(Val(:avx512))` folds to that width at compile time
 # rather than spelling `64` here. AVX2/NEON/unknown fall through to the scalar
 # loop until they have been measured (proposal Section 6.2, Section 7 item 5).
-@inline _complex_pack_isa_eligible(profile::TargetProfile) =
+#
+# SHARED, deliberately one function and not a per-fast-path copy (proposal
+# Section 5: the eligibility question is the same question asked of different
+# tiles, and "should be visibly the same function, not two copies that could
+# drift"). Phase 2's planar store fast path
+# (src/kernels/planar.jl, `_complex_vector_eligible`) calls exactly this; it
+# lives here rather than there only because packing was built first. Renamed
+# from Phase 1's `_complex_pack_isa_eligible` for that reason -- the predicate
+# is unchanged.
+@inline _complex_fastpath_isa_eligible(profile::TargetProfile) =
     profile.vector_bytes == _isa_vector_bytes(Val(:avx512))
-@inline _complex_pack_isa_eligible() = _complex_pack_isa_eligible(target_profile())
+@inline _complex_fastpath_isa_eligible() = _complex_fastpath_isa_eligible(target_profile())
 
 # The value half of the gate, mirroring `_copies_unchanged` above: the two
 # transforms the driver can produce (src/driver.jl, `plan_contract`) are the
@@ -507,7 +516,7 @@ stays entirely with `_pack_emit_zero!`.
         _complex_pack_format_eligible(format) &&
         _complex_pack_transform_eligible(transform) &&
         valid == PD && _unit_stride_rows(lane_axis) &&
-        _complex_pack_isa_eligible()
+        _complex_fastpath_isa_eligible()
 end
 
 # The second shuffle operand. Every pattern below reads the lanes that carry
