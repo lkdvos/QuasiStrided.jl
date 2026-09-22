@@ -75,8 +75,7 @@ end
 
 
 # =====================================================================
-# Conjugation plumbing (docs/decisions.md, "Conjugation: semantics, and where
-# each piece is absorbed"): the predicates themselves, that the real path is
+# Conjugation plumbing: the predicates themselves, that the real path is
 # unaffected by them, and rejection of a conjugated output.
 # =====================================================================
 
@@ -187,10 +186,10 @@ end
 
 
 # =====================================================================
-# Label order within M/N and the M/N orientation swap (docs/decisions.md,
-# "Label-order milestone"). `_classify_labels` lists free labels in A's/B's
-# own axis order; `plan_contract` then sorts each list by |C-stride| and may
-# swap the operand roles. These tests pin that composite order.
+# Label order within M/N and the M/N orientation swap. `_classify_labels`
+# lists free labels in A's/B's own axis order; `plan_contract` then sorts each
+# list by |C-stride| and may swap the operand roles. These tests pin that
+# composite order.
 # =====================================================================
 
 const _lo_order = QuasiStrided._order_free_labels
@@ -460,7 +459,7 @@ end
     end
 end
 
-@testset "F2: run-length-aware kernel demotion (docs/decisions.md, \"F2\")" begin
+@testset "run-length-aware kernel demotion" begin
     # The `ccsd_t_1` fixture (benchmark/profile_to_suite.jl's
     # `ccsd_t_1_dim16`/`ccsd_t_1_dim16_f32`, shrunk here to the minimum that
     # reproduces the identical demotion decision): C's leading unit-stride run
@@ -509,14 +508,14 @@ end
         default_kernel = QuasiStrided._default_kernel(T, Qm, Qn)
         default_mr = mr(default_kernel)
         if Qm == run || run % default_mr == 0
-            # The predicate already holds for the shipped default: F2 must be
-            # a no-op, on every ISA.
+            # The predicate already holds for the shipped default: run-length
+            # demotion must be a no-op, on every ISA.
             @test plan.kernel === default_kernel
         else
             candidates = [sh[1] for sh in QuasiStrided.kernel_shapes(T) if run % sh[1] == 0]
             if isempty(candidates)
                 # No menu shape fits either (mirrors the d=5 pinning fixture,
-                # above): F2 falls back to leaving the kernel untouched.
+                # above): run-length demotion leaves the kernel untouched.
                 @test plan.kernel === default_kernel
             else
                 # Demoted: the predicate now holds, at the LARGEST menu `mr`
@@ -541,8 +540,8 @@ end
     end
 
     # Plain GEMM: `Qm == run` is always true (M's only label is C's own
-    # unit-stride axis), so F2 must never fire regardless of dtype/mr -- the
-    # kernel stays exactly `_default_kernel`'s choice.
+    # unit-stride axis), so run-length demotion must never fire regardless of
+    # dtype/mr -- the kernel stays exactly `_default_kernel`'s choice.
     for T in (Float64, Float32)
         Ma, Ka, Na = 37, 11, 23
         Amat = randn(T, Ma, Ka)
@@ -742,8 +741,7 @@ end
     # mr (ccsd_t_3, d=4: sorted N run 16 >= mr, sorted M run 1). The swap is
     # guarded by `T <: Real` (`_prefer_swap`'s call site, src/planning/plan.jl);
     # extending it to complex kernels is a deliberately deferred, unmeasured
-    # follow-up (docs/proposals/complex-fast-paths.md, Section 6.1). This test
-    # pins that the swap does not fire for complex dtypes, and that
+    # follow-up. This test pins that the swap does not fire for complex dtypes, and that
     # conjugation is correct on the unswapped complex path -- an
     # `op`-carrying A, both flags exercised, checked against the loop
     # reference.

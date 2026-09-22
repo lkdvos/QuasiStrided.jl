@@ -1,6 +1,6 @@
 # The vectorized complex packing fast path (src/packing/pack_contiguous.jl,
-# `_pack_complex_contiguous!`), designed in docs/proposals/complex-fast-paths.md,
-# Sections 4.3 (PlanarFormat) / 4.4 (OneEFormat A) / 4.5 (1m's B is planar's).
+# `_pack_complex_contiguous!`), serving `PlanarFormat`, `OneEFormat`'s A panel,
+# and 1m's B panel (which is planar's).
 #
 # Three separable things are pinned here, deliberately not mixed:
 #
@@ -134,8 +134,8 @@ end
 # ---------------------------------------------------------------------------
 # Shape coverage: every logical register-tile extent the shipped AVX-512
 # complex menus can hand the packer, read off the menus rather than transcribed
-# (proposal Section 6.2: no expectation may be hardcoded to one shape), plus
-# three hand-added edge cases the menus do not contain.
+# (no expectation may be hardcoded to one shape), plus three hand-added edge
+# cases the menus do not contain.
 # ---------------------------------------------------------------------------
 
 const MENU_MRS = sort(

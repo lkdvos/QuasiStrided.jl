@@ -22,8 +22,7 @@ branch.
 **No auto-dispatch rule is derived from any measurement**: the ranking of
 methods differs from machine to machine.
 [`PlanarMethod`](@ref) is the unconditional default; [`OneMMethod`](@ref) is
-selected only by naming the kernel (docs/decisions.md, "Method ranking does not
-transfer between machines").
+selected only by naming the kernel.
 """
 abstract type ComplexMethod end
 

@@ -394,7 +394,7 @@ end
 end
 
 # =====================================================================
-# Complex element type (docs/decisions.md, "Verification contract", layer 4).
+# Complex element type.
 #
 # The oracle stays independent of the engine. In particular it does NOT call
 # `QuasiStrided._qs_isconj` or `QuasiStrided._op_conjugates`: the

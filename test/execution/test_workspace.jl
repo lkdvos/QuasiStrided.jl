@@ -214,8 +214,7 @@ end
     end
 
     # A PtrArray-backed workspace is not reserve!-able at all: the grow-upward
-    # discipline and allocator-owned temporaries are mutually exclusive
-    # (docs/decisions.md, "Verified allocator behavior", fact 3).
+    # discipline and allocator-owned temporaries are mutually exclusive.
     manual = TO.ManualAllocator()
     Cmanual = zeros(Ma, Na)
     manual_plan = _mm_plan(

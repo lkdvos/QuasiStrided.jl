@@ -4,11 +4,9 @@
 # and the permuted/negative-stride/sliced "scattered" fixture), bucketing
 # sampled cost into adapter/planning/packing/microkernel/store/blas/etc.
 #
-# Extended 2026-09-21 ("profile-grid" pass, see docs/decisions.md's "T4"
-# section) from the original 7 CASES + 1 DIRECT_CASES entry to the full
-# MAIN_SHAPES/SMALL_SHAPES/EXTRA_SHAPES x 4-dtype grid (38 CASES + 5
-# DIRECT_CASES, including two explicit OneMKernel entries) -- see the
-# "Full-grid extension" comment below for the additive rules.
+# Covers the full MAIN_SHAPES/SMALL_SHAPES/EXTRA_SHAPES x 4-dtype grid (38
+# CASES + 5 DIRECT_CASES, including two explicit OneMKernel entries) -- see
+# the "Full-grid extension" comment below for the additive rules.
 #
 #   julia --project=benchmark benchmark/profile_to_suite.jl [caseid ...]
 #
@@ -86,10 +84,8 @@ const CASES = [
         ),
         dtype = Float32,
     ),
-    # Same shape as ccsd_t_1_dim16, at ComplexF64 -- added 2026-09-22 to
-    # investigate why QuasiStrided's ComplexF64/Float64 GFLOP/s ratio on
-    # :tccg (bench_to_suite.jl, job 7087420) sits at ~0.29 median vs
-    # StridedBLAS's ~0.68 (docs/decisions.md, "ComplexF64 tccg slowdown").
+    # Same shape as ccsd_t_1_dim16, at ComplexF64: probes why QuasiStrided's
+    # ComplexF64/Float64 GFLOP/s ratio on :tccg sits well below StridedBLAS's.
     (
         id = "ccsd_t_1_dim16_c64",
         IA = [:i, :j, :m, :a], IB = [:m, :k, :b, :c],
@@ -130,8 +126,8 @@ const CASES = [
         dims = Dict(:m => 512, :k => 512, :n => 512),
         dtype = Float64,
     ),
-    # Same GEMM shape, but N=12: STATUS.md's "Next task" flags this as the
-    # regime where packing/per-call overhead, not the microkernel, dominates.
+    # Same GEMM shape, but N=12: the regime where packing/per-call overhead,
+    # not the microkernel, dominates.
     (
         id = "smallN_256x256x12",
         IA = [:m, :k], IB = [:k, :n], IC = [:m, :n],

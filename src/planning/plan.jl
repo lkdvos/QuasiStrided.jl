@@ -139,9 +139,8 @@ function plan_contract(
     # REJECTED, not supported -- there is nowhere to absorb its `op` (the
     # engine writes through to the parent), so it would be silently wrong;
     # supporting it would also thread a flag through `store_tile!` and force
-    # re-deriving the beta-applied-once argument (docs/decisions.md, "A
-    # conjugated output `C` is rejected this milestone"). The two transforms
-    # are `Union{typeof(identity),typeof(conj)}` here and die at the
+    # re-deriving the beta-applied-once argument. The two transforms are
+    # `Union{typeof(identity),typeof(conj)}` here and die at the
     # `_plan_contract` barrier below, as the kernel's Union does.
     _qs_isconj(C, false) && throw(
         ArgumentError(
@@ -183,9 +182,8 @@ function plan_contract(
 
     # The swap is for real element types only. Extending it to complex
     # kernels, which now also have a vectorized store, is a deliberately
-    # deferred, unmeasured follow-up (docs/proposals/complex-fast-paths.md,
-    # Section 6.1). Real kernels (`SIMDKernel` and `ScalarKernel`) keep it.
-    # Uses the precomputed `run_m`/`run_n` directly.
+    # deferred, unmeasured follow-up. Real kernels (`SIMDKernel` and
+    # `ScalarKernel`) keep it. Uses the precomputed `run_m`/`run_n` directly.
     if T <: Real && _prefer_swap(run_m, run_n, mr(kernel_asis), mr(kernel_swapped))
         # B takes the M role and A the N role. Everything operand-bound moves
         # together: the groups (each already carries its own C map), the K

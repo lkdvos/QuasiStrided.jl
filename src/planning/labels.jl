@@ -177,9 +177,8 @@ end
 # store (`_store_tile_planar_vector!`, `src/microkernels/planar.jl`) gives the
 # swap something to win on the complex path too. The `T <: Real` guard is
 # therefore an UNMEASURED, DELIBERATELY DEFERRED question, not a settled case:
-# lifting it needs its own before/after measurement
-# (docs/proposals/complex-fast-paths.md, Section 6.1). See the `T <: Real`
-# guard at the call site.
+# lifting it needs its own before/after measurement. See the `T <: Real` guard
+# at the call site.
 function _prefer_swap(run_m::Int, run_n::Int, mr_asis::Int, mr_swapped::Int = mr_asis)
     return run_m < mr_asis && run_n >= mr_swapped
 end

@@ -7,8 +7,7 @@
 # `real(T)`: packed buffers, `SIMD.Vec` lanes and the accumulator.
 #
 # Two *independent* performance cliffs run through this file and must not be
-# conflated (docs/decisions.md, "The planar microkernel: accumulator, body, and
-# two independent cliffs"):
+# conflated:
 #
 #   Cliff A -- architectural register spill. Hardware. See
 #   `planar_register_pressure`.
@@ -98,9 +97,8 @@ reference shape `(MV, NR) = (2, 6)` it is `24 + 4 + 2 = 30` and that shape
 *does* spill (mostly store-port traffic rather than a load-use chain), while
 `(24,3,8)` at pressure 26 is clean and `(8,8,8)` at pressure 20 is not -- so
 spilling is not monotone in this number and aspect ratio matters
-independently (docs/decisions.md, "Correcting the Phase C planar spill
-table"). Treat this as a necessary condition, never a ranking; shapes are
-ranked on measured throughput or not at all.
+independently. Treat this as a necessary condition, never a ranking; shapes
+are ranked on measured throughput or not at all.
 """
 planar_register_pressure(::PlanarKernel{MR, NR, T, W}) where {MR, NR, T, W} =
     2 * (MR ÷ W) * NR + 2 * (MR ÷ W) + 2

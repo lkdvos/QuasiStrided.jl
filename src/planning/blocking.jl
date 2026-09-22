@@ -29,9 +29,9 @@ end
 Cache-blocking factors keyed on the detected vector ISA
 ([`target_profile`](@ref)), `scalartype(kernel)` and the kernel's method.
 Measured constants, not a cache model: the measured grid spans only 9%/11%
-best-to-worst, so a model's upside is a few percent against the tens of percent
-docs/decisions.md records such models losing. [`cache_topology`](@ref) is
-exposed for reporting only. `plan_contract` rounds `mc`/`nc` to `mr`/`nr`
+best-to-worst, so a model's upside is a few percent while a mis-fitted model
+can lose tens of percent. [`cache_topology`](@ref) is exposed for reporting
+only. `plan_contract` rounds `mc`/`nc` to `mr`/`nr`
 multiples and clamps them to the contraction's extents.
 """
 default_blocking(kernel) =

@@ -1,7 +1,6 @@
 # The configuration this package ships now against the one it shipped before
 # hardware detection existed. Both measured as a user would get them -- no
-# pinned mc/kc/nc, no grid. This is the number quoted in docs/decisions.md,
-# Phases G and H, and it doubles as a regression guard.
+# pinned mc/kc/nc, no grid. It doubles as a regression guard.
 #
 #   julia --project=. benchmark/bench_default_vs_legacy.jl
 

@@ -18,8 +18,7 @@ buffers across contractions of different shapes.
 workspace pool is keyed by; `VT` is the vector type of the two packed macro
 panels, whose element type is `real(T)` -- the same type on the real path,
 `Float64`/`Float32` for a complex contraction, since every packed buffer below
-the kernel boundary holds reals (docs/decisions.md, "Buffer element type: the
-`VT` bound relaxes, the arity does not"). The bound on `VT` is therefore only
+the kernel boundary holds reals. The bound on `VT` is therefore only
 `AbstractVector`, with the `eltype(VT) === real(T)` invariant enforced by the
 inner constructor; `VT` is still a `where`-bound parameter resolved to a
 concrete vector type at construction.
@@ -27,8 +26,7 @@ concrete vector type at construction.
 `VT` is `Vector{real(T)}` on the default, GC-owned, [`reserve!`](@ref)-able
 path; on an explicit-allocator path it is whatever that allocator returns, and
 the workspace is then scoped to that one call -- [`release!`](@ref) it and drop
-it, never pass it back as `workspace = ws` (docs/decisions.md, "Verified
-allocator behavior").
+it, never pass it back as `workspace = ws`.
 
 The `tw_*` buffers belong to `execute_tilewise!`, the independent oracle, and
 are allocated only under `oracle = true`. The four register-tile-sized
@@ -133,7 +131,7 @@ end
 end
 
 # `Val(true)`: a genuine temporary, routed through `allocator` and never
-# `resize!`d afterwards (docs/decisions.md, "Verified allocator behavior").
+# `resize!`d afterwards.
 @inline function _alloc_temp(::Type{T}, n::Int, allocator) where {T}
     return TO.tensoralloc(Vector{T}, (n,), Val(true), allocator)
 end
@@ -242,9 +240,8 @@ never reallocates one that is already large enough, and never hands back a
 `view`; every consumer is length-tolerant and addresses only the live region
 of the *current* block. `oracle = false` leaves the `execute_tilewise!`-only
 buffers alone. Defined only for the default, GC-owned path -- an
-allocator-provided temporary must never be `resize!`d (docs/decisions.md,
-"Verified allocator behavior"), so that path sizes its workspace exactly once
-at construction instead.
+allocator-provided temporary must never be `resize!`d, so that path sizes its
+workspace exactly once at construction instead.
 """
 function reserve!(
         ws::ContractWorkspace{T, Vector{R}}, kernel, blocking::Blocking, oracle::Bool
@@ -298,7 +295,7 @@ LIFO arenas unwind correctly. The offset and descriptor buffers are GC-owned
 and untouched; `ws` must not be used afterwards. Calling this unconditionally
 is correct for every allocator -- it returns memory for `ManualAllocator` and
 is a no-op for the ones that unwind via `allocator_reset!`/`@no_escape`
-instead (docs/decisions.md, "Verified allocator behavior").
+instead.
 """
 function release!(ws::ContractWorkspace, allocator)
     TO.tensorfree!(ws.tw_packed_b, allocator)

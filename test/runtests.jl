@@ -1,8 +1,7 @@
 using Test
 using Random
 using QuasiStrided
-# QuasiStrided.jl un-exports its internal/public-unexported tiers (see
-# docs/decisions.md, "Public / internal API split: three tiers"); this test
+# QuasiStrided.jl un-exports its internal/public-unexported tiers; this test
 # suite still references all of them unqualified across its included files,
 # so restore them here once rather than editing each file individually.
 using QuasiStrided: AxisGroup, axis_length, offsets, fill_offsets!, BlockDescriptor,

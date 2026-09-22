@@ -14,8 +14,8 @@ const execute! = QuasiStrided.execute!
 const ContractPlan = QuasiStrided.ContractPlan
 const execute_tilewise! = QuasiStrided.execute_tilewise!
 
-# TO names are always qualified (frozen import convention, docs/decisions.md);
-# a bare `using TensorOperations` collides with QuasiStrided's `scalartype`.
+# TO names are always qualified: a bare `using TensorOperations` collides with
+# QuasiStrided's `scalartype`.
 import TensorOperations as TO
 
 # Plan for the dense matmul C[m,n] = sum_k A[m,k]*B[k,n], the shape most

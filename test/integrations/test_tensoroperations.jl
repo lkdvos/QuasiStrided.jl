@@ -1,7 +1,6 @@
 # TO-comparison test suite for `QuasiStrided.QuasiStridedBackend`, written
-# against the documented adapter contract rather than its implementation
-# (docs/decisions.md, "Correctness oracle: cross-package, one deliberate
-# deviation from precedent"). Included by `test/runtests.jl`, which already provides
+# against the documented adapter contract rather than its implementation.
+# Included by `test/runtests.jl`, which already provides
 # `Test`/`Random`/`QuasiStrided`.
 
 # Standalone-run support: `runtests.jl` supplies `Test`/`Random`/`QuasiStrided`
@@ -54,10 +53,8 @@ end
 @testset "tensorcontract! agrees with StridedNative/StridedBLAS (eltype = $T)" for T in all_eltypes
     Random.seed!(1234567)
 
-    # Same shape/permutation family as the frozen worked example in
-    # docs/decisions.md (pA = ((3,1,4),(2,5))-shaped etc.), adapted to modest
-    # sizes: A has 5 axes (3 open, 2 contracted), B has 4 axes (2 contracted,
-    # 2 open).
+    # A pA = ((3,1,4),(2,5))-shaped permutation family at modest sizes: A has
+    # 5 axes (3 open, 2 contracted), B has 4 axes (2 contracted, 2 open).
     A = randn(T, (3, 20, 5, 3, 4))
     B = randn(T, (4, 6, 20, 3))
     pA = ((3, 1, 4), (2, 5))
@@ -150,8 +147,7 @@ end
 # =========================================================================
 # Conjugation, the part the flag-only loop above cannot reach.
 #
-# docs/decisions.md, "Conjugation: semantics, and where each piece is
-# absorbed": there are two *independent* sources of conjugation per input --
+# There are two *independent* sources of conjugation per input --
 # TO's `conjA`/`conjB` flags and `StridedView.op` -- and they compose with
 # **xor**:
 #
@@ -285,11 +281,9 @@ end
 @testset "hard-reject: conjugated output view (eltype = $T)" for T in complex_eltypes
     # A conjugated output `C` is rejected, matching TO's own TBLIS extension
     # (`isconj(SV(C), false) && throw_conj_output(f)`). The rejection lives in
-    # `plan_contract` rather than in the adapter (docs/decisions.md, 'Second
-    # addendum to "Required argument-checking order in the adapter
-    # (frozen)"'), so that a caller reaching the engine directly is protected
-    # too -- but it must still surface as an `ArgumentError` from
-    # `tensorcontract!`.
+    # `plan_contract` rather than in the adapter, so that a caller reaching the
+    # engine directly is protected too -- but it must still surface as an
+    # `ArgumentError` from `tensorcontract!`.
     Random.seed!(271828)
     pA, pB, pAB = _MATMUL_PAB
     A = randn(T, (4, 4))
@@ -350,10 +344,9 @@ end
         Rq = tensorcontract!(Cq, A, pA, true, B, pB, false, pAB, one(T), zero(T), qsbackend)
         @test all(isfinite, Rq)
         @test Rq ≈ Rn
-        # Pinning test (docs/decisions.md, "Index-model coverage"): an empty
-        # contracted-index group (pA[2] and pB[1] both `()`) must still
-        # produce the full outer-product shape, i.e. `axis_length` of an
-        # empty `AxisGroup` is 1, not 0.
+        # Pinning test: an empty contracted-index group (pA[2] and pB[1] both
+        # `()`) must still produce the full outer-product shape, i.e.
+        # `axis_length` of an empty `AxisGroup` is 1, not 0.
         @test size(Rq) == (5, 3, 4)
     end
 
@@ -388,9 +381,8 @@ end
 
     @testset "non-contiguous StridedView-wrapped inputs" begin
         # Wrap the strided views explicitly via StridedViews, as a real user
-        # constructing a StridedView directly would (per the "StridedView"
-        # dependency use documented in docs/decisions.md), rather than
-        # relying only on Base.SubArray.
+        # constructing a StridedView directly would, rather than relying only
+        # on Base.SubArray.
         Afull = randn(T, (6, 8))
         Bfull = randn(T, (8, 10))
         Av = StridedView(Afull)[1:2:6, 1:2:8]

@@ -1,6 +1,5 @@
-# Per-call planning cost and bounds-check placement (docs/decisions.md,
-# "Per-call floor: cheaper planning, once-per-block bounds validation,
-# closed-form affine blocks").
+# Per-call planning cost and bounds-check placement: cheaper planning,
+# once-per-block bounds validation, closed-form affine blocks.
 #
 # Three things are pinned here, each of which the rest of the suite would only
 # catch indirectly:

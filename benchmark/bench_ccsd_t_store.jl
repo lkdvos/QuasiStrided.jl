@@ -24,8 +24,7 @@
 #              composite for every case. For ccsd_t_1 no swap is needed and
 #              Arm 5 is a repeat of Arm 4both.
 #
-# NOTE (post label-order milestone, docs/decisions.md "Label-order
-# milestone"): `plan_contract` now performs the label sort and orientation
+# NOTE: `plan_contract` performs the label sort and orientation
 # swap that Arms 3/4-*/5 emulate by hand INTERNALLY, unconditionally, on
 # every call -- so on current `src/planning/labels.jl`, Arm 2's own label order is
 # already re-sorted by `_order_free_labels` before these arms' extra operand
@@ -507,8 +506,7 @@ open(PROVENANCE_PATH, "w") do io
     println(
         io,
         "caveat = single machine ($(gethostname())), single measurement session; ",
-        "not averaged across machines or repeated sessions. See docs/decisions.md, ",
-        "\"Store fast-path investigation: Phase A\"."
+        "not averaged across machines or repeated sessions."
     )
     println(io, "\n# Machine-load check at provenance-write time (uptime):")
     println(io, safe_run(`uptime`))

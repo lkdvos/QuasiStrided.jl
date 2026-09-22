@@ -1,6 +1,5 @@
 # The vectorized planar complex store fast path (src/microkernels/planar.jl,
-# `_store_tile_planar_vector!`), designed in docs/proposals/complex-fast-paths.md,
-# Section 3.3.
+# `_store_tile_planar_vector!`).
 #
 # Four separable things are pinned here, deliberately not mixed:
 #

@@ -1,4 +1,4 @@
-# Phase E block-size sweep (docs/decisions.md, "Macro-blocking milestone").
+# Block-size sweep.
 # Times `execute!` over a grid of shapes x (mc,kc,nc) for
 # ScalarKernel/SIMDKernel x Float64/Float32, against `execute_tilewise!` and
 # a `LinearAlgebra.mul!` line, and reports a geomean ranking. No cache model
@@ -23,7 +23,7 @@ grid_for(::Type{Float32}) = GRID_F32
 
 # ScalarKernel stays at the historical (8,6) reference shape; SIMDKernel uses
 # whatever `_default_kernel` derives for this machine, so this sweep validates
-# mc/nc at the shape the engine actually ships (docs/decisions.md, Phase G).
+# mc/nc at the shape the engine actually ships.
 kernels_for(::Type{T}) where {T} = (
     ScalarKernel = ScalarKernel(Val(8), Val(6), T),
     SIMDKernel = QuasiStrided._default_kernel(T),

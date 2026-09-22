@@ -22,8 +22,7 @@
 # ----------------------------------------------------------------------------
 
 # The method the engine uses for `T`; `OneMMethod` is selected only by naming
-# the kernel (docs/decisions.md, "Method ranking does not transfer between
-# machines").
+# the kernel, since method ranking does not transfer between machines.
 _default_method(::Type{<:Real}) = RealMethod()
 _default_method(::Type{<:Complex}) = PlanarMethod()
 
@@ -127,9 +126,8 @@ end
 # pin the package to one machine's noise.
 _shape_override(::Val, ::Type) = nothing
 
-# AVX-512, measured (docs/decisions.md, "The register shape: the derived rule
-# was wrong for complex by 38-41%"): the derived `MR = 2W, NR = 6` shape is the
-# worst planar configuration, and `24x3`/`48x3` win outright.
+# AVX-512, measured: the derived `MR = 2W, NR = 6` shape is the worst planar
+# configuration (by 38-41%), and `24x3`/`48x3` win outright.
 _shape_override(::Val{:avx512}, ::Type{ComplexF64}) = (24, 3, 8)
 _shape_override(::Val{:avx512}, ::Type{ComplexF32}) = (48, 3, 16)
 
@@ -152,7 +150,7 @@ _shape_override(::Val{:avx2}, ::Type{ComplexF32}) = (8, 5, 8)
 # would pick MR = 4 on 128-bit lanes, not obviously better than the fallback).
 # Complex: AVX-512 only -- planar holds separate real and imaginary
 # accumulator planes, so on AVX2's 16 registers even `(MV, NR) = (1, 6)`
-# leaves nothing spare (docs/decisions.md, "Cliff A").
+# leaves nothing spare (Cliff A, src/microkernels/planar.jl).
 _rule_applies(::Val{:avx512}, ::ComplexMethod) = true
 _rule_applies(::Val{:avx2}, ::RealMethod) = true
 _rule_applies(::Val, ::ComplexMethod) = false
@@ -253,9 +251,9 @@ _default_kernel(::Type{T}) where {T} = _kernel_for(target_profile(), T)
     return _kernel_from_shape(_fitted_shape(profile, T, method), T, method)
 end
 
-# Run-length-aware demotion (docs/decisions.md, "F2"), applied to whichever
-# operand the M/N swap decision chose to feed M. The vectorized store needs
-# EVERY register sliver unit-stride in C; given a leading unit-stride run of
+# Run-length-aware demotion, applied to whichever operand the M/N swap decision
+# chose to feed M. The vectorized store needs EVERY register sliver unit-stride
+# in C; given a leading unit-stride run of
 # length `run` in C, that holds iff `Qm == run || run % mr(kernel) == 0` (not
 # the weaker `mr <= run`: at run=20, mr=16 only 40% of slivers are
 # contiguous). When the kernel fails this, demote to the LARGEST menu shape
@@ -268,10 +266,9 @@ end
 # declines to demote there.
 #
 # Real element types only. Complex kernels now have a vectorized store too, so
-# extending this is a deliberately deferred, unmeasured follow-up
-# (docs/proposals/complex-fast-paths.md, Section 6.1); the search below already
-# goes through the kernel's own method's menu, so lifting the guard is all it
-# would take.
+# extending this is a deliberately deferred, unmeasured follow-up; the search
+# below already goes through the kernel's own method's menu, so lifting the
+# guard is all it would take.
 #
 # Order matters for cost: the cheap `Qm == run` / `run % mr == 0`
 # short-circuits run before the O(Qm/mr) `_unbroken_fraction` scan, which is
@@ -299,7 +296,7 @@ end
 
 # Deepest `Qk` at which run-length demotion still wins: it crosses over from a
 # win to a loss between Qk=32 and 64 for Float64 and between 64 and 128 for
-# Float32 (docs/decisions.md, "tensorcontract-rs comparison").
+# Float32.
 const F2_DEMOTE_KMAX_F64 = 32
 const F2_DEMOTE_KMAX_F32 = 64
 

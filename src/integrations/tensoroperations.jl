@@ -53,9 +53,7 @@ struct QuasiStridedBackend <: TO.AbstractBackend end
 # ----------------------------------------------------------------------------
 
 # One `task_local_storage` slot (not `threadid()`) holding a
-# `Dict{DataType,ContractWorkspace}` keyed by scalar type; see
-# docs/decisions.md, "Amendment 1: `ContractWorkspace` and the `allocator`
-# keyword".
+# `Dict{DataType,ContractWorkspace}` keyed by scalar type.
 const _QS_WORKSPACE_KEY = :quasistrided_contract_workspaces
 
 @inline function _qs_workspace_pool()
@@ -72,8 +70,7 @@ end
 # The key is `eltype(C)` alone, with **no method component**: planar and 1m
 # pack into the same `Vector{real(T)}` and `reserve!` is grow-only, so a
 # workspace pooled under one complex method serves the other after at most a
-# grow (docs/decisions.md, "Buffer element type: the `VT` bound relaxes, the
-# arity does not").
+# grow.
 # Keying on the storage type rather than the packed type is what keeps a
 # `Float64` and a `ComplexF64` contraction from colliding on one workspace.
 @inline function _qs_task_workspace(::Type{T}) where {T}
@@ -174,8 +171,7 @@ end
 # ----------------------------------------------------------------------------
 
 # ----------------------------------------------------------------------------
-# Conjugation (docs/decisions.md, "Conjugation: semantics, and where each piece
-# is absorbed")
+# Conjugation
 # ----------------------------------------------------------------------------
 #
 # `conjA`/`conjB` are NOT dropped: both are forwarded to `plan_contract`, which
@@ -219,9 +215,7 @@ end
 # short-circuits on `T <: Complex` regardless, so `conjA = true` on a real
 # eltype cannot even create a new `execute!` specialisation.
 
-# Shared prefix of both `tensorcontract!` methods below, in the required order
-# (docs/decisions.md, "Required argument-checking order in the adapter
-# (frozen)"):
+# Shared prefix of both `tensorcontract!` methods below, in the required order:
 #
 #     eligibility -> argcheck -> dimcheck -> wrap -> aliasing
 #         -> conjugated-C rejection

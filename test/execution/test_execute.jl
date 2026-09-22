@@ -293,8 +293,7 @@ end
 
 # =====================================================================
 # Allocation targets: the macro-blocking execute! must not box a QSTile
-# UnionAll (docs/decisions.md, "Phase A findings (scouting + allocation
-# root-cause)").
+# UnionAll.
 # SIMDKernel: 0 B on Julia >= 1.11 (older Julia doesn't keep the Vec-tuple
 # accumulator register-resident; see test_simd_kernel.jl's own skip).
 # ScalarKernel: bounded, not zero -- its zero_accumulator is a spec-accepted

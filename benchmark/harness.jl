@@ -160,7 +160,7 @@ does 25% fewer FMAs and still loses -- which a flops column alone cannot see.
 and at the shipped `nc` the B term dominates, so it comes out near 2x and is
 insensitive to exactly the A-side difference that distinguishes the methods.
 Conflating the two would credit a method for its blocking rather than its
-format (docs/decisions.md, "Harness defects fixed en route").
+format.
 """
 function packed_bytes_per_flop(kernel, blocking)
     T = QuasiStrided.scalartype(kernel)
@@ -176,15 +176,14 @@ end
 """
     complex_efficiency(gf_complex, gf_real) -> Float64
 
-The milestone's headline metric: one engine's complex throughput divided by its
+The headline complex metric: one engine's complex throughput divided by its
 own real throughput at the same shape, with complex charged 8 flops/MAC.
 
 `1.0` means complex is treated exactly as well as real, and it should exceed 1
 -- complex is 4x the flops on 2x the bytes, i.e. twice the arithmetic
 intensity, so packing and per-call overheads amortise *better*. Below ~0.9
 indicates a structural overhead specific to complex (a packing cost or an
-accumulator spill) and is a finding, not a result to publish. Measured values:
-docs/decisions.md, "The headline metric".
+accumulator spill) and is a finding, not a result to publish.
 """
 complex_efficiency(gf_complex::Float64, gf_real::Float64) = gf_complex / gf_real
 
@@ -247,7 +246,7 @@ end
 
 # Fixed case timed at the start/middle/end of a sweep to catch drift. 15 reps:
 # a 7-rep trial once showed 43% spread on this ~25 us shape, a
-# timer-resolution artefact (docs/decisions.md, Phase E).
+# timer-resolution artefact.
 const CANARY_SHAPE = ShapeSpec("canary_64^3", 64, 64, 64)
 const CANARY_COMBO = (128, 256, 1536)
 

@@ -19,8 +19,7 @@ using QuasiStrided: TargetProfile, CacheLevel, target_profile, cache_topology,
             @test k isa SIMDKernel
             @test (mr(k), nr(k), lanewidth(k)) === _fallback_shape(T)
         end
-        # The measured constants (docs/decisions.md, "Phase E: benchmark sweep
-        # and measured block-size defaults").
+        # The measured block-size defaults.
         @test _fallback_blocking(Float64) === Blocking(64, 128, 768)
         @test _fallback_blocking(Float32) === Blocking(96, 384, 1152)
         for key in (:unknown, :avx2, :neon, :somethingelse), T in (Float64, Float32)
@@ -126,8 +125,7 @@ end
 @testset "packed_*_per_k is the identity on every shipped real kernel" begin
     # The driver's `_sliver_panel` call sites use `packed_a_per_k`/
     # `packed_b_per_k` rather than `mr`/`nr`: for a real kernel the two are the
-    # same number, so the real path is unaffected (docs/decisions.md, "Three
-    # meanings of `T`, pinned").
+    # same number, so the real path is unaffected.
     for T in (Float64, Float32), (MR, NR, W) in kernel_shapes(T)
         k = SIMDKernel(Val(MR), Val(NR), T, Val(W))
         @test packed_a_per_k(k) === mr(k) === MR
@@ -160,9 +158,7 @@ end
 
         # `_shape_override` on AVX-512 carries the measured sweep winner, and
         # is what `_derived_shape` therefore returns; the derived shape was the
-        # worst planar configuration by 38-41% (docs/decisions.md, "The
-        # register shape: the derived rule was wrong for complex by 38-41%").
-        # See `_shape_override`'s comment for the NEON and AVX2 rows.
+        # worst planar configuration by 38-41%. See `_shape_override`'s comment for the NEON and AVX2 rows.
         @test _shape_override(Val(:avx512), T) === swept
         @test _derived_shape(synthetic(:avx512, 64), T) === swept
 
@@ -331,7 +327,7 @@ end
         @test onem.nc === planar.nc
         @test planar.mc * a_reals(PlanarMethod()) === onem.mc * a_reals(OneMMethod())
     end
-    # The worked example from docs/decisions.md, "Register shape and blocking".
+    # Worked example: the AVX-512 rows for real and both complex methods.
     @test default_blocking(Val(:avx512), Float64) === Blocking(128, 256, 768)
     @test default_blocking(Val(:avx512), ComplexF64, PlanarMethod()) === Blocking(64, 256, 384)
     @test default_blocking(Val(:avx512), ComplexF64, OneMMethod()) === Blocking(32, 256, 384)

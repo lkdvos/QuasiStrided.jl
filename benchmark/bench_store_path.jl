@@ -3,7 +3,7 @@
 # destination-storage variants (`Vector{T}`, `Memory{T}`, strided-hot,
 # strided-cold, and MR-tail versions of the first two). Also attempts to
 # reproduce the "SIMDKernel reaches 101-103 GFLOP/s" accumulate-only claim
-# (docs/decisions.md, Float64, kc=256). Report-only, no fix applied.
+# (Float64, kc=256). Report-only, no fix applied.
 #
 #   julia --project=. benchmark/bench_store_path.jl [options]
 #
@@ -347,7 +347,7 @@ end
 println("canary spread (max-min)/min = ", @sprintf("%.4f", CANARY_SPREAD))
 
 # Reproduction attempt for "SIMDKernel reaches 101-103 GFLOP/s, ~88% of
-# peak" (docs/decisions.md), Float64/Float32, kc=256. Times both a plain
+# peak", Float64/Float32, kc=256. Times both a plain
 # `Vector` panel (matching that table's column) and a `PackedPanel` (the
 # real driver's actual panel type).
 const REPRO_SHAPES = [
@@ -445,7 +445,7 @@ open(SUMMARY_PATH, "w") do io
     println(io, "canary relative spread (max-min)/min: ", @sprintf("%.4f", CANARY_SPREAD))
 
     println(io, "\n== Reproduction attempt: \"101-103 GFLOP/s, ~88% of peak\" (accumulate-only) ==")
-    println(io, "(docs/decisions.md, \"NV is held at 12 deliberately\", Float64 kc=256, \"as plain Vector\" column)")
+    println(io, "(Float64 kc=256, plain Vector panel)")
     for r in repro_rows
         println(
             io, "  ", r.dtype, " ", r.shape, " kc=", r.kc,
@@ -554,7 +554,7 @@ open(PROVENANCE_PATH, "w") do io
     println(io, TOP_HEAD)
     println(
         io, "\nSINGLE-MACHINE CAVEAT: as with every other benchmark in this project, this is one",
-        "\nCascade Lake / AVX-512 machine (see docs/decisions.md's standing caveat), not a portable claim.",
+        "\nCascade Lake / AVX-512 machine, not a portable claim.",
         "\nThe reference machine was NOT confirmed exclusive for this run (see uptime/top above);",
         "\nthe canary bracket above is the check for drift during the run."
     )

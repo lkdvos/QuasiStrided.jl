@@ -706,8 +706,7 @@ const _QS = QuasiStrided
         end
 
         # 1m is NOT the default and no rule may make it one: method ranking
-        # does not transfer between machines (docs/decisions.md, "Method
-        # ranking does not transfer between machines").
+        # does not transfer between machines.
         @test _default_method(ComplexF64) === PlanarMethod()
         @test _default_method(ComplexF32) === PlanarMethod()
         for T in (ComplexF64, ComplexF32)

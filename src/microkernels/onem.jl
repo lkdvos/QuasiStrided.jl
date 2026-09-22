@@ -9,12 +9,14 @@
 # measurement compares two *methods* rather than two hand-tunings. Writing an
 # inner loop here would invalidate that comparison.
 #
-# Why the real kernel computes the right thing -- the `Ar`/`Br` product
-# derivation, and why accumulator real row `2i` is the real part of complex row
-# `i` -- is in docs/decisions.md, "Transcribed from `src/microkernels/onem.jl`:
-# why the induced method works". The `2*kc` doubling is confined to this
-# file's own delegation and never appears in a length, an offset or a driver
-# loop bound.
+# Why the real kernel computes the right thing: at logical K step `p`, 1e-packed
+# A holds two real K steps `(re_0, im_0, re_1, im_1, ...)` then
+# `(-im_0, re_0, -im_1, re_1, ...)`, and planar B holds `re_0..re_{NR-1}` then
+# `im_0..im_{NR-1}`. A real `2MR x NR` kernel walks both linearly, so real row
+# `2t` accumulates `re*re - im*im` and row `2t+1` accumulates `im*re + re*im`:
+# accumulator real row `2i` is the real part and `2i+1` the imaginary part of
+# complex row `i`. The `2*kc` doubling is confined to this file's own
+# delegation and never appears in a length, an offset or a driver loop bound.
 #
 # Cliff B (Julia heap-allocating a dynamically indexed `NTuple` above NV = 16;
 # see src/microkernels/simd.jl) applies here exactly as it does to planar: the
@@ -143,9 +145,8 @@ AVX-512).
 Every shipped 1m shape is spill-free -- 0 stack stores and 0 reloads at
 `(12,8,8)`, `(16,6,8)`, `(8,8,8)` and `(8,4,4)`, at exactly `MV*NR` FMAs per
 *real* K step -- as checked on `kernel.inner`, because the code running 1m's K
-loop **is** the real path's `accumulate`, byte for byte (docs/decisions.md,
-"Every shipped 1m shape is spill-free"). Spill counts are not timings; shapes
-are ranked on measured throughput.
+loop **is** the real path's `accumulate`, byte for byte. Spill counts are not
+timings; shapes are ranked on measured throughput.
 """
 onem_register_pressure(::OneMKernel{MR, NR, T, W}) where {MR, NR, T, W} =
     ((2 * MR) ÷ W) * NR + ((2 * MR) ÷ W) + 1

@@ -6,8 +6,6 @@
 # takes `parent`/`offset`), so a view's `.op` is silently dropped on all three
 # operands unless folded in here -- and a caller reaching `plan_contract`
 # directly, with no adapter in sight, is exposed to the same silent wrongness.
-# Semantics and rejected alternatives: docs/decisions.md, "Conjugation:
-# semantics, and where each piece is absorbed".
 #
 # GUARDRAIL: a TOTAL table with a throwing fallback, NOT TensorOperations'
 # TBLIS extension's `A.op === conj` test. `StridedView(p, sz, st, off,

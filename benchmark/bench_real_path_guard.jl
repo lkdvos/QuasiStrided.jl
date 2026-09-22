@@ -16,9 +16,7 @@
 #
 #   julia --project=. benchmark/bench_real_path_guard.jl
 #
-# HOW TO RUN AND READ IT -- all three points cost this project time to find,
-# and the full account is in docs/decisions.md, "The real-path regression
-# guard: no regression, and the resolution is ~5%":
+# HOW TO RUN AND READ IT (the resolution of this guard is ~5%):
 #
 #   * Sequence in ABBA order, with nothing else on the machine. Straight
 #     base-then-new twice is confounded by wall-clock drift, and an 11-rep

@@ -54,15 +54,14 @@ end
 # ---------------------------------------------------------------------------
 # Complex packing fast path (deinterleave-and-copy)
 #
-# Design: docs/proposals/complex-fast-paths.md, Sections 4.3 (PlanarFormat)
-# and 4.4 (OneEFormat's A panel). It is the complex counterpart of
-# `_pack_a_contiguous!` above and nothing more: a leaf-level alternative inside
-# `_pack_a!`/`_pack_b!` for the ONE sliver shape it can serve, with the shared
-# `_pack_panel!` loop (src/packing/pack.jl) as the fallback for everything
-# else. It uses the same format, offset formula and transform contract, and
-# must produce the same bytes the scalar loop would.
+# Serves `PlanarFormat` and `OneEFormat`'s A panel. It is the complex
+# counterpart of `_pack_a_contiguous!` above and nothing more: a leaf-level
+# alternative inside `_pack_a!`/`_pack_b!` for the ONE sliver shape it can
+# serve, with the shared `_pack_panel!` loop (src/packing/pack.jl) as the
+# fallback for everything else. It uses the same format, offset formula and
+# transform contract, and must produce the same bytes the scalar loop would.
 #
-# Why this is the easy half of the complex round trip (proposal Section 4.3):
+# Why this is the easy half of the complex round trip:
 # packing applies no `alpha`/`beta`, never reads its destination, and its only
 # `transform`s are `identity` and `conj` -- and `conj` on a complex element
 # touches the imaginary half alone. So there is no cross-plane arithmetic here
@@ -106,9 +105,8 @@ specialization.
 columns). It must be unit-stride `AffineAxis`, because that is what makes `PD`
 consecutive source elements `PD` consecutive `Complex{T}` values in storage and
 hence `2PD` consecutive `real(T)`s -- the bitcast the fast path performs is
-sound for exactly that case and for no other (proposal Section 3.3; the
-"Complex packing" header in src/packing/pack.jl says why a `QSTile` is never
-`reinterpret`ed in general).
+sound for exactly that case and for no other (the "Complex packing" header in
+src/packing/pack.jl says why a `QSTile` is never `reinterpret`ed in general).
 
 `valid == PD` excludes every partial sliver, so the fast path never has to
 write a padding lane and the "padding is a literal zero, never `-0.0`" contract
@@ -136,19 +134,20 @@ end
 @inline _pack_alt(src::Vec, ::typeof(conj)) = -src
 
 # OneEFormat's second `2PD`-real region wants the OPPOSITE choice from its
-# first (proposal Section 4.4: `conj` "just swaps which plane is free"),
-# because that region stores `-im` where the first stores `+im`.
+# first (`conj` just swaps which plane is free), because that region stores
+# `-im` where the first stores `+im`.
 @inline _pack_alt_flipped(src::Vec, ::typeof(identity)) = -src
 @inline _pack_alt_flipped(src::Vec, ::typeof(conj)) = src
 
 # --- shuffle primitives ----------------------------------------------------
 #
 # GUARDRAIL: every index tuple below is built HERE, from `PD`, at specialization
-# time -- never hardcoded to one register shape, and never a runtime gather. `PD` is `mr(kernel)`/`nr(kernel)`, which the driver
-# derives from `kernel_shapes`; the patterns therefore follow the shipped menus
-# automatically (proposal Section 6.2). These are `@generated` for the same
-# reason the store paths in src/microkernels/simd.jl are: `shufflevector` needs a
-# literal `Val` index tuple, and `Val(ntuple(...))` is not reliably one.
+# time -- never hardcoded to one register shape, and never a runtime gather.
+# `PD` is `mr(kernel)`/`nr(kernel)`, which the driver derives from
+# `kernel_shapes`; the patterns therefore follow the shipped menus
+# automatically. These are `@generated` for the same reason the store paths in
+# src/microkernels/simd.jl are: `shufflevector` needs a literal `Val` index
+# tuple, and `Val(ntuple(...))` is not reliably one.
 #
 # `src` is `[re_0, im_0, ..., re_{PD-1}, im_{PD-1}]`, the `PD` source elements
 # of one K step read through their native `Complex{T}` layout.

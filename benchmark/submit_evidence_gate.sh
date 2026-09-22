@@ -1,6 +1,6 @@
 #!/bin/bash
-# Slurm job for the "evidence gate" full run of benchmark/bench_to_suite.jl
-# (docs/proposals/dispatch-tiers.md, section 5.1): StridedBLAS vs
+# Slurm job for the "evidence gate" full run of benchmark/bench_to_suite.jl:
+# StridedBLAS vs
 # QuasiStridedBackend over the upstream TensorOperationsBenchmarks
 # :pairwise/:tccg cases plus the newly-wired :mps/:ctmrg/:trg tensor-network
 # categories, at full reps. Single core, single node -- this script has no
@@ -16,8 +16,7 @@
 # TensorOperationsBenchmarks' own default sweep (which goes to 96). A smoke
 # test found StridedNative (not QuasiStrided) had a severe, size-growing
 # slowdown on :trg specifically -- 42x slower than StridedBLAS at chi=32, and
-# a single un-warmed call did not finish within 100s at chi=48; see
-# docs/decisions.md's ":mps/:ctmrg/:trg wiring" section for the numbers.
+# a single un-warmed call did not finish within 100s at chi=48.
 # StridedNative was dropped from bench_to_suite.jl's BACKENDS entirely
 # (2026-09-22, see that file's header) since it was already excluded from
 # every plot, so this cap is no longer protecting against a walltime blowup

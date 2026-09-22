@@ -1,8 +1,7 @@
 # Head-to-head timing of `@tensor` under `StridedNative()`, `StridedBLAS()`
 # and `QuasiStridedBackend()` on identical inputs, over the same shape grid as
 # `benchmark/bench_driver.jl`. An honest comparison, not a search for a win:
-# see docs/decisions.md, "Not hooked into `select_backend`", which these
-# numbers are the evidence base for.
+# these numbers are why the backend is not hooked into `select_backend`.
 #
 #   julia --project=. benchmark/bench_tensoroperations.jl
 #
@@ -34,9 +33,9 @@ end
 #
 # `reps` was 9, which is below this project's standing discipline: ccqlin038 is
 # not reliably exclusive, canary spreads of 4-15% are normal, and an 11-rep
-# comparison in the panel-addressing milestone invented two regressions that 21
-# reps erased (STATUS.md, "Measurement hygiene"). 15 is the floor; pass more for
-# anything whose conclusion depends on a difference under ~10%.
+# comparison once invented two regressions that 21 reps erased. 15 is the
+# floor; pass more for anything whose conclusion depends on a difference under
+# ~10%.
 function median_time_s(f!::Function; reps::Int = 15)
     f!()  # warm-up, discarded
     ts = Vector{Float64}(undef, reps)
