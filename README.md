@@ -90,13 +90,13 @@ unexported (Julia >= 1.11; visible via `QuasiStrided.<name>` on 1.10):
 
 | Public, unexported names |
 | --- |
-| `contract!`, `plan_contract`, `execute!`, `ContractPlan`, `ContractWorkspace`, `Blocking`, `default_blocking`, `ScalarKernel`, `SIMDKernel`, `PlanarKernel`, `OneMKernel` |
+| `contract!`, `plan_contract`, `execute!`, `ContractPlan`, `ContractWorkspace`, `Blocking`, `default_blocking`, `ScalarKernel`, `SIMDKernel`, `PlanarKernel`, `OneMKernel`, `target_profile`, `cache_topology`, `TargetProfile`, `CacheLevel` |
 
 Everything not listed above (indexing, packing, tile/kernel internals such
 as `AxisGroup`, `KernelDescriptor`, `pack_a!`/`pack_b!`, `accumulate`, etc.)
 is internal implementation detail: it carries a docstring and is freely used
 within the package and its tests, but no semver promise and no expectation
-of stability across releases. The split has three tiers (1 exported + 11
+of stability across releases. The split has three tiers (1 exported + 15
 public + internal names); keeping most names unexported avoids export
 collisions with TensorOperations (e.g. both packages have a `scalartype`).
 
@@ -137,8 +137,11 @@ The package implements:
   defaults.
 - A register shape derived from the detected hardware (`target_profile()`:
   ISA, vector width, register count), with per-ISA overrides and a
-  register-budget fit for ISAs without one. A contraction too small in an
-  extent or run length to fill a register tile is demoted to a smaller shape.
+  register-budget fit for ISAs without one. When `M` is too small to fill one
+  register tile, the kernel is demoted to the conservative fitted shape. For
+  real element types and a shallow contracted extent, a kernel whose `MR` does
+  not divide `C`'s leading unit-stride run is demoted to a menu shape that
+  does, so the vectorized store applies.
 - `ComplexF32`/`ComplexF64` support; `conjA`/`conjB` and each operand's
   `StridedView.op` are folded into packing. A conjugated output is rejected.
 - Zero steady-state allocation for `execute!` on Julia >= 1.11. On Julia 1.10

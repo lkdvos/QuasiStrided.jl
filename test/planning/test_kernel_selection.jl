@@ -473,3 +473,25 @@ end
         @test demote(T, k, 1, 1000, 1) === k
     end
 end
+
+@testset "_derived_shape is always a member of the method's menu" begin
+    methods = ((Float64, RealMethod()), (Float32, RealMethod()))
+    methods = (
+        methods..., (ComplexF64, PlanarMethod()), (ComplexF32, PlanarMethod()),
+        (ComplexF64, OneMMethod()), (ComplexF32, OneMMethod()),
+    )
+    for (T, m) in methods, isakey in (VALID_ISAS..., :somethingelse),
+            vb in (0, 16, 32, 64, 128), nreg in (0, 16, 32)
+        shape = _derived_shape(synthetic(isakey, vb; nregisters = nreg), T, m)
+        @test shape in kernel_shapes(T, m)
+        k = QuasiStrided._kernel_from_shape(shape, T, m)
+        @test (mr(k), nr(k), lanewidth(k)) === shape
+    end
+end
+
+@testset "_kernel_from_shape throws ArgumentError for types without a menu" begin
+    for T in (Float16, Int, ComplexF16)
+        @test_throws ArgumentError QuasiStrided._kernel_from_shape((8, 6, 4), T)
+    end
+    @test_throws ArgumentError QuasiStrided._kernel_from_shape((8, 6, 4), Float64, OneMMethod())
+end

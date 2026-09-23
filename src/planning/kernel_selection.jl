@@ -36,9 +36,9 @@ _fallback_shape(::Type{T}) where {T} = (8, NR_DEFAULT, _default_lanewidth(real(T
 # Menus. Complex `MR` counts logical (complex) rows and `W` real lanes. The 1m
 # menus look "unaligned" (MR = 12 at W = 8) only because 1m runs a real
 # microkernel of `2MR` rows, so it is `2MR` that must be a multiple of `W`.
-# Each complex menu starts with the shape `_derived_shape` resolves to on
+# Each planar menu starts with the shape `_derived_shape` resolves to on
 # `:avx512`; each real menu contains `_fallback_shape` and the AVX-512/AVX2
-# rule shapes.
+# rule shapes, and each 1m menu contains its AVX-512 rule shape.
 #
 # The last three entries of each planar menu are an `MV = 1` tile at each lane
 # width the package compiles, so that `_fitted_shape` finds a fitting entry for
@@ -70,10 +70,11 @@ kernel_shapes(::Type{ComplexF64}, ::OneMMethod) = KERNEL_SHAPES_C64_ONEM
 kernel_shapes(::Type{ComplexF32}, ::PlanarMethod) = KERNEL_SHAPES_C32_PLANAR
 kernel_shapes(::Type{ComplexF32}, ::OneMMethod) = KERNEL_SHAPES_C32_ONEM
 
-# The kernel type implementing `method` for `T`, or `nothing` when there is none.
-_kernel_type(::RealMethod, ::Type{<:Real}) = SIMDKernel
-_kernel_type(::PlanarMethod, ::Type{<:Complex}) = PlanarKernel
-_kernel_type(::OneMMethod, ::Type{<:Complex}) = OneMKernel
+# The kernel type implementing `method` for `T`, or `nothing` when there is none
+# (exactly the pairs `kernel_shapes` has a menu for).
+_kernel_type(::RealMethod, ::Type{<:Union{Float32, Float64}}) = SIMDKernel
+_kernel_type(::PlanarMethod, ::Type{<:Union{ComplexF32, ComplexF64}}) = PlanarKernel
+_kernel_type(::OneMMethod, ::Type{<:Union{ComplexF32, ComplexF64}}) = OneMKernel
 _kernel_type(::Any, ::Type) = nothing
 
 """
@@ -121,37 +122,40 @@ end
 # Shape resolution from the detected hardware
 # ----------------------------------------------------------------------------
 
-# Explicit per-ISA shapes, consulted first. Empty for the real types: there
-# the `MR = 2W` rule below is already the measured optimum, so a row would only
-# pin the package to one machine's noise.
-_shape_override(::Val, ::Type) = nothing
+# Explicit per-ISA shapes, consulted first. Planar only. Empty for the real
+# types: there the `MR = 2W` rule below is already the measured optimum, so a
+# row would only pin the package to one machine's noise. 1m has none: it is
+# never selected automatically.
+_shape_override(key::Val, ::Type{T}) where {T} = _shape_override(key, T, _default_method(T))
+_shape_override(::Val, ::Type, ::ComplexMethod) = nothing
 
 # AVX-512, measured: the derived `MR = 2W, NR = 6` shape is the worst planar
 # configuration (by 38-41%), and `24x3`/`48x3` win outright.
-_shape_override(::Val{:avx512}, ::Type{ComplexF64}) = (24, 3, 8)
-_shape_override(::Val{:avx512}, ::Type{ComplexF32}) = (48, 3, 16)
+_shape_override(::Val{:avx512}, ::Type{ComplexF64}, ::PlanarMethod) = (24, 3, 8)
+_shape_override(::Val{:avx512}, ::Type{ComplexF32}, ::PlanarMethod) = (48, 3, 16)
 
 # NEON, measured on an Apple M3 Max by the sibling `tensorcontract-rs` project
 # (planar winner `(MV, NR) = (2, 6)` for both precisions). The register-budget
 # fit selects the same shapes; the rows pin them so a later menu edit cannot
 # move them silently.
-_shape_override(::Val{:neon}, ::Type{ComplexF64}) = (4, 6, 2)
-_shape_override(::Val{:neon}, ::Type{ComplexF32}) = (8, 6, 4)
+_shape_override(::Val{:neon}, ::Type{ComplexF64}, ::PlanarMethod) = (4, 6, 2)
+_shape_override(::Val{:neon}, ::Type{ComplexF32}, ::PlanarMethod) = (8, 6, 4)
 
 # AVX2, modelled rather than measured, after the same sibling project's
 # provisional `(MV, NR) = (1, 5)`: at `MV = 1`, `NR = 6` costs all 16 of AVX2's
 # vector registers (`2*6 + 2 + 2`), leaving none for address arithmetic, while
 # `NR = 5` costs 14. `benchmark/bench_complex_efficiency.jl` arm 2 is the sweep
 # that would measure it; it needs AVX2-only hardware to be meaningful.
-_shape_override(::Val{:avx2}, ::Type{ComplexF64}) = (4, 5, 4)
-_shape_override(::Val{:avx2}, ::Type{ComplexF32}) = (8, 5, 8)
+_shape_override(::Val{:avx2}, ::Type{ComplexF64}, ::PlanarMethod) = (4, 5, 4)
+_shape_override(::Val{:avx2}, ::Type{ComplexF32}, ::PlanarMethod) = (8, 5, 8)
 
 # Where the `MR = 2W` rule is validated. Real: AVX-512 and AVX2 (on NEON it
 # would pick MR = 4 on 128-bit lanes, not obviously better than the fallback).
 # Complex: AVX-512 only -- planar holds separate real and imaginary
 # accumulator planes, so on AVX2's 16 registers even `(MV, NR) = (1, 6)`
 # leaves nothing spare (Cliff A, src/microkernels/planar.jl).
-_rule_applies(::Val{:avx512}, ::ComplexMethod) = true
+_rule_applies(::Val{:avx512}, ::RealMethod) = true
+_rule_applies(::Val{:avx512}, ::Union{PlanarMethod, OneMMethod}) = true
 _rule_applies(::Val{:avx2}, ::RealMethod) = true
 _rule_applies(::Val, ::ComplexMethod) = false
 
@@ -163,19 +167,22 @@ _rule_shape(vb::Int, ::Type{T}) where {T} =
     _derived_shape(profile::TargetProfile, T, method = _default_method(T)) -> (MR, NR, W)
 
 The register shape for `T` under `method` on `profile`, in precedence order:
-an explicit `_shape_override` row, then `_rule_shape` where `_rule_applies`,
-then `_fitted_shape`. Always a member of `kernel_shapes(T, method)`.
+an explicit `_shape_override` row, then `_rule_shape` where `_rule_applies`
+and the rule's shape is in the menu, then `_fitted_shape`. Always a member of
+`kernel_shapes(T, method)`.
 """
 _derived_shape(profile::TargetProfile, ::Type{T}) where {T} =
     _derived_shape(profile, T, _default_method(T))
 
 function _derived_shape(profile::TargetProfile, ::Type{T}, method) where {T}
     key = Val(profile.isa)
-    ovr = _shape_override(key, T)
+    ovr = _shape_override(key, T, method)
     ovr === nothing || return ovr
     vb = profile.vector_bytes
-    (_rule_applies(key, method) && vb > 0 && vb % sizeof(real(T)) == 0) &&
-        return _rule_shape(vb, T)
+    if _rule_applies(key, method) && vb > 0 && vb % sizeof(real(T)) == 0
+        shape = _rule_shape(vb, T)
+        shape in kernel_shapes(T, method) && return shape
+    end
     return _fitted_shape(profile, T, method)
 end
 
@@ -209,6 +216,11 @@ fitted shapes are unmeasured off `:avx512`; they are not claimed to be good,
 only to run without spilling by the budget's own reckoning.
 """
 _fitted_shape(::TargetProfile, ::Type{T}, ::RealMethod) where {T} = _fallback_shape(T)
+
+# 1m's menus hold AVX-512 shapes only; its head is spill-free at every lane
+# width it compiles, so it is the conservative choice.
+_fitted_shape(::TargetProfile, ::Type{T}, method::OneMMethod) where {T} =
+    first(kernel_shapes(T, method))
 
 function _fitted_shape(profile::TargetProfile, ::Type{T}, method::PlanarMethod) where {T}
     R = real(T)
@@ -266,9 +278,10 @@ end
 # declines to demote there.
 #
 # Real element types only. Complex kernels now have a vectorized store too, so
-# extending this is a deliberately deferred, unmeasured follow-up; the search
-# below already goes through the kernel's own method's menu, so lifting the
-# guard is all it would take.
+# extending this is a deliberately deferred, unmeasured follow-up. The menu
+# search below already goes through the kernel's own method, but lifting the
+# guard would also need `plan_contract` to compute `run_m`/`run_n` for complex
+# `T` (it passes `0` today) and a measured complex `Qk` cutoff.
 #
 # Order matters for cost: the cheap `Qm == run` / `run % mr == 0`
 # short-circuits run before the O(Qm/mr) `_unbroken_fraction` scan, which is
