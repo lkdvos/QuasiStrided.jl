@@ -84,17 +84,19 @@ fp_ref(::OneEFormat, ::Type{T}, vr, kc, valid, g, f) where {T} =
 # deliberate sprinkling of signed and unsigned zeros -- `conj` and 1e's `-im`
 # are sign flips, and `+0.0` vs `-0.0` is precisely where a `*(-1.0)`-based
 # implementation would diverge from the scalar `-x`.
-function fp_storage(::Type{T}, n) where {T}
+function fp_value(::Type{T}, i::Int) where {T}
     R = real(T)
-    return [
-        (
-                i % 17 == 0 ? T(R(0), R(0)) :
-                i % 19 == 0 ? T(R(3), R(0)) :
-                i % 23 == 0 ? T(R(0), R(-5)) :
-                T(R(10 * i + 1), R(-(10 * i + 2)))
-            ) for i in 1:n
-    ]
+    if i % 17 == 0
+        return T(R(0), R(0))
+    elseif i % 19 == 0
+        return T(R(3), R(0))
+    elseif i % 23 == 0
+        return T(R(0), R(-5))
+    else
+        return T(R(10 * i + 1), R(-(10 * i + 2)))
+    end
 end
+fp_storage(::Type{T}, n) where {T} = [fp_value(T, i) for i in 1:n]
 
 # Run `pack_*!` into a `PackedPanel` (the only destination the gate admits) and
 # return the buffer contents.
