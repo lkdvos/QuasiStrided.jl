@@ -409,8 +409,7 @@ end
     GC.@preserve buf begin
         pk = packed_panel(buf, 1, length(buf))
         for f in (identity, conj)
-            pack_a!(pk, source, kernel, f)          # warm up
-            @test @allocated(pack_a!(pk, source, kernel, f)) == 0
+            @test steady_pack_allocs(pack_a!, pk, source, kernel, f) == 0
         end
     end
 end

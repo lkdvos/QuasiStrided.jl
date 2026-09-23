@@ -76,3 +76,13 @@ function scattered_fixture(::Type{T}, a_n = 32, k_n = 32, b_n = 8, n_n = 32) whe
     Cv = StridedView(view(Cbig, 2:(a_n + 1), 2:(n_n + 1), 1:b_n))
     return (Cv, Aperm, (2, 3, 1), Bneg, (2, 4), (1, 4, 3))
 end
+
+# Steady-state allocation of one `pack!(packed, source, kernel, transform)`
+# call, measured after a warm-up. The `::F where {F}` bound forces
+# specialization on the transform: a function argument that is only passed on
+# is otherwise not specialized, and the resulting dynamic call allocates on
+# Julia 1.10 even though the packer itself does not.
+function steady_pack_allocs(pack!::P, packed, source, kernel, transform::F) where {P, F}
+    pack!(packed, source, kernel, transform)
+    return @allocated pack!(packed, source, kernel, transform)
+end

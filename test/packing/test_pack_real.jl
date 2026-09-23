@@ -814,12 +814,10 @@ end
             bfull = SourceTile(storage, 0, AffineAxis(0, 1, kc), AffineAxis(0, kc, NR))
             btail = SourceTile(storage, 0, AffineAxis(0, 1, kc), AffineAxis(0, kc, NR - 1))
             for (src, tf) in ((full, identity), (full, conj), (fullscat, identity), (tail, identity), (strided, conj))
-                pack_a!(pa, src, kernel, tf)
-                push!(bytes, @allocated pack_a!(pa, src, kernel, tf))
+                push!(bytes, steady_pack_allocs(pack_a!, pa, src, kernel, tf))
             end
             for (src, tf) in ((bfull, identity), (btail, conj))
-                pack_b!(pb, src, kernel, tf)
-                push!(bytes, @allocated pack_b!(pb, src, kernel, tf))
+                push!(bytes, steady_pack_allocs(pack_b!, pb, src, kernel, tf))
             end
         end
         return bytes
