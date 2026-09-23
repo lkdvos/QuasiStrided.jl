@@ -209,12 +209,12 @@ for dtype in PLOTTED_DTYPES, category in unique(r.category for r in ROWS)
     labeler = category == "pairwise" ? pairwise_shape_label :
         category == "tccg" ? tccg_shape_label : nothing
     labels = labeler === nothing ? ids : [
-        labeler(
-            first(r.dim for r in subset if r.case_id == id),
-            first(r.params for r in subset if r.case_id == id),
-            dtype
-        ) for id in ids
-    ]
+            labeler(
+                first(r.dim for r in subset if r.case_id == id),
+                first(r.params for r in subset if r.case_id == id),
+                dtype
+            ) for id in ids
+        ]
 
     fig = Figure(size = (1150, max(400, 26 * length(ids) + 150) + (labeler === nothing ? 0 : 24)))
     if labeler !== nothing
