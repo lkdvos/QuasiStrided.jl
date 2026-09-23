@@ -38,7 +38,7 @@ function _classify_labels(
             throw(
                 ArgumentError(
                     "label $lbl appears in indA, indB, and indC: labels present in all " *
-                        "three operands (batch-like) are out of scope for this milestone"
+                        "three operands (batch-like) are not supported"
                 )
             )
         elseif inB && !inC

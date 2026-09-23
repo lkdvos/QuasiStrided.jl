@@ -371,7 +371,7 @@ end
     plan = _mm_plan(Cmat, Amat, Bmat; mc = 8, kc = 6, nc = 7)
 
     # Every *instance* is concretely typed, and no field is a Union or a bare
-    # AbstractVector (the frozen prohibition; VT is a where-bound parameter
+    # AbstractVector (which is prohibited; VT is a where-bound parameter
     # resolved at construction, like ScatterAxis{V}).
     @test isconcretetype(typeof(plan))
     @test isconcretetype(typeof(plan.workspace))

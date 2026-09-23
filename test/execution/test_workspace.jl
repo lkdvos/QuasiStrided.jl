@@ -201,7 +201,7 @@ end
         @test length(ws.packed_b) == cld(plan.blocking.nc, 3) * 3 * plan.blocking.kc
         @test isempty(ws.tw_packed_a)
         # Offset buffers are Val(false) requests: a plain Vector{Int} from
-        # every allocator, because fill_offsets!/describe_block are frozen on
+        # every allocator, because fill_offsets!/describe_block are fixed on
         # that concrete type.
         @test ws.m_buf_A isa Vector{Int}
         @test ws.k_buf_B isa Vector{Int}

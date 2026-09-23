@@ -39,7 +39,7 @@ function group_from_views(
 end
 
 # =====================================================================
-# Worked example (spec section 8), built from real StridedViews
+# Worked example, built from real StridedViews
 # =====================================================================
 
 @testset "Strided integration: worked example, full arrays" begin
@@ -138,9 +138,8 @@ end
 
 @testset "Strided integration: negative-stride input, adjusted base" begin
     # Manually construct a StridedView with a negative stride and a base
-    # offset adjusted to keep every access in-bounds, per spec section 9
-    # ("negative offsets are valid relative offsets and require a suitable
-    # operand base"). This mirrors what a reversed view produces.
+    # offset adjusted to keep every access in-bounds (negative offsets are
+    # valid relative offsets and require a suitable operand base). This mirrors what a reversed view produces.
     parentvec = collect(1.0:12.0)
     # Represent a 4x3 column-major matrix, but with dim 1 reversed: element
     # (i,j) (1-based, i in 1:4) should read parentvec[(4-i) + 1 + 3*(j-1)].
@@ -191,7 +190,7 @@ end
 end
 
 # =====================================================================
-# Test-only packer (spec section 10) -- NOT a production packing format.
+# Test-only packer -- NOT a production packing format.
 # This is deliberately a simple, explicit rectangle packer to exercise the
 # indexing interface end to end; it must not be confused with the production
 # packer in src/packing/.
@@ -200,8 +199,7 @@ end
 """
     row_addressing(desc, buf) -> Function
 
-Select the row (or column) addressing path once per block, per spec section
-10: if `desc.regular`, return a closure computing `base + (i-1)*stride`;
+Select the row (or column) addressing path once per block: if `desc.regular`, return a closure computing `base + (i-1)*stride`;
 otherwise return a closure reading `buf[i]`. Callers must not re-branch on
 `desc.regular` inside the per-element copy loop.
 """
@@ -219,7 +217,7 @@ end
 
 Test-only column-major packer. Fills `dest[1:row_desc.count, 1:col_desc.count]`
 from `parent` at `parent[base + row_offset[i] + col_offset[j] + 1]`
-(1-based Julia storage indexing, per spec section 9). The row/column
+(1-based Julia storage indexing). The row/column
 addressing path is selected once (via `block_addressing`), not re-branched
 per element.
 """
@@ -263,7 +261,7 @@ end
 end
 
 @testset "test-only packer: irregular map vs direct indexing" begin
-    # G = AxisGroup((3,2), ((1,3),(1,10))) from spec section 8: map2 is
+    # G = AxisGroup((3,2), ((1,3),(1,10))): map2 is
     # irregular. Use it as the *column* map against a regular row map, on a
     # synthetic parent buffer, and compare packed output to direct
     # elementwise addressing.
@@ -308,14 +306,14 @@ end
 end
 
 # =====================================================================
-# Small test-only scalar a,n,b,k contraction (spec section 10/11)
+# Small test-only scalar a,n,b,k contraction
 # =====================================================================
 
 """
     scalar_contract!(C, cbase, A, abase, B, bbase, M, N, K)
 
 Test-only scalar contraction C[m,n] += sum_k A[m,k]*B[k,n], generalized to
-the M/N/K AxisGroup formulation of spec section 3/8: `M`/`N`/`K` each carry
+the M/N/K AxisGroup formulation: `M`/`N`/`K` each carry
 two maps, (A,C), (B,C), (A,B) respectively. Establishes agreement of paired
 group enumeration across A, B, and C end to end. Not a production kernel.
 """

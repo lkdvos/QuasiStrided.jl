@@ -1,4 +1,4 @@
-# The complex element-type milestone's headline metric, plus the planar-vs-1m
+# The headline complex metric, plus the planar-vs-1m
 # head-to-head.
 #
 #   julia --project=. benchmark/bench_complex_efficiency.jl

@@ -16,7 +16,7 @@ transforms `atransform`/`btransform`. `VT` is the workspace's packed-panel
 vector type (`Vector{real(T)}` on the default allocator path, so `Vector{T}`
 on the real path), a `where`-bound parameter resolved at construction, so
 every plan instance is concretely typed. Field layout is an implementation
-detail, not part of the frozen interface.
+detail, not part of the public interface.
 
 Note the M/N orientation swap:
 after a swap, `Astorage`/`Abase`/`atransform` describe the ORIGINAL `B`

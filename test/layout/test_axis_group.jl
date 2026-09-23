@@ -11,7 +11,7 @@ using QuasiStrided: AxisGroup, axis_length, offsets, fill_offsets!, BlockDescrip
 # Independent Cartesian-coordinate oracle
 # =====================================================================
 #
-# Per spec section 3: coordinates are x[d] = (q div prod(L[1:d-1])) mod L[d],
+# Coordinates are x[d] = (q div prod(L[1:d-1])) mod L[d],
 # first axis fastest, and offset[p](q) = sum(x[d]*S[p][d] for d). This is
 # exactly what `CartesianIndices` over the length tuple enumerates (Julia's
 # CartesianIndices is column-major: first dimension fastest), converted to
@@ -112,7 +112,7 @@ end
 end
 
 # =====================================================================
-# Fixed fixtures: worked A/B/C contraction example (spec section 8)
+# Fixed fixtures: worked A/B/C contraction example
 # =====================================================================
 
 @testset "fixed fixture: worked A/B/C example" begin
@@ -516,7 +516,7 @@ end
 end
 
 @testset "normalization runs correctly unnormalized as well" begin
-    # Explicit reminder per spec section 7: tests must run both normalized
+    # Tests must run both normalized
     # and unnormalized groups. Pick an arbitrary interval start not aligned
     # to any dimension boundary and check both agree with the oracle.
     lengths = (3, 2, 2)

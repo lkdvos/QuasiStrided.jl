@@ -557,11 +557,11 @@ end
     end
 end
 
-@testset "F2 K-depth guard: _unbroken_fraction equivalence" begin
+@testset "run-length demotion K-depth guard: _unbroken_fraction equivalence" begin
     # `_unbroken_fraction(Qm, run, mr) == 1.0` must hold EXACTLY when the
-    # predicate `_demote_for_run` has always used (`Qm == run || run % mr ==
+    # run-length predicate of `_demote_for_run` (`Qm == run || run % mr ==
     # 0`) holds -- checked over a randomized grid, not just hand-picked
-    # cases, per the task brief.
+    # cases.
     rng = Random.MersenneTwister(0xF2_F2A_C7)
     for _ in 1:5000
         Qm = rand(rng, 1:200)
@@ -574,8 +574,8 @@ end
     end
 end
 
-@testset "F2 K-depth guard: deep-K no longer demotes, shallow-K still does" begin
-    # Same fixture family as `benchmark/probes/probe_f2_kdepth.jl`:
+@testset "run-length demotion K-depth guard: deep-K does not demote, shallow-K does" begin
+    # Same fixture family as `benchmark/probes/probe_run_demote_kdepth.jl`:
     # C[a,b,c,i,j,k] = A[i,j,m,a] * B[m,k,b,c], i=j=k=b=c=6, a fixed, m swept.
     # Qm = a*36, Qn = 216 (both independent of m); Qk = m.
     IA = (:i, :j, :m, :a)
@@ -583,7 +583,7 @@ end
     IC = (:a, :b, :c, :i, :j, :k)
     (indA, indB, indC), _ = _lo_labels(IA, IB)
 
-    function _f2_fixture(::Type{T}, a::Int, m::Int) where {T}
+    function _run_demote_fixture(::Type{T}, a::Int, m::Int) where {T}
         i = j = k = b = c = 6
         A = randn(T, i, j, m, a)
         B = randn(T, m, k, b, c)
@@ -591,8 +591,8 @@ end
         return StridedView(C), StridedView(A), StridedView(B)
     end
 
-    kmax_of(::Type{Float64}) = QuasiStrided.F2_DEMOTE_KMAX_F64
-    kmax_of(::Type{Float32}) = QuasiStrided.F2_DEMOTE_KMAX_F32
+    kmax_of(::Type{Float64}) = QuasiStrided._RUN_DEMOTE_KMAX_F64
+    kmax_of(::Type{Float32}) = QuasiStrided._RUN_DEMOTE_KMAX_F32
 
     for (T, a) in ((Float64, 8), (Float32, 16))
         Qm = a * 36
@@ -605,23 +605,22 @@ end
         # leading axis, so the as-is orientation always feeds M -- checked
         # below via `plan.Astorage`, not assumed).
         m_deep = 2 * kmax_of(T)
-        Cv, Av, Bv = _f2_fixture(T, a, m_deep)
+        Cv, Av, Bv = _run_demote_fixture(T, a, m_deep)
         plan_deep = plan_contract(Cv, Av, indA, Bv, indB, indC)
         @test plan_deep.Astorage === parent(Av)
         @test plan_deep.kernel === default_kernel
 
-        # Shallow-K: Qk = 8, deep inside kmax(T) for both dtypes -- confirms
-        # the original, still-valid F2 case (a run-length-broken default
-        # kernel at a shallow contraction) is unaffected by the new guard.
+        # Shallow-K: Qk = 8, deep inside kmax(T) for both dtypes -- the
+        # run-length demotion (a run-length-broken default kernel at a
+        # shallow contraction) is unaffected by the K-depth guard.
         # Whether the run-length predicate itself is already satisfied by
         # the shipped default kernel is ISA-dependent (a smaller `mr` on a
-        # narrower ISA can already divide the run) -- so, like the existing
-        # F2 testset above, the expectation is DERIVED from the predicate,
-        # never hardcoded to "must demote": on this host/ISA the sweep's own
-        # data confirms it always demotes, but forced-ISA runs may
+        # narrower ISA can already divide the run) -- so the expectation is
+        # DERIVED from the predicate, never hardcoded to "must demote": on
+        # the reference host/ISA it always demotes, but forced-ISA runs may
         # legitimately land on the "predicate already holds" branch instead.
         m_shallow = 8
-        Cv2, Av2, Bv2 = _f2_fixture(T, a, m_shallow)
+        Cv2, Av2, Bv2 = _run_demote_fixture(T, a, m_shallow)
         plan_shallow = plan_contract(Cv2, Av2, indA, Bv2, indB, indC)
         @test plan_shallow.Astorage === parent(Av2)
         mlab, = QuasiStrided._classify_labels(indA, indB, indC)
@@ -635,13 +634,13 @@ end
             @test run % mr(plan_shallow.kernel) == 0
         end
 
-        # Boundary (T5 review, N9): the guard is `Qk > kmax`, so `Qk ==
+        # Boundary: the guard is `Qk > kmax`, so `Qk ==
         # kmax` must still be ELIGIBLE to demote (subject to the same
         # run-length predicate as any other in-range point) and `Qk ==
         # kmax + 1` must NEVER demote, regardless of the predicate. Pins the
         # `>` (not `>=`) boundary directly rather than only sampling well
         # inside/outside it.
-        Cv_b, Av_b, Bv_b = _f2_fixture(T, a, kmax_of(T))
+        Cv_b, Av_b, Bv_b = _run_demote_fixture(T, a, kmax_of(T))
         plan_b = plan_contract(Cv_b, Av_b, indA, Bv_b, indB, indC)
         run_b = _lo_run(msorted, indC, Cv_b)  # same M order at every m in this fixture
         if Qm == run_b || run_b % mr(default_kernel) == 0
@@ -650,7 +649,7 @@ end
             @test plan_b.kernel !== default_kernel
         end
 
-        Cv_b1, Av_b1, Bv_b1 = _f2_fixture(T, a, kmax_of(T) + 1)
+        Cv_b1, Av_b1, Bv_b1 = _run_demote_fixture(T, a, kmax_of(T) + 1)
         plan_b1 = plan_contract(Cv_b1, Av_b1, indA, Bv_b1, indB, indC)
         @test plan_b1.kernel === default_kernel
     end

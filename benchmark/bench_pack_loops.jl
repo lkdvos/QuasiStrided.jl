@@ -1,14 +1,9 @@
-# T2a evidence-gathering microbenchmark, updated post-unification (commit
-# 69f8e4f, "Unify real/complex packing into one loop, format-dispatched"):
-# originally measured whether the per-element `if t < valid` branch inside
-# the now-deleted `_pack_panel_complex!` (src/packing/pack.jl, pre-69f8e4f) cost
-# enough on real workloads to justify unifying it with the real path's
-# full/tail-split `_pack_panel!`. That unification has since happened --
-# `_pack_panel!` (src/packing/pack.jl) now handles both real and complex formats,
-# dispatched via `_pack_emit!`/`_pack_emit_zero!` -- so this script now
-# re-measures the SAME cases against the unified loop, as AC4c evidence
-# (docs/decisions.md, "tensorcontract-rs comparison"), and its `code_llvm`
-# section dumps the unified `_pack_panel!` instead of the deleted function.
+# Packing-loop microbenchmark: per-call cost of the single `_pack_panel!` loop
+# (src/packing/pack.jl), which packs every format (real, planar, 1e, 1m),
+# dispatched via `_pack_emit!`/`_pack_emit_zero!`. Times real and complex
+# formats on full and tail slivers (ns per element and per real written), and
+# its `code_llvm` section dumps `_pack_panel!` for a complex format to check
+# its branch structure.
 #
 #   julia -t 1 --project=benchmark benchmark/bench_pack_loops.jl
 #
@@ -22,19 +17,19 @@
 # which is where src/packing/pack.jl's real/complex methods live).
 #
 # Fixtures are built directly against `QSTile`/`PackedPanel` (as
-# `test/test_packing*.jl` do), NOT via `execute!`, so each case isolates one
+# `test/packing/test_pack*.jl` do), NOT via `execute!`, so each case isolates one
 # pack call's cost instead of a whole contraction's. "Full sliver" means the
 # tile's valid row/column count equals the kernel's MR/NR (the loop's fast
 # branch in the real path, no padding at all); "tail sliver" means valid ==
 # MR-1/NR-1 (the padding branch), the case a non-multiple extent produces at
 # the last block of an M/N sweep. `kc` (the K depth packed per call) is fixed
-# at 256 for every case, per the task's ask.
+# at 256 for every case.
 #
 # Real-dtype A is packed from a deliberately NON-contiguous (stride-2 rows)
 # source, so `_pack_a_contiguous_eligible` (src/packing/pack_contiguous.jl) can never
 # fire -- `_unit_stride_rows` (src/microkernels/simd.jl) requires stride == 1
 # exactly -- and `pack_a!` falls into `_pack_panel!`'s scalar fallback body,
-# the real counterpart this task compares the complex loop against. Real B
+# the real baseline the complex formats are compared against. Real B
 # has no contiguous fast path to dodge either way, so it is packed from an
 # ordinary column-major-pitch tile.
 
@@ -48,7 +43,7 @@ using QuasiStrided: PlanarKernel, OneMKernel, kernel_shapes, OneMMethod, default
 using InteractiveUtils
 
 const REPS = 21
-const KC = 256                    # fixed K depth for every packing call, per the task
+const KC = 256                    # fixed K depth for every packing call
 const SHAPE_FOR_PLAN = ShapeSpec("plan_256^3", 256, 256, 256)  # only to pick plan.kernel
 
 const OUTDIR = results_dir()
@@ -170,20 +165,17 @@ function run_case!(csv, kernel, case::PackCase)
 end
 
 # ---------------------------------------------------------------------------
-# Code inspection: since the tensorcontract-rs unification (commit 69f8e4f),
-# `_pack_panel_complex!` no longer exists -- real and complex packing share
-# one loop, `_pack_panel!` (src/packing/pack.jl), dispatched on `PackFormat` via
-# `_pack_emit!`/`_pack_emit_zero!`. This dumps that unified loop at the
-# Planar-A call's own (complex) argument types, i.e. `format = PlanarFormat()`,
-# `Val(PD) = Val(MR)`. Report, don't assume: the per-element `t < valid ?
-# load : zero` conditional this loop used to have is gone by construction --
-# `_pack_panel!` branches once per `p` (`if valid == PD` outside the K loop),
-# not once per element -- so the finding to check for is whether that
-# outer/coarser branch is still present (it should be) and whether any
-# per-element conditional load has crept back in (it should not).
+# Code inspection: real and complex packing share one loop, `_pack_panel!`
+# (src/packing/pack.jl), dispatched on `PackFormat` via
+# `_pack_emit!`/`_pack_emit_zero!`. This dumps it at the Planar-A call's own
+# (complex) argument types, i.e. `format = PlanarFormat()`,
+# `Val(PD) = Val(MR)`. `_pack_panel!` branches once per `p` (`if valid == PD`
+# outside the K loop), not once per element, so check that this coarse branch
+# is present and that no per-element `t < valid ? load : zero` conditional
+# load appears in the IR.
 # ---------------------------------------------------------------------------
 
-function dump_pack_panel_complex_llvm(io, ::Type{T}) where {T}
+function dump_pack_panel_llvm_complex(io, ::Type{T}) where {T}
     kernel = default_plan_kernel(T)           # PlanarKernel{MR,NR,T,W}
     d = kernel.descriptor
     tile = plain_a_tile(T, mr(kernel), KC)
@@ -195,7 +187,7 @@ function dump_pack_panel_complex_llvm(io, ::Type{T}) where {T}
     packed = packed_panel(buffer, 1, needed)
     MR = mr(kernel)
 
-    println(io, "\n--- @code_llvm _pack_panel! (unified) at the Planar-A call's argument types ($T) ---")
+    println(io, "\n--- @code_llvm _pack_panel! at the Planar-A call's argument types ($T) ---")
     println(io, "kernel = ", typeof(kernel), "  MR=", MR, " format=", PlanarFormat())
     io2 = IOBuffer()
     InteractiveUtils.code_llvm(
@@ -292,9 +284,9 @@ function main()
         end
     end
 
-    println("\n--- code_llvm: unified _pack_panel! branch-structure finding ---")
+    println("\n--- code_llvm: _pack_panel! branch structure (complex formats) ---")
     for T in (ComplexF64, ComplexF32)
-        dump_pack_panel_complex_llvm(stdout, T)
+        dump_pack_panel_llvm_complex(stdout, T)
     end
 
     println("\nwrote ", CSV_PATH)

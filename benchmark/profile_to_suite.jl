@@ -137,12 +137,12 @@ const CASES = [
 ]
 
 # ---------------------------------------------------------------------------
-# Full-grid extension (2026-09-21 "profile-grid" pass): every
-# MAIN_SHAPES/SMALL_SHAPES/EXTRA_SHAPES shape from harness.jl, at both real
-# dtypes and (MAIN_SHAPES union SMALL_SHAPES only) both complex dtypes.
-# Additive only -- the seven case ids above are untouched; `_EXISTING_CASE_IDS`
-# below guards against ever emitting a duplicate id for the three shapes
-# (`plain_256`, `plain_512`, `smallN_256x256x12`) already covered at Float64.
+# Full grid: every MAIN_SHAPES/SMALL_SHAPES/EXTRA_SHAPES shape from
+# harness.jl, at both real dtypes and (MAIN_SHAPES union SMALL_SHAPES only)
+# both complex dtypes, on top of the seven hand-picked cases above.
+# `_EXISTING_CASE_IDS` below guards against emitting a duplicate id for the
+# three shapes (`plain_256`, `plain_512`, `smallN_256x256x12`) already covered
+# at Float64.
 # ---------------------------------------------------------------------------
 
 # (ShapeSpec name in harness.jl, case id base for Float64 / `_f32` suffix).

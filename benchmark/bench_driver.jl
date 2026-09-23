@@ -228,7 +228,7 @@ println("canary spread (max-min)/min = ", @sprintf("%.4f", canary_spread))
 rank_combos(raw, T::DataType) = rank_by(raw, T, r -> (r.mc, r.kc, r.nc))
 
 open(SUMMARY_PATH, "w") do io
-    println(io, "# Phase E ranking summary")
+    println(io, "# Ranking summary")
     println(io, "canary median times (s): ", canary_results)
     println(io, "canary relative spread (max-min)/min: ", @sprintf("%.4f", canary_spread))
     chosen = Dict{DataType, Tuple{Int, Int, Int}}()

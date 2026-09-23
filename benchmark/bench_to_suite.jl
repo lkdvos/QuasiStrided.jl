@@ -2,12 +2,10 @@
 # upstream TensorOperations.jl benchmark suite's :pairwise/:tccg/:mps/:ctmrg/
 # :trg cases.
 #
-# StridedNative() was dropped from BACKENDS (2026-09-22): it was already
-# excluded from plot_bench_to_suite.jl's plots (see that file's header), so
-# timing it here only cost walltime -- and on :ctmrg/:trg specifically it has
-# a severe, size-growing slowdown (see the --trg-chis note below) that made a
-# ComplexF64 run risk blowing the job's walltime budget for numbers nobody
-# looks at.
+# StridedNative() is not in BACKENDS: plot_bench_to_suite.jl does not plot it
+# (see that file's header), and on :ctmrg/:trg it has a severe, size-growing
+# slowdown (see the --trg-chis note in submit_evidence_gate.sh) that puts a
+# ComplexF64 run at risk of exceeding the job's walltime.
 #
 #   julia --project=benchmark benchmark/bench_to_suite.jl [options]
 #

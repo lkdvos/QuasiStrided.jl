@@ -454,7 +454,7 @@ end
         @test demote(T, k, 3 * MR, 1000, 1) === k
         @test demote(T, k, 7, 7, 1) === k
         # Deeper than the K cutoff: never demoted.
-        kmax = T === Float64 ? QuasiStrided.F2_DEMOTE_KMAX_F64 : QuasiStrided.F2_DEMOTE_KMAX_F32
+        kmax = T === Float64 ? QuasiStrided._RUN_DEMOTE_KMAX_F64 : QuasiStrided._RUN_DEMOTE_KMAX_F32
         @test demote(T, k, 1, 1000, kmax + 1) === k
         for run in (1, 4, 8, 12, 16, 20, 24, 48)
             run % MR == 0 && continue

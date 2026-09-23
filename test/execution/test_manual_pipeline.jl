@@ -2,7 +2,7 @@
 # axis_from_descriptor -> QSTile -> pack_a!/pack_b! -> ScalarKernel
 # execute_tile! end to end, including multiple K panels applying beta once.
 
-@testset "Phase 2 integration: AxisGroup -> tiles -> packing -> ScalarKernel" begin
+@testset "manual pipeline: AxisGroup -> tiles -> packing -> ScalarKernel" begin
     # A[a,k,b] shape (3,5,2), B[k,n] shape (5,4), C[a,n,b] shape (3,4,2),
     # column-major, C[a,n,b] = sum_k A[a,k,b]*B[k,n].
     A = reshape(collect(1.0:30.0), 3, 5, 2)
@@ -64,7 +64,7 @@
     Cout = reshape(Cstorage, size(Cref))
     @test Cout ≈ Cref
 
-    # Multiple K panels (lengths 2,2,1 per microkernel spec section 10/11),
+    # Multiple K panels (lengths 2,2,1),
     # each packed/executed independently, beta_effective=0 on the first panel
     # and 1 on the rest -> must reproduce the same result (up to fp rounding
     # from different accumulation grouping, which is expected/allowed).

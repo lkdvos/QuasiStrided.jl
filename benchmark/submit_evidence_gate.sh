@@ -2,7 +2,7 @@
 # Slurm job for the "evidence gate" full run of benchmark/bench_to_suite.jl:
 # StridedBLAS vs
 # QuasiStridedBackend over the upstream TensorOperationsBenchmarks
-# :pairwise/:tccg cases plus the newly-wired :mps/:ctmrg/:trg tensor-network
+# :pairwise/:tccg cases plus the :mps/:ctmrg/:trg tensor-network
 # categories, at full reps. Single core, single node -- this script has no
 # internal parallelism, so plain sbatch is the right tool (not disBatch).
 #
@@ -12,47 +12,31 @@
 # Adjust --partition/--time/--mem below for your cluster (Rusty/Popeye) and
 # account as needed; see https://wiki.flatironinstitute.org/SCC/Software/Slurm.
 #
-# NOTE on --trg-chis: deliberately capped at 48 here, narrower than upstream
-# TensorOperationsBenchmarks' own default sweep (which goes to 96). A smoke
-# test found StridedNative (not QuasiStrided) had a severe, size-growing
-# slowdown on :trg specifically -- 42x slower than StridedBLAS at chi=32, and
-# a single un-warmed call did not finish within 100s at chi=48.
-# StridedNative was dropped from bench_to_suite.jl's BACKENDS entirely
-# (2026-09-22, see that file's header) since it was already excluded from
-# every plot, so this cap is no longer protecting against a walltime blowup
-# -- it's just left in place because nobody has re-validated chi>48 for
-# StridedBLAS/QuasiStrided specifically. Raise it if you want that data.
+# --trg-chis 16..48: capped at 48, narrower than upstream
+# TensorOperationsBenchmarks' own default sweep (which goes to 96).
+# StridedNative has a severe, size-growing slowdown on :trg (42x slower than
+# StridedBLAS at chi=32; a single un-warmed call does not finish within 100s
+# at chi=48), which is why it is not in bench_to_suite.jl's BACKENDS. chi>48
+# has not been validated for StridedBLAS/QuasiStrided; raise the cap if you
+# want that data.
 #
-# --reps bumped 21 -> 41 (2026-09-21): the first evidence-gate run
-# (job 7085230) showed ~27 case timings with a StridedBLAS median stuck at a
-# suspicious, size-independent ~11.8-12.0ms floor (reproduced standalone as
-# ~500x too slow for the same tensors -- not a real per-call cost, some kind
-# of one-off stall on the compute node). A plain median over more reps makes
-# a transient stall less likely to still be the median value; --time bumped
-# 2h -> 3h to match. The rerun (job 7085608, --reps 41) STILL showed the same
-# floor on largely the same cases (down from 27 to 21 of 170), so more reps
-# alone does not fix it -- it's a majority-of-calls effect on those specific
-# cases, not a rare transient. Root cause not yet found (not reproducible
-# standalone on the login node, only inside the Slurm compute-node
-# allocation); a real fix belongs in bench_to_suite.jl or the job's
-# environment (e.g. pinning OPENBLAS_NUM_THREADS=1), not just more reps.
+# --reps 41: some StridedBLAS case timings (~21 of 170) show a suspicious,
+# size-independent ~11.8-12.0ms median floor on the compute node (~500x the
+# standalone per-call cost for the same tensors). More reps make a transient
+# stall less likely to be the median, but the floor persists at 41 reps on
+# largely the same cases, so it is a majority-of-calls effect, not a rare
+# transient. Root cause unknown (it reproduces only inside the Slurm
+# compute-node allocation, not standalone on the login node); a real fix
+# belongs in bench_to_suite.jl or the job's environment (e.g. pinning
+# OPENBLAS_NUM_THREADS=1), not more reps.
 #
-# --dtypes Float32 -> ComplexF64 (2026-09-22): plot_bench_to_suite.jl only
-# plots Float64/ComplexF64 now (Float32 out of scope), so collecting Float32
-# timings here was wasted walltime; --time bumped 3h -> 4h since ComplexF64
-# cases haven't been timed at this full size sweep before (a small smoke
-# test at --reps 3 with one size per category found no correctness
-# mismatches or backend errors across all 5 categories).
+# --dtypes Float64,ComplexF64: plot_bench_to_suite.jl plots only these, so
+# Float32 timings would be wasted walltime.
 #
-# StridedNative dropped from BACKENDS entirely (2026-09-22, same day): job
-# 7087143 (this --dtypes change, StridedNative still present) ran past 1.5h
-# with zero visible progress past package precompilation -- almost certainly
-# StridedNative hitting its known :ctmrg/:trg slowdown (see the --trg-chis
-# note above), now likely worse under ComplexF64's larger footprint, for
-# numbers plot_bench_to_suite.jl was already discarding. Cancelled and fixed
-# at the source (bench_to_suite.jl's BACKENDS) rather than worked around
-# here; --time left at 4h as a margin since ComplexF64 timing at this size
-# sweep is still otherwise unvalidated.
+# --time 04:00:00: a margin for the ComplexF64 cases at this full size sweep,
+# whose walltime is not otherwise validated (a smoke test at --reps 3 with one
+# size per category found no correctness mismatches or backend errors across
+# all 5 categories).
 #SBATCH --job-name=qs-evidence-gate
 #SBATCH --partition=ccq
 #SBATCH --nodes=1
@@ -69,7 +53,7 @@ set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR not set -- run this script via sbatch, not directly}"
 
 # juliaup's own toolchain lives on this workstation's LOCAL disk (/home, not
-# /mnt/home -- see this org's CLAUDE.md filesystem table), so it isn't visible
+# the shared /mnt/home), so it isn't visible
 # on a compute node at all, and the site's bare `module load julia` resolves
 # to julia/1.11.2, whose depot (this repo's Manifest, precompiled for 1.12)
 # fails to precompile under it. `module spider julia/1.12.6` shows it needs a

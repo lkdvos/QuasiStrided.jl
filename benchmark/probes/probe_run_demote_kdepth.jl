@@ -1,37 +1,39 @@
-# T2b evidence-gathering probe: how big is the F2 run-length demotion's
-# regression (`_demote_for_run`, src/planning/kernel_selection.jl, fired unconditionally
-# from its two call sites at src/planning/kernel_selection.jl/1074) across a range of
-# `Qk` ("K-depth", the contracted extent `m` in the fixture below)?
+# Probe: cost of the run-length kernel-shape demotion (`_demote_for_run`,
+# src/planning/kernel_selection.jl, called from `plan_contract` in
+# src/planning/plan.jl) across a range of `Qk` ("K-depth", the contracted
+# extent `m` in the fixture below). `r = t_demoted / t_default` per point is
+# the evidence behind the K-depth guard `_RUN_DEMOTE_KMAX_F64/_F32`: demotion
+# wins at shallow K and loses past the crossover.
 #
-# T1 (this milestone, earlier in this session) already confirmed, on this
-# exact fixture family, that F2 fires at EVERY `(T, a, m)` combination
-# regardless of `m` -- i.e. it never declines to demote. This script does not
-# add a K-depth guard and draws no go/no-go conclusion; it only measures the
-# three arms below so a downstream gate can read `r = t_demoted / t_default`
-# against fixed rules.
+# On this fixture family the run-length predicate is broken at every
+# `(T, a, m)`, so demotion is eligible everywhere; the guard alone decides.
+# Hence `auto` matches `forced-demoted` for `Qk <= kmax(T)` and
+# `forced-default` above it, and `kernel_type_matches_first_m` is expected to
+# be false for `Qk > kmax(T)`.
 #
-#   julia -t 1 --project=benchmark benchmark/probes/probe_f2_kdepth.jl
+#   julia -t 1 --project=benchmark benchmark/probes/probe_run_demote_kdepth.jl
 #
 # Fixture: A is (i,j,m,a), B is (m,k,b,c), C is (a,b,c,i,j,k), with
 # i=j=k=b=c=6 fixed and (a, m) swept. Free extents seen by `plan_contract`
 # are therefore Qm = a*36 (i*j=36) and Qn = 216 (b*c*k=6*6*6=216), both
 # independent of `m` -- only Qk = m depends on `m`. That in turn means the
 # swap decision (`_prefer_swap`) and the demoted shape are themselves
-# independent of `m` for a fixed `(T, a)`; this is verified explicitly below
-# (per-point, not assumed) by re-deriving `plan.kernel`'s type at every `m`
-# and comparing it against the type recorded at the first `m` of the sweep.
+# independent of `m` for a fixed `(T, a)` (only whether the guard lets
+# demotion fire depends on `m`); this is checked per point by re-deriving
+# `plan.kernel`'s type at every `m` and comparing it against the type
+# recorded at the first (shallowest) `m` of the sweep.
 #
 # Three arms per `(T, a, m)` point, timed interleaved (not
 # all-of-arm-1-then-all-of-arm-2), each on its own warmed `ContractPlan` via
 # `execute!` (never `plan_contract` itself, which is comparatively cheap and
 # would just add noise):
-#   1. auto           -- plan_contract(...), no `kernel=`; F2 fires as today.
+#   1. auto           -- plan_contract(...), no `kernel=`; the planner decides.
 #   2. forced-default -- plan_contract(...; kernel = _default_kernel(T, Qm,
 #                         Qn)); explicit `kernel=` makes both call sites use
-#                         this kernel verbatim (see src/planning/plan.jl,
-#                         1065-1067/1073-1075), bypassing F2 entirely.
+#                         this kernel verbatim (see `plan_contract` in
+#                         src/planning/plan.jl), bypassing demotion entirely.
 #   3. forced-demoted -- plan_contract(...; kernel = <whatever `auto` chose>),
-#                         i.e. F2's own pick, forced so its cost can be
+#                         i.e. the demotion's own pick, forced so its cost can be
 #                         measured without re-deciding the swap/demotion.
 
 include(joinpath(@__DIR__, "..", "harness.jl"))
@@ -45,8 +47,8 @@ using Random
 const REPS = 15
 const OUTDIR = results_dir()
 mkpath(OUTDIR)
-const CSV_PATH = joinpath(OUTDIR, "f2_kdepth.csv")
-const PROV_PATH = joinpath(OUTDIR, "f2_kdepth_PROVENANCE.txt")
+const CSV_PATH = joinpath(OUTDIR, "run_demote_kdepth.csv")
+const PROV_PATH = joinpath(OUTDIR, "run_demote_kdepth_PROVENANCE.txt")
 
 # ---------------------------------------------------------------------------
 # Fixture
@@ -67,8 +69,8 @@ kernel_shape_str(kernel) = "($(mr(kernel)),$(nr(kernel)),$(lanewidth(kernel)))"
 
 # ---------------------------------------------------------------------------
 # One measured point: (T, a, m). `default_kernel`/`demoted_kernel` are passed
-# in (computed once per (T,a), reused across the m-sweep, per the docstring
-# above); `verify_kernel_type` is the type recorded for `demoted_kernel` at
+# in (computed once per (T,a), reused across the m-sweep, per the header
+# comment); `verify_kernel_type` is the type recorded for `demoted_kernel` at
 # the first m of the sweep, used to check m-independence at every point.
 # ---------------------------------------------------------------------------
 
@@ -143,7 +145,7 @@ end
 # ---------------------------------------------------------------------------
 
 function main()
-    print_env_header(stdout, "probes/probe_f2_kdepth.jl")
+    print_env_header(stdout, "probes/probe_run_demote_kdepth.jl")
     println("REPS = ", REPS)
 
     csv = open(CSV_PATH, "w")
@@ -175,8 +177,8 @@ function main()
             Qn = 216
             default_kernel = _default_kernel(T, Qm, Qn)
 
-            # Reference m to establish the demoted kernel + its type, per the
-            # m-independence claim in the header comment.
+            # Reference (shallowest) m to establish the demoted kernel + its
+            # type, per the m-independence claim in the header comment.
             m0 = ms[1]
             Cv0, Av0, indA0, Bv0, indB0, indC0 = fixture(T, a, m0, rng)
             plan0 = plan_contract(Cv0, Av0, indA0, Bv0, indB0, indC0)
@@ -189,20 +191,20 @@ function main()
             )
             if kernel_shape_str(default_kernel) == kernel_shape_str(demoted_kernel)
                 @warn "T=$T a=$a: auto's kernel at m=$m0 has the SAME shape as " *
-                    "_default_kernel(T,Qm,Qn) -- F2 did NOT demote here, contrary " *
-                    "to the T1 finding. Flagging loudly per task instructions."
+                    "_default_kernel(T,Qm,Qn) -- run-length demotion did NOT fire " *
+                    "at the shallowest m, so the forced-demoted arm is the default."
             end
 
             for (i, m) in enumerate(ms)
-                check_numeric = i == 1  # once per (T,a), per task ask
+                check_numeric = i == 1  # once per (T,a)
                 row = measure_point(
                     T, a, m, default_kernel, demoted_kernel, verify_kernel_type, rng;
                     check_numeric = check_numeric
                 )
                 if !row.kernel_type_matches_first_m
                     @warn "T=$T a=$a m=$m: auto's kernel TYPE differs from the " *
-                        "one recorded at m=$m0 -- the m-independence assumption " *
-                        "is FALSE at this point. Flagging loudly."
+                        "one recorded at m=$m0 (expected once Qk exceeds the " *
+                        "K-depth guard; unexpected below it)."
                 end
                 if check_numeric && !row.numeric_ok
                     @warn "T=$T a=$a m=$m: numeric mismatch between arms!"
@@ -222,8 +224,8 @@ function main()
                         "$(row.auto_matches),$(row.numeric_checked),$(row.numeric_ok)"
                 )
 
-                # The specific regression point (Float64, a=8, m=512): 2 EXTRA
-                # independent reps, per task ask.
+                # The deep-K regression point (Float64, a=8, m=512): 2 EXTRA
+                # independent reps.
                 if T === Float64 && a == 8 && m == 512
                     for rep in 1:2
                         erow = measure_point(
@@ -268,12 +270,12 @@ function main()
     println("machine load (uptime): ", machine_load)
 
     open(PROV_PATH, "w") do io
-        print_env_header(io, "probes/probe_f2_kdepth.jl")
+        print_env_header(io, "probes/probe_run_demote_kdepth.jl")
         println(io, "reps = ", REPS)
         println(io, "canaries = ", canaries)
         @printf(io, "canary spread = %.2f%%\n", 100spread)
         println(io, "machine load (uptime, at provenance-write time) = ", machine_load)
-        println(io, "\n--- table (see f2_kdepth.csv for the machine-readable form) ---")
+        println(io, "\n--- table (see run_demote_kdepth.csv for the machine-readable form) ---")
         for row in all_rows
             @printf(
                 io,
@@ -283,7 +285,7 @@ function main()
                 row.kernel_type_matches_first_m, row.numeric_checked, row.numeric_ok
             )
         end
-        println(io, "\n--- extra reps: Float64, a=8, m=512 (the specific prior-pass regression point) ---")
+        println(io, "\n--- extra reps: Float64, a=8, m=512 (the deep-K regression point) ---")
         for row in extra_rows
             @printf(
                 io,

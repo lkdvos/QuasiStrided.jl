@@ -4,8 +4,8 @@
 #
 # Three separable things are pinned here, deliberately not mixed:
 #
-#  1. VALUES. The fast path must produce the bytes the scalar
-#     `_pack_panel_complex!` loop produces -- not "within a tolerance". There is
+#  1. VALUES. The fast path must produce the bytes the scalar `_pack_panel!`
+#     loop produces -- not "within a tolerance". There is
 #     no arithmetic on this path beyond a sign flip, so bitwise `isequal` (which
 #     also separates `+0.0` from `-0.0`) is the right comparison, matching
 #     test_pack_complex.jl's own justification for using `==` there. Each
@@ -117,8 +117,8 @@ end
 realtype_of(kernel) = QS.realtype(kernel)
 
 # Scalar reference run: a plain `Vector` destination is excluded by the gate
-# (`packed isa PackedPanel{R}`), so this is the untouched
-# `_pack_panel_complex!` loop by construction.
+# (`packed isa PackedPanel{R}`), so this is the scalar `_pack_panel!` loop by
+# construction.
 function fp_pack_a_scalar(kernel, source, kc, transform)
     buf = fill(realtype_of(kernel)(-777), packed_a_length(kernel, kc))
     pack_a!(buf, source, kernel, transform)

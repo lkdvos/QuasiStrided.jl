@@ -1,4 +1,4 @@
-# Benchmark harness for the Phase 1 grouped-axis indexing layer
+# Benchmark harness for the grouped-axis indexing layer
 # (`src/layout/axis_group.jl`). See Julia-Tensor-Indexing-Agent-Spec.md section 12
 # for what this is meant to measure and why.
 #

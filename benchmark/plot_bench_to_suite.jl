@@ -65,8 +65,9 @@ struct Row
     std_gflops::Float64
 end
 
-# Whether the CSV being read has the min_gflops/std_gflops columns (added
-# 2026-09-22); set by `read_rows`, checked before attempting the violin plot.
+# Whether the CSV being read has the min_gflops/std_gflops columns (older
+# CSVs lack them); set by `read_rows`, checked before attempting the violin
+# plot.
 HAS_SPREAD_COLUMNS = false
 
 # `params` is the free-form "k1=v1;k2=v2;..." field bench_to_suite.jl writes

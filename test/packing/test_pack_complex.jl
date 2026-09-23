@@ -505,10 +505,10 @@ probe_b(packed, src, kernel, f) =
 
         src_kc0 = SourceTile(storage, 0, AffineAxis(0, 1, MR), AffineAxis(0, MR, 0))
 
-        # Tail slivers (T5 review, S5): every probe above uses a FULL sliver
-        # (m == MR / n == NR); the unified `_pack_panel!` gave complex
-        # formats a genuinely separate tail branch (the valid-lanes loop plus
-        # `_pack_emit_zero!` padding), which had no allocation coverage.
+        # Tail slivers: every probe above uses a FULL sliver (m == MR /
+        # n == NR); complex formats take a separate tail branch in
+        # `_pack_panel!` (the valid-lanes loop plus `_pack_emit_zero!`
+        # padding), which needs its own allocation coverage.
         src_a_tail = SourceTile(storage, 0, AffineAxis(0, 1, MR - 1), AffineAxis(0, MR, kc))
         src_b_tail = SourceTile(storage, 0, AffineAxis(0, 1, kc), AffineAxis(0, kc, NR - 1))
 

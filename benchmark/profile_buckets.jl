@@ -42,10 +42,9 @@ const SPECIFIC_QS_BUCKETS = [
             "plan_contract", "_plan_contract", "_classify_labels", "_order_free_labels",
             "_prefer_swap", "_default_kernel", "_kernel_from_shape",
             "default_blocking",
-            # Per-call-floor milestone (2026-09-21). These already landed in
-            # "planning" through the ancestor walk -- `plan_contract` is their
-            # only caller -- so naming them makes the attribution explicit
-            # rather than incidental; it cannot change any classification.
+            # These would land in "planning" through the ancestor walk anyway
+            # (`plan_contract` is their only caller); naming them makes the
+            # attribution explicit and cannot change any classification.
             "_build_pair_group", "_pair_group_rank", "_pair_group_static",
         ],
     ),
@@ -65,8 +64,7 @@ const SPECIFIC_QS_BUCKETS = [
             "_execute_nest!", "execute!", "_axis_of", "_classify_slivers!",
             "_sliver_panel", "_scale_micro_tile!", "_scale_all_of_C!",
             "fill_offsets!", "describe_block", "block_descriptors!", "checked_tile_storage_bounds",
-            # Per-call-floor milestone (2026-09-21): the closed-form affine
-            # block path and the hoisted once-per-macro-block bounds check.
+            # The closed-form affine block path and the hoisted once-per-macro-block bounds check.
             # Same note as under "planning" -- `_execute_nest!` is the only
             # caller of each, so these names change no classification; the
             # `unsafe_pack_*!`/`unsafe_execute_*!` entry points need no entry

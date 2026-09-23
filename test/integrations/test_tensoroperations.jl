@@ -44,7 +44,7 @@ const all_eltypes = (eltypes..., complex_eltypes...)
 const _MATMUL_PAB = ((1,), (2,)), ((1,), (2,)), ((1, 2), ())
 
 @testset "QuasiStridedBackend export" begin
-    # Frozen: QuasiStridedBackend is the *only* exported name.
+    # QuasiStridedBackend is the *only* exported name.
     @test QuasiStrided.QuasiStridedBackend === QuasiStrided.QuasiStridedBackend
     @test QuasiStridedBackend <: TensorOperations.AbstractBackend
     @test QuasiStridedBackend() isa QuasiStridedBackend
@@ -233,7 +233,7 @@ end
     end
 end
 
-@testset "conjugation: _op_conjugates is the frozen table, with a throwing fallback" begin
+@testset "conjugation: _op_conjugates is a closed table, with a throwing fallback" begin
     # The table as a pure function, checked on its own so that it is exercised
     # independently of any complex kernel. An `op` that is
     # not one of the four must throw rather than be silently treated as
@@ -545,7 +545,7 @@ end
 end
 
 @testset "hard-reject: aliasing between C and an input" begin
-    # Frozen argument-checking order, step 4: `plan_contract`/`execute!` have
+    # Argument-checking order, step 4: `plan_contract`/`execute!` have
     # no aliasing check whatsoever, so the adapter itself must catch this
     # before touching the engine.
     pA, pB, pAB = _MATMUL_PAB
@@ -602,7 +602,7 @@ end
         # The aliasing check runs on the `StridedView`-wrapped operands, which
         # unwrap `PermutedDimsArray`/`Adjoint` down to the shared parent. That
         # must hold for complex operands too -- conjugated-C rejection comes
-        # *after* aliasing in the frozen order (eligibility -> argcheck ->
+        # *after* aliasing in the required order (eligibility -> argcheck ->
         # dimcheck -> wrap -> aliasing -> conjugated-C rejection), and
         # reordering it away would let a conjugated-but-aliased call through
         # with the wrong error, or none.
@@ -626,7 +626,7 @@ end
     end
 end
 
-@testset "tensoradd! falls back to StridedNative (amended 2026-09-16)" begin
+@testset "tensoradd! falls back to StridedNative" begin
     A = randn(Float64, (3, 4))
     C1 = zeros(Float64, (4, 3))
     @tensor backend = qsbackend C1[j, i] = A[i, j]
@@ -647,7 +647,7 @@ end
     @test C3 == C1
 end
 
-@testset "tensortrace! falls back to StridedNative (amended 2026-09-16)" begin
+@testset "tensortrace! falls back to StridedNative" begin
     A = randn(Float64, (4, 3, 3))
     C1 = zeros(Float64, 4)
     @tensor backend = qsbackend C1[i] = A[i, j, j]

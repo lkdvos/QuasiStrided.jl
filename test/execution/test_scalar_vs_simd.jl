@@ -3,7 +3,7 @@
 
 using StridedViews: StridedView
 
-@testset "Phase 3 integration: driver + SIMDKernel swap" begin
+@testset "driver integration: ScalarKernel -> SIMDKernel swap" begin
     rng = MersenneTwister(20260908)
     Amat = rand(rng, 11, 13)
     Bmat = rand(rng, 13, 9)

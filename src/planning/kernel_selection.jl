@@ -262,7 +262,7 @@ end
 #
 # The demotion wins by fixing the store, but it also changes the packing and
 # microkernel cost, which grows with the contracted extent `Qk`; past
-# `F2_DEMOTE_KMAX_*` that cost dominates and demoting loses, so the guard
+# `_RUN_DEMOTE_KMAX_*` that cost dominates and demoting loses, so the guard
 # declines to demote there.
 #
 # Real element types only. Complex kernels now have a vectorized store too, so
@@ -272,16 +272,16 @@ end
 #
 # Order matters for cost: the cheap `Qm == run` / `run % mr == 0`
 # short-circuits run before the O(Qm/mr) `_unbroken_fraction` scan, which is
-# additionally skipped while `F2_BROKEN_ENOUGH` is inert (`1.0`). Whenever a
+# additionally skipped while `_RUN_DEMOTE_BROKEN_ENOUGH` is inert (`1.0`). Whenever a
 # short-circuit holds the fraction is `1.0` anyway, so the order changes no
 # decision.
 function _demote_for_run(::Type{T}, kernel, run::Int, Qm::Int, Qk::Int) where {T}
     T <: Real || return kernel
-    kmax = T === Float64 ? F2_DEMOTE_KMAX_F64 : F2_DEMOTE_KMAX_F32
+    kmax = T === Float64 ? _RUN_DEMOTE_KMAX_F64 : _RUN_DEMOTE_KMAX_F32
     Qk > kmax && return kernel
     Qm == run && return kernel
     run % mr(kernel) == 0 && return kernel
-    F2_BROKEN_ENOUGH < 1.0 && _unbroken_fraction(Qm, run, mr(kernel)) > F2_BROKEN_ENOUGH &&
+    _RUN_DEMOTE_BROKEN_ENOUGH < 1.0 && _unbroken_fraction(Qm, run, mr(kernel)) > _RUN_DEMOTE_BROKEN_ENOUGH &&
         return kernel
     method = complex_method(kernel)
     best = nothing
@@ -297,15 +297,15 @@ end
 # Deepest `Qk` at which run-length demotion still wins: it crosses over from a
 # win to a loss between Qk=32 and 64 for Float64 and between 64 and 128 for
 # Float32.
-const F2_DEMOTE_KMAX_F64 = 32
-const F2_DEMOTE_KMAX_F32 = 64
+const _RUN_DEMOTE_KMAX_F64 = 32
+const _RUN_DEMOTE_KMAX_F32 = 64
 
 # Demotion is also skipped when more than this fraction of the register
 # slivers already lie inside one run. Inert at `1.0`: the evidence conflicts
 # between Float64 and Float32 and one shared threshold cannot satisfy both, so
 # the `Qk` cutoff above is the only active guard. Known residual: on
 # less-broken shapes demotion still fires, and can lose, for `Qk <= kmax(T)`.
-const F2_BROKEN_ENOUGH = 1.0
+const _RUN_DEMOTE_BROKEN_ENOUGH = 1.0
 
 # Fraction of the `cld(Qm, mr)` register slivers `[s*mr, min((s+1)*mr, Qm))`
 # that lie ENTIRELY inside one run of length `run`, i.e. `lo ÷ run == hi ÷
