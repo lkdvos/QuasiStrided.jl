@@ -1009,6 +1009,44 @@ end
     end
 end
 
+@testset "pack_a!/pack_b!: every tail width, Float32 (the fallback loop's other real dtype)" begin
+    kernel = KernelDescriptor(Val(8), Val(6), Float32)
+    MR, NR = mr(kernel), nr(kernel)
+    storage = Float32.(collect(1.0:500.0))
+    calls = Ref(0)
+    counting = x -> (calls[] += 1; Float32(3.0) * x)
+    for kc in (1, 5), dst in (:vector, :panel)
+        for m in 0:MR
+            src = SourceTile(storage, 20, AffineAxis(2, 3, m), AffineAxis(0, 40, kc))
+            expected = _oracle_packed_a(storage, 20, _offs(src.rows), _offs(src.cols), MR, x -> Float32(3.0) * x, Float32)
+            buf = fill(Float32(-777.0), MR * kc + 4)
+            calls[] = 0
+            if dst === :vector
+                pack_a!(view(buf, 1:(MR * kc)), src, kernel, counting)
+            else
+                GC.@preserve buf pack_a!(packed_panel(buf, 1, MR * kc), src, kernel, counting)
+            end
+            @test buf[1:(MR * kc)] == expected
+            @test calls[] == m * kc
+            @test all(==(Float32(-777.0)), buf[(MR * kc + 1):end])
+        end
+        for n in 0:NR
+            src = SourceTile(storage, 20, AffineAxis(0, 40, kc), AffineAxis(2, 3, n))
+            expected = _oracle_packed_b(storage, 20, _offs(src.rows), _offs(src.cols), NR, x -> Float32(3.0) * x, Float32)
+            buf = fill(Float32(-777.0), NR * kc + 4)
+            calls[] = 0
+            if dst === :vector
+                pack_b!(view(buf, 1:(NR * kc)), src, kernel, counting)
+            else
+                GC.@preserve buf pack_b!(packed_panel(buf, 1, NR * kc), src, kernel, counting)
+            end
+            @test buf[1:(NR * kc)] == expected
+            @test calls[] == n * kc
+            @test all(==(Float32(-777.0)), buf[(NR * kc + 1):end])
+        end
+    end
+end
+
 @testset "pack_a!/pack_b!: zero steady-state allocation on the driver's argument types" begin
     # PackedPanel destination, dense storage (Memory on >= 1.11), AffineAxis /
     # PtrScatterAxis axes, identity and conj -- the fast path and both

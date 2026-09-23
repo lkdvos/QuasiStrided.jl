@@ -414,29 +414,27 @@ is the sign-off document; the user accepted its recommendation against
 building the tiers now. Do not restart this item without new evidence
 against that recommendation (see the proposal's evidence gate, below).
 
-**Current next task, two tracks, both authorized 2026-09-21:**
+**Update 2026-09-22: both tracks below have since moved. This section is
+kept for its historical framing; see the two milestone sections that follow
+it ("Per-call floor..." and "tensorcontract-rs comparison...") for what
+actually shipped.**
 
 1. **Evidence gate** (`docs/proposals/dispatch-tiers.md` section 5.1):
-   confirm the recommendation above holds on the upstream `:mps`/`:ctmrg`/
-   `:trg` categories, never before measured against this engine. An sbatch
-   script for this is prepared for the user to submit on Rusty/Popeye; not
-   run as part of this session (Slurm job submission is the user's own
-   action per this project's operating constraints). Wires those categories
-   into `benchmark/bench_to_suite.jl` first (previously only `:pairwise`/
-   `:tccg` were runnable).
-2. **Per-call floor** (`docs/proposals/dispatch-tiers.md` section 5.2): the
-   residual loss pattern found by the analyses above is per-call/per-block
-   overhead, not packing -- `plan_contract`'s ~3.8-4.4 KB/~4.4-6.7 us
-   allocation-heavy label bookkeeping, per-sliver validation
-   (`_check_pack_a`/`_check_pack_b` + `checked_tile_storage_bounds`, 7.4% of
-   `ao2mo_2_dim16`), and `driver_loop` bookkeeping (`fill_offsets!`/
-   `describe_block`/`_classify_slivers!`, 28.7% of `ao2mo_2_dim16`).
-   User has explicitly authorized hoisting the per-sliver validation to
-   once-per-macro-block even though this changes `pack_a!`/`pack_b!`'s
-   documented "all validation before any write" contract, on the condition
-   that the resulting now-unchecked internal entry points are named with an
-   `unsafe_` prefix so the shifted safety contract is visible at every call
-   site. See `docs/decisions.md` for this track's outcome once it lands.
+   **partially done.** `:mps`/`:ctmrg`/`:trg` are wired into
+   `benchmark/bench_to_suite.jl` and smoke-tested with real numbers already
+   on record (`docs/decisions.md`, "`bench_to_suite.jl`: wiring up
+   `:mps`/`:ctmrg`/`:trg`, smoke-tested" -- QuasiStrided 1.03-1.25x slower
+   than `StridedBLAS` across the three categories at the smoke test's sizes).
+   The FULL sweep (`benchmark/submit_evidence_gate.sh`, prepared) is still not
+   submitted -- Slurm job submission remains the user's own action.
+2. **Per-call floor** (`docs/proposals/dispatch-tiers.md` section 5.2):
+   **done.** See "Per-call floor: cheaper planning, once-per-block bounds
+   validation, closed-form affine blocks" below -- `plan_contract` went from
+   4.1-6.4 us/5.0-7.0 KB to 1.0-2.3 us/1.8-2.6 KB per call, storage-bounds
+   validation hoisted to once per macro block behind the documented
+   `unsafe_*` naming convention, closed-form affine-ramp blocks for rank-<=1
+   composites. Measured 1.19x-1.67x on the three profiled cases,
+   `docs/decisions.md` has the full account.
 
 Two smaller follow-ons, both unblocked but not urgent: the register tile
 can be enlarged (`NV` up to 28 is allocation-free and spill-free -- it just
@@ -473,7 +471,7 @@ cannot reach them. **LoopVectorization.jl was considered and rejected** as a
 dependency (grant-funded maintenance, compiler-fragile, and unnecessary — the
 addressing idea was reproduced with zero new dependencies).
 
-## Complex element-type milestone — open
+## Complex element-type milestone — complete
 
 Opened 2026-09-14 on branch/worktree `complex`, base `114e594`. Goal: support
 `ComplexF32`/`ComplexF64` end to end — engine and `QuasiStridedBackend` — with
@@ -887,3 +885,93 @@ milestone also fixed the underlying lever itself (`_order_free_labels`, plus
 a guarded M/N orientation swap); see `docs/decisions.md`, "Label-order
 milestone", for the mechanism and the measured before/after on these same
 four cases.
+
+## Per-call floor milestone — complete (2026-09-21)
+
+Authorized off `docs/proposals/dispatch-tiers.md` section 5.2 ("Next task",
+above). Three items, all shipped in one pass, `src/driver.jl` +
+`src/axis_group.jl`: (1) `_classify_labels`/`_build_pair_group`/
+`_order_free_labels` no longer build `Set`s or call runtime `ntuple(f,
+::Int)` -- `plan_contract` 4.1-6.4 us/5.0-7.0 KB -> 1.0-2.3 us/1.8-2.6 KB;
+(2) storage-bounds validation hoisted to once per macro block behind
+`unsafe_pack_a!`/`unsafe_pack_b!`/`unsafe_execute_tile!`/
+`unsafe_execute_micro_tile!`, proved (not just tested) equivalent to the old
+per-sliver checks; (3) closed-form `affine_ramp` block description for
+rank-<=1 composites, replacing the offset buffer where applicable. Measured
+1.19x-1.67x on the three profiled cases (`ao2mo_2_dim16`, `plain_64`,
+`smallMN_16x256x16`); ABBA guard geomean 0.9207, 0 of 18 shapes slower by
+more than 5%. Full suite **52679 passed, 0 failed** (47224 before). Full
+narrative, the equivalence proof, and two deferred follow-on ideas
+(identical-map sharing, piecewise-affine slivers) in `docs/decisions.md`,
+"Per-call floor: cheaper planning, once-per-block bounds validation,
+closed-form affine blocks".
+
+## `tensorcontract-rs` comparison milestone — complete (2026-09-22)
+
+Opened from a comparison against the user's sibling Rust project
+`tensorcontract-rs` (the design source the complex-element-type milestone
+above also drew from). Full brief, evidence corrections, and the
+orch-planner execution contract in
+`.claude/orchestration/tensorcontract-rs-lessons.md`; full narrative,
+per-item gates and measurements in `docs/decisions.md`, "tensorcontract-rs
+comparison (2026-09-22)". Two of the original five comparison items were
+found moot before implementation started (already shipped as the per-call
+floor above, or already measured-and-rejected before the comparison ran);
+the three genuinely open items were each gated on their own measurement
+before any `src/` change, per this project's evidence-first convention --
+none were implemented speculatively.
+
+- **Item 1** (shipped): unified `_pack_panel!` for real and complex packing
+  (`src/packing.jl`), replacing the complex path's per-element conditional
+  load with the real path's full/tail split. Gate: packing share up to
+  62.8% on some shapes, complex loop 1.58x slower per real-emitted than the
+  real fallback. Real-dtype LLVM IR proved structurally identical pre/post.
+  ABBA guard 0.9718 (inside the required band). Complex packing
+  microbenchmark: Planar-B 1.55-1.56x faster (clears the gate); Planar-A
+  roughly flat; **1e (`OneEFormat`) found 14-26% slower post-change on
+  `ComplexF64`**, an unmentioned-until-review regression now on record,
+  not yet profiled further.
+- **Item 2** (shipped): F2's run-length kernel-shape demotion
+  (`_demote_for_run`) fired unconditionally regardless of the contracted
+  extent `Qk`, a documented, previously-unfixed defect (regresses large-K
+  cases up to ~39%). Added a `Qk` cutoff (`F2_DEMOTE_KMAX_F64=32`,
+  `F2_DEMOTE_KMAX_F32=64`, derived from a 28-point sweep) plus a
+  "broken-enough" fraction guard that ships inert (`F2_BROKEN_ENOUGH=1.0`)
+  because the sweep found conflicting evidence between dtypes. **Known,
+  accepted residual**: on "less-broken" shapes, demotion still fires (and
+  loses, up to ~39%) for `Qk` between 1 and `kmax(T)` -- a single inert
+  constant can't resolve the cross-dtype conflict; recorded, not fixed.
+  The original `ccsd_t_1` shallow-K win is unaffected by construction.
+- **Item 3** (shipped): `plan_contract` was recomputing the same two
+  run-length values a second time at the F2 call sites after `_prefer_swap`
+  had already computed them once; now computed once and reused. **Also
+  corrected two things the comparison and the planning contract both got
+  wrong**: there was only ONE run-length derivation (`_leading_unit_run`),
+  not three as claimed, and the contract's proposed `affine_ramp` relation
+  test would have been genuinely incorrect as specified (it compared
+  against a two-map `AxisGroup` that also constrains operand A, a strictly
+  stronger condition than the C-only quantity being tested) -- the shipped,
+  corrected version uses a single-map `AxisGroup` instead, verified over
+  2000 randomized draws.
+- **Independent review (T5)**: no blocking findings. Five should-fix items,
+  the most substantive being an unmeasured added cost from the "inert"
+  fraction guard (fixed by reordering) and complex plans paying for
+  run-length calls the old code never made (fixed by gating on `T <:
+  Real`) -- both addressed before close. Also caught and corrected two
+  `docs/decisions.md` numbers that no longer matched an on-disk artefact
+  after a benchmark-directory overwrite, and a flag paragraph that
+  misattributed a pre-existing (older, unrelated) complex-efficiency drop
+  to this milestone.
+
+**Flagged for the user, not acted on in this milestone** (all recorded in
+`docs/decisions.md`): (a) the item-2 residual above exceeds this project's
+own 15% record-and-ask threshold at some points -- whether to reopen a
+K-straddling store-path option (considered and deliberately not built) is
+the user's call; (b) item 1's 1e-format regression is unprofiled; (c) a
+complex-efficiency metric reads roughly half its complex-element-type-
+milestone value as of the CLEAN pre-milestone tree (`f7fa490`) already --
+predates this milestone, cause unknown, a bisection against the
+complex-element-type milestone's close is the natural next step if pursued.
+
+Full suite **66451/66451 passing**, Runic clean, both forced-ISA profiles
+(`avx2`, `unknown`) show only their documented expected residues throughout.

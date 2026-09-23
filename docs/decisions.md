@@ -5795,6 +5795,457 @@ construction). Unchanged behaviour, not introduced here; the sentence is now
 scoped to the macro-blocking pack/execute path and the exception named
 explicitly.
 
+## tensorcontract-rs comparison (2026-09-22)
+
+Milestone opened from a comparison against the user's sibling Rust project,
+`tensorcontract-rs` (the same design source cited by the complex-element-type
+milestone). Full milestone brief, evidence-verification corrections, and the
+orch-planner execution contract are in
+`.claude/orchestration/tensorcontract-rs-lessons.md` (tracked in git, per
+this project's convention for orchestration files, e.g. `label-order.md`).
+Two of the original
+five comparison items were found moot before this milestone opened: the
+allocation-light label classification (already shipped as the per-call-floor
+milestone above) and an opt-in cache-blocking model (already measured and
+rejected, `src/blocking.jl`'s own docstring). Three items remained in scope,
+each gated on its own measurement before implementation, per this project's
+standing evidence-first convention.
+
+### Item 1: unified real/complex packing (shipped)
+
+**Gate (before implementing).** `src/packing.jl` kept two structurally
+separate packing loops: `_pack_panel!` (real, had the full/tail vectorized
+split from the "Packing speed" milestone above) and `_pack_panel_complex!`
+(complex, still had that milestone's original per-element `t < valid ? load
+: zero` conditional). Evidence gathered
+(`benchmark/results/ccqlin038.flatironinstitute.org-2026-09-22/pack_loops_PROVENANCE.txt`,
+`profiles/buckets_summary-tcrs-pre.txt`): packing share up to **62.8%**
+(`smallN_256x256x12`, `ComplexF32`, named-buckets-only) against a 10%
+go/no-go floor; complex-loop cost **1.58x** per real-emitted vs. the real
+fallback loop on the B operand (0.4583 vs. 0.2904 ns/real) against a 1.3x
+floor. Gate passed decisively on both independent criteria.
+
+**Design.** One `_pack_panel!(packed, ::Type{T}, format::FMT, ::Val{PD},
+kc, valid, transform, load, plane_offset)`, keeping the real loop's exact
+full/tail structure, dispatching the per-lane store through
+`_pack_emit!`/`_pack_emit_zero!` on `format`. `RealFormat` gained emit
+methods (it had none before -- `PlanarFormat`/`OneEFormat` already had
+theirs from the complex-element-type milestone); real callers pass
+`RealFormat()` and a `plane_offset` closure over `packed_a_offset`/
+`packed_b_offset`; complex callers pass `Val(MR)`/`Val(NR)` in place of the
+old `Int physical_dim`. `_pack_panel_complex!` deleted. Untouched (test-bound
+or out of scope): `_pack_a_contiguous_eligible`, `_pack_a_contiguous!`,
+`_copies_unchanged`, `src/complex_format.jl`, `src/kernel_descriptor.jl`, any
+kernel file, `src/driver.jl`.
+
+**Shipped as commit `69f8e4f`**, "Unify real/complex packing into one loop,
+format-dispatched" (`src/packing.jl` +106/-44 net across the diff;
+`test/test_packing.jl` +38, `test/test_packing_complex.jl` +39 -- Float32
+tail-width coverage and `kc==1` full/tail coverage for Planar A, Planar B,
+and 1e A under `conj`, closing gaps the evidence-gate work had left
+unexercised). Full suite **54431/54431 passing** (baseline 54203 + 228 new),
+0 failed. Runic-clean on every added/touched line (two pre-existing,
+unrelated diffs in `test/test_packing.jl`/`test/test_per_call_floor.jl`,
+present since before this milestone, deliberately left alone). Both
+forced-ISA runs (`avx2`, `unknown`) show only the residues
+`test/forced_isa_runner.jl`'s own header documents.
+
+**AC4a (real-dtype LLVM IR structurally identical): PASSED.** `code_llvm`
+(debuginfo=:none) dumped for `_pack_a!`/`_pack_b!` at `KernelDescriptor{16,6}`
+and `{32,6}`, both dtypes, both bounds-check `Val`s, across
+contiguous-fast-path/full-sliver/tail-sliver source shapes: 25496 lines each
+pre/post; raw diff nonempty (9080 lines) but entirely SSA-numbering and
+per-session pointer-literal noise; diff after normalizing digit sequences is
+**empty**. No fallback needed.
+
+**AC4b (two-tree ABBA guard): PASSED, narrowly.** Base tree archived from
+`f7fa490` (`git archive` + the working tree's gitignored `Manifest.toml`
+copied in, both environments `Pkg.instantiate()`d), A-B-B-A over
+`benchmark/bench_real_path_guard.jl`, 21 reps/run, 2 runs/tree, all 4 canary
+spreads 2.3-4.5% (quiet). Per-shape median over 18 shapes (real dtypes only,
+9 shapes x {Float32,Float64}): **geomean new/base = 0.9718** -- inside the
+required `[0.97, 1.03]` band by 0.0018. 12/18 shapes moved >2% faster, 3/18
+>2% slower, 3 within noise -- 12 < the 14-shape one-sided-shift trigger, so
+no flag. **Honestly noted, not chased further**: 12 of 18 *real-dtype* shapes
+(this commit touches only complex packing; AC4a already proved the real-path
+IR is bit-identical) show a mild, fairly consistent 3-5% speedup on the new
+tree. The harness/archive setup was checked and found sound (identical
+`Manifest.toml`, matching thread settings, correct ABBA ordering, all four
+canaries quiet). Most likely ordinary cross-tree noise -- this project's own
+"Measurement hygiene" note (above) already documents 4-15% canary spreads and
+rank reversals between successive sweeps as normal on this shared machine --
+but the one-sidedness is recorded rather than smoothed over, since it sits
+inside accepted thresholds without a mechanism to explain it.
+Artifacts: `benchmark/results/ccqlin038.flatironinstitute.org-2026-09-22/
+real_path_guard_new69f8e_run{1,2}.csv` (new tree, on disk); the base-tree
+runs were written under a session scratchpad and are not guaranteed to
+persist -- the geomean/split figures above are the artifact of record for
+this entry.
+
+**AC4c (complex packing microbenchmark): PASSED via the B operand.**
+Re-measured with `benchmark/bench_pack_loops.jl`. **Corrected against the
+T5 review (S2)**: an earlier draft of this paragraph quoted numbers from an
+intermediate re-run that no longer matches the artefact actually on disk,
+because `pack_loops.csv`/`pack_loops_PROVENANCE.txt` were overwritten by a
+later run during this same milestone (item 2's evidence-gathering reused the
+same benchmark directory). The numbers below are re-derived directly from
+the CURRENT on-disk artefact
+(`benchmark/results/ccqlin038.flatironinstitute.org-2026-09-22/
+{pack_loops.csv,pack_loops_PROVENANCE.txt}`, provenance `69f8e4f-dirty`,
+canary spread **6.23%**, 21 reps), against the preserved pre-change baseline
+at `pack_loops.tcrs-pre.csv`:
+
+| case | pre | post | ratio |
+|---|---|---|---|
+| Planar-A-full ComplexF64 | 0.3826 | **0.3977** | 1.040x slower |
+| Planar-B-full ComplexF64 | 0.4583 | **0.2949** | **1.554x faster** |
+| 1e-A-full ComplexF64 | 0.3912 | **0.4910** | **1.255x slower** |
+| 1e-A-tail ComplexF64 | 0.3845 | **0.4380** | **1.139x slower** |
+
+The acceptance criterion required >= 1.2x on *at least one* of the two
+originally-named numbers (Planar-A-full or Planar-B-full); Planar-B-full
+clears it at 1.554x, so **AC4c still passes**, but two regressions the
+original paragraph did not mention are now on record: 1e (`OneEFormat`, the
+Van Zee 1m method's packing) is 14-26% *slower* post-unification on both
+sliver kinds, for `ComplexF64`. This is plausible on structural grounds
+(1e's emit path may not vectorize as cleanly inside the shared full/tail
+loop as it did in the old, format-specific loop) but has not been profiled
+further -- flagged here rather than silently omitted, since this project's
+own canary convention (Real-B-tail `Float64` alone moves +42% between two
+supposedly-identical-IR runs in this same session, per T5's cross-check)
+means neither the Planar-B win nor the 1e loss can be fully separated from
+noise on a single un-repeated run. A repeat run with alternation would
+settle it; not done here, out of this review-response's immediate scope.
+
+Post-unification `code_llvm` of the unified `_pack_panel!` at the Planar-A
+argument types confirms the per-element branch this item exists to remove
+is gone (`icmp eq i64 %valid, 24` / `br ... label %L3, label %L101` -- a
+single coarse full-vs-tail branch per call, not a per-element one) --
+checked directly, not assumed. This structural finding (not a timing
+number) is the strongest evidence for this item, and is unaffected by the
+artefact/noise concerns above.
+
+**AC4d (existing tests pass unmodified): PASSED**, folded into the
+54431/54431 full-suite result above -- no existing testset body was edited,
+only new testsets added.
+
+**Profiling re-run** (`benchmark/profile_to_suite.jl`, same 10 cases, `--tag
+tcrs-post` vs. the pre-change `tcrs-pre` run, named-buckets-only packing
+share):
+
+| case | pre | post |
+|---|---|---|
+| `plain_64_c64` | 18.18% | 18.29% |
+| `plain_64_c32` | 26.94% | 21.46% |
+| `shallowK_256x24x256_c64` | 4.45% | 4.81% |
+| `shallowK_256x24x256_c32` | 5.37% | 4.51% |
+| `smallN_256x256x12_c64` | 48.66% | 48.96% |
+| `smallN_256x256x12_c32` | 62.81% | 53.97% |
+| `smallM_12x256x256_c64` | 28.72% | 28.61% |
+| `smallM_12x256x256_c32` | 28.11% | 23.56% |
+| `smallMN_16x256x16_c64` | 30.49% | 30.32% |
+| `smallMN_16x256x16_c32` | 30.97% | 27.59% |
+
+Pattern matches the microbenchmark: every `ComplexF32` (Planar `48x3`) case's
+packing share drops (14-20% relative), every `ComplexF64` (Planar `24x3`)
+case stays flat -- consistent with the B-operand-only improvement measured
+above, since the packing-share reduction tracks which format's B-side
+packing dominates the mix, not a uniform effect. Artifacts:
+`benchmark/results/ccqlin038.flatironinstitute.org-2026-09-22/profiles/
+buckets_summary-tcrs-{pre,post}.txt`.
+
+**Unplanned finding, corrected against the T5 review (S3), narrowed to what
+it actually is: an unrelated, pre-existing effect, not something this item
+caused or that AC4c leaves ungated.** `benchmark/bench_complex_efficiency.jl`
+on the post-change tree read ComplexF64/ComplexF32 geomean **0.909/0.734**
+(run 1, canary 10.4%) and **0.939/0.786** (run 2, canary 16.6%). An earlier
+draft of this paragraph said this metric "is not gated by any AC4 item" --
+that is wrong: **AC4c's second clause is exactly "`bench_complex_efficiency.jl`
+geomeans not below base by more than the run's canary spread"**, and the
+correct baseline for that clause is the CLEAN, pre-milestone `f7fa490`
+reading the planning contract's own Section 0 already recorded: **0.96
+(ComplexF64) / 0.75 (ComplexF32)** -- not the much older
+**1.829/1.910** complex-element-type-milestone figure, which is a different
+comparison. Read against the right baseline, the post-change numbers
+(0.909-0.939 / 0.734-0.786) are flat within each run's own canary spread:
+**AC4c's second clause passes.** The real, and separate, observation is that
+`f7fa490`'s own 0.96/0.75 was ALREADY roughly half of the 1.829/1.910
+complex-element-type-milestone figure -- i.e. whatever caused that drop
+happened at some point BEFORE this milestone opened, not as a consequence of
+item 1's packing change. The base-tree artefact this comparison would need
+has since been overwritten by a later run in this same benchmark directory
+(the same overwrite problem noted in AC4c above); the planner's Section 0
+reading of it is the only record left. Flagged for the user as a genuine,
+separate, pre-existing question -- a bisection between the complex-element-
+type milestone's close and `f7fa490` (most plausibly implicating the
+per-call-floor work, given the timing) is the natural next step if pursued,
+but it is not this milestone's regression to fix.
+
+### Item 2: F2 K-depth guard (2-A)
+
+**Gate (before implementing, G2).** A 28-point sweep
+(`benchmark/probes/probe_f2_kdepth.jl`, `C[a,b,c,i,j,k] = A[i,j,m,a] *
+B[m,k,b,c]`, `i=j=k=b=c=6`, `m` swept 8..512) found F2 (`_demote_for_run`)
+fires unconditionally at every point regardless of the contracted extent
+`Qk = m`, and crosses over from a win to a loss between `Qk=32` and `Qk=64`
+for Float64 and between `Qk=64` and `Qk=128` for Float32. The "broken-enough"
+fraction guard (tensorcontract-rs's second guard on the same mechanism) gave
+conflicting evidence between dtypes at the tested default fraction (Float64
+supported adopting `0.75`; Float32 contradicted it), so per the planning
+contract's instruction to keep ONE constant (not split by dtype), it was
+adopted inert (`1.0`) rather than guessed. Four points on the "less-broken"
+`a=40`(F64)/`a=80`(F32) rows exceed the sweep's own 15% record-and-ask
+threshold (up to 37.4%) even with the Qk-cutoff guard in place -- recorded as
+a known, accepted residual (U2), not something this item fixes.
+
+**Design.** `_demote_for_run(::Type{T}, kernel, run::Int, Qm::Int, Qk::Int)
+where {T<:Real}` (`src/driver.jl:299`) gained a `Qk` parameter. Two new
+guards run BEFORE the existing `Qm == run || run % mr(kernel) == 0`
+short-circuit and search: return `kernel` unchanged if `Qk >
+F2_DEMOTE_KMAX_F64`/`F2_DEMOTE_KMAX_F32` (by `T`), or if
+`_unbroken_fraction(Qm, run, mr(kernel)) > F2_BROKEN_ENOUGH`. New
+`_unbroken_fraction(Qm, run, mr)` (`:262`) computes the fraction of the
+`cld(Qm, mr)` register slivers that lie entirely inside one run of length
+`run` -- by construction exactly `1.0` iff the existing predicate holds,
+checked over a 5000-point randomized grid
+(`test/test_driver.jl`, `"F2 K-depth guard: _unbroken_fraction
+equivalence"`) rather than a couple of hand-picked cases. Three new
+constants next to `KERNEL_SHAPES_F64`/`KERNEL_SHAPES_F32`
+(`src/driver.jl:442-454`): `F2_DEMOTE_KMAX_F64 = 32`, `F2_DEMOTE_KMAX_F32 =
+64`, `F2_BROKEN_ENOUGH = 1.0` (inert -- a fraction in `[0,1]` can never
+exceed `1.0`, so this guard is dead code today, deliberately left wired in
+rather than simplified away so a future pass can activate it by changing
+one constant). Both `plan_contract` call sites
+(`src/driver.jl:1117`/`1125`) updated to pass `Qk` (already in scope). The
+generic complex no-op fallback (`:314`) got the same signature extension,
+still a no-op. Nothing else touched (`_prefer_swap`, `_leading_unit_run`,
+`_default_kernel`, the kernel-shape menus, `_plan_contract`, the five-loop
+nest, and every kernel file are unmodified).
+
+**New tests** (`test/test_driver.jl`, both additive, no existing testset
+body edited): (1) the `_unbroken_fraction` equivalence property test above;
+(2) `"F2 K-depth guard: deep-K no longer demotes, shallow-K still does"`,
+reusing the sweep's own fixture family for `(Float64, a=8)` and `(Float32,
+a=16)` -- at `Qk = 2*kmax(T)` asserts `plan.kernel === _default_kernel(T,
+Qm, Qn)` (no demotion); at `Qk = 8` the expectation is DERIVED from the
+run-length predicate (`Qm == run || run % mr(default_kernel) == 0`), exactly
+like the pre-existing F2 testset above, rather than hardcoded to "always
+demotes" -- an earlier draft of this test hardcoded that assumption and
+failed under a forced AVX2 profile (`QS_FAKE_ISA=avx2`), where the
+default kernel's narrower `mr` already satisfies the predicate at this
+fixture's run length; fixed before landing, see below. No literal `mr` in
+either new testset.
+
+**Verification.**
+- `Pkg.test()`: baseline (unmodified tree, HEAD `d27286e`) **54431/54431**;
+  post-change **64443/64443** (delta = 5000x2 property-test assertions + 6x2
+  new assertions in the deep/shallow-K testset per dtype, matching exactly).
+- Runic: `runic --check src/driver.jl` and `runic --check test/test_driver.jl`
+  both exit 0 (clean) on the changed lines.
+- Forced-ISA (`test/forced_isa_runner.jl`): `avx2/32/16` -- 62435 passed, 1
+  failed (`test_target.jl` "runs on this host without throwing", the
+  documented-expected residue of running under a forced profile) + 1 errored
+  (`Package Bumper not found`, expected per the runner's own docstring when
+  invoked outside the `Pkg.test()` environment). `unknown/0/0` -- 62431
+  passed, same 1 failed + 1 errored residue, plus 2 broken. **Identified, not
+  left as a flag** (T5 review, N7, which correctly caught that an earlier
+  draft of this paragraph guessed "a standing Aqua ambiguity-check artifact"
+  without checking): both are the pre-existing `skip =
+  (target_profile().nregisters == 0)` condition in
+  `test/test_planar_kernel.jl`/`test/test_onem_kernel.jl`, which fires only
+  under `QS_FAKE_NREG=0` (the `unknown` profile) and not under `avx2`'s
+  `QS_FAKE_NREG=16` -- unrelated to any F2/driver code path touched here.
+  The AVX2 run is also what caught the hardcoded-assumption test bug noted
+  above.
+
+**AC5a (K-sweep re-run vs. pre-change).** Re-ran
+`benchmark/probes/probe_f2_kdepth.jl` on the changed tree; pre-change CSV
+preserved at
+`benchmark/results/ccqlin038.flatironinstitute.org-2026-09-22/f2_kdepth_pre-guard.csv`,
+post-change at `f2_kdepth_post-guard.csv` (canary spread 9.1%, `uptime` load
+average 2.8 -- noted, not clean, per this project's measurement-hygiene
+convention).
+
+Kernel-selection outcome, checked by TYPE at every point (not just timing):
+for `(Float64, a=8)`, `Qk in {8,16,32}` still resolve to the demoted
+`(8,6,4)` kernel and `Qk in {64,128,256,512}` now resolve to the shipped
+default `(16,6,8)` -- the guard fires exactly at the measured crossover. For
+`(Float32, a=16)`, `Qk in {8,16,32,64}` still demote to `(16,6,8)` and `Qk in
+{128,256,512}` now resolve to `(32,6,16)`. Both match the intended cutoff
+(`kmax(F64)=32`, `kmax(F32)=64`) exactly, with `Qk=64` itself (== kmax, not
+`>` kmax) correctly still on the demoting side for Float32.
+
+`auto` vs. `min(forced-default, forced-demoted)` timing ratio on the two
+FULLY-BROKEN rows (`a=8` F64, `a=16` F32) at every measured `Qk`: **0.983 -
+1.037** across all 16 points (median ~1.00), i.e. tracking the pointwise
+optimum to within the run's own 9.1% canary spread -- consistent with exact
+(`1.000`) tracking modulo ordinary measurement noise, not a systematic gap.
+(Per-point ratios: F64 a=8 -- 0.989, 0.991, 0.996, 1.002, 1.003, 1.032, 1.037,
+1.014, 1.015 for `Qk = 8,16,32,64,128,256,512,512,512`; F32 a=16 -- 1.004,
+0.983, 1.001, 0.998, 0.998, 1.026, 1.000 for `Qk = 8,16,32,64,128,256,512`.)
+
+**Residual (U2), confirmed present as expected, not fixed.** The four points
+the planning contract flagged in advance (`a=40`/F64, `a=80`/F32, the
+"less-broken" rows, where demotion still fires for `Qk <= kmax(T)` but is
+not the pointwise-optimal choice) show gaps consistent with the pre-change
+measurement, within noise:
+
+| point | pre-change r | post-change r |
+|---|---|---|
+| F64 a=40 Qk=16 | 1.148 | 1.190 |
+| F64 a=40 Qk=32 | 1.374 | 1.387 |
+| F32 a=80 Qk=32 | 1.107 | 1.139 |
+| F32 a=80 Qk=64 | 1.292 | 1.256 |
+
+Max observed gap post-change: **38.7%** (F64 a=40, Qk=32) -- same order as
+the pre-change 37.4% figure and the same documented mechanism (F2 still
+fires unconditionally for `Qk <= kmax(T)`, with no regularity-based
+tie-break; `F2_BROKEN_ENOUGH` is inert). This is the expected, previously
+recorded residual, not a new or smaller/larger-than-expected finding.
+
+**AC5c (shallow-K/`ccsd_t_1` still demotes, still wins).** Re-ran
+`julia -t 1 --project=benchmark benchmark/bench_ccsd_t_store.jl --dims 8,16
+--dtypes Float32,Float64`. For `ccsd_t_1` at both `dim=8` and `dim=16`, both
+dtypes (`Qk = dim`, well inside both `kmax` values), the M-composite's
+register slivers are reported **fully regular/unit-stride** (e.g. `dim=16`,
+Float32: `M-slivers: regular&&unit-stride = 256  other = 0`; `dim=16`,
+Float64: same, `256/0`) -- i.e. the vectorized store path is fully engaged,
+confirming F2 still demotes exactly as before at these `Qk`. This is also
+guaranteed by construction, not just observed: `Qk in {8,16}` is `<=
+kmax(T)` for both dtypes and `F2_BROKEN_ENOUGH` is inert, so
+`_demote_for_run` takes the identical code path (falls through both new
+guards unconditionally false) it did before this change -- the kernel
+choice on this fixture family is provably unaffected. Absolute timings on
+this run (`arm=1`/QuasiStrided, `ccsd_t_1`): `dim=8` Float32 `1.613e-4 s`,
+`dim=16` Float32 `1.349e-2 s`, `dim=8` Float64 `2.489e-4 s`, `dim=16`
+Float64 `2.106e-2 s` -- not directly comparable to the original F2 pass's
+table (2026-09-21, `1.626e-2`/`2.649e-4 s` for Float32) since three
+unrelated performance passes (F1 inlining, per-call floor, packing
+unification) landed on this tree since then; the "still wins" claim here
+rests on the code-path-identity argument above, not a re-measured speedup
+ratio against a pre-F2 baseline.
+
+**Probe-script artifact found and resolved, not a driver defect -- and
+corrected here against the T5 review (N8), which caught that this paragraph
+misdescribed which column was wrong.** One sweep point (`Float32, a=80,
+Qk=32`) initially looked contradictory when eyeballed mid-investigation:
+timing said the point was on the "less-broken residual" side (`r > 1`,
+demotion not pointwise-optimal), yet a quick read seemed to disagree with
+which kernel actually ran. Checked directly (not just from the CSV) by
+reproducing the exact plan: `auto`'s kernel at that point is
+`SIMDKernel{16,6,Float32,8}`, bit-identical to the recorded `demoted_shape`
+-- the correct, expected pick for a "less-broken" point inside `kmax`. The
+CSV itself is consistent with this: `auto_matches_default_type=false`,
+`auto_matches_demoted_type=true` at that row (the demoted type, correctly).
+**The actually-inconsistent field is the separate, redundant `auto_matches`
+text column**, which reads `default` at that row despite
+`auto_matches_demoted_type=true` -- a labeling bug in that one derived,
+human-readable column of `benchmark/probes/probe_f2_kdepth.jl` (predating
+this item, unrelated to `_demote_for_run`'s own logic); the type-identity
+columns and the timing/ratio data in the same row are unaffected and were
+used as-is above. Not fixed here (probe tooling, out of this item's edit
+scope) -- noted so the `auto_matches` text column specifically isn't
+trusted blindly in the future; the type-identity columns are fine.
+
+**Commit**: `5efa37b` "F2 K-depth guard: gate run-length demotion on the
+contracted extent (item 2)".
+
+### Item 3: one run-length derivation, explicit consumers (conditional on item 2)
+
+**Correction to the original comparison and to the planning contract.** Both
+described this as "three independent re-derivations of run length in C" and
+proposed consolidating them behind a new shared primitive. Neither is
+accurate: there was already exactly ONE derivation, `_leading_unit_run`
+(`src/driver.jl`) -- `_prefer_swap` called it twice (once per composite) and
+the two `_demote_for_run` call sites in `plan_contract` called it a third
+time, for whichever orientation was actually chosen. The only real
+redundancy was that `plan_contract` recomputed the same two values
+(`_leading_unit_run(morder,...)`/`_leading_unit_run(norder,...)`) a second
+time at the demotion call sites, having already computed them once inside
+`_prefer_swap`'s old body. The planner's proposed relation to `affine_ramp`
+(the per-call-floor milestone's closed-form block primitive) was ALSO
+checked and found not to hold as literally stated -- see below.
+
+**Design shipped.** `plan_contract` now computes `run_m = _leading_unit_run(
+morder, indC, C)` and `run_n = _leading_unit_run(norder, indC, C)` once,
+immediately after `morder`/`norder` are built, and both the swap decision and
+both `_demote_for_run` call sites consume these same two values -- one
+derivation, three consumers, all reading the same computed value rather than
+recomputing it. `_prefer_swap` gained a genuine two-method split: a core
+`_prefer_swap(run_m::Int, run_n::Int, mr_asis::Int, mr_swapped::Int=mr_asis)`
+holding the actual logic, and the pre-existing label-list signature
+(`morder::Vector{Int}, norder::Vector{Int}, indC, C, mr_asis, mr_swapped`)
+kept as a one-line wrapper that derives the same two run lengths and calls
+the core -- so the existing external test coverage of the label-list form
+(`test/test_driver.jl`, `"label order: _leading_unit_run / _prefer_swap"`)
+needed no changes, and a new testset
+(`"label order: the two _prefer_swap methods agree"`) cross-checks the two
+methods directly on four label/mr combinations rather than just trusting the
+wrapper reads correctly. No decision semantics changed anywhere -- this is
+pure dead-computation removal, not a behavior change.
+
+**The `affine_ramp` relation, checked and corrected.** The contract proposed
+testing `(_leading_unit_run(morder, indC, C) == Qm) == (affine_ramp(mgroup)[1]
+&& affine_ramp(mgroup)[2][2] == 1)` against `mgroup` (the TWO-map `AxisGroup`
+`_build_pair_group` returns, pairing the composite with operand A). This is
+WRONG in general: `_leading_unit_run`'s quantity depends only on C's own
+per-label strides/extents, but `mgroup`'s `affine_ramp` is a condition on
+BOTH its maps (A's structure too) -- strictly stronger, and false on
+fixtures where C's map ramps cleanly but A's (arbitrary, e.g. permuted or
+scattered) does not. Testing the literal proposal would have produced a
+test that fails whenever A doesn't happen to ramp, for reasons having
+nothing to do with `_leading_unit_run`. The corrected, provably-equivalent
+primitive is a SINGLE-map (`P=1`) `AxisGroup` built from C's own map alone
+(`src/driver.jl`'s `_build_pair_group`-style construction, but with one map
+instead of two): `(run == Qm) == (isramp && steps[1] == 1)` holds exactly,
+verified over 2000 randomized `(D, lengths, strides, order)` draws with zero
+mismatches (`test/test_driver.jl`, `"label order: _leading_unit_run's
+full-coverage condition is a single-map affine_ramp on C's own strides"`).
+Two edge cases needed excluding from the random draw, both reproduced as
+real (not hypothetical) mismatches before being excluded: an empty `order`
+(rank-0) and an `order` consisting entirely of singleton axes (`Qm == 1`) --
+`affine_ramp`'s own documented convention reports `steps = (0,)`, not
+`(1,)`, for a vacuous ramp, while `_leading_unit_run` returns `1` (matching
+`Qm == 1`) unconditionally in both cases; this project's own existing
+convention (see `_lo_run`'s separate `Int[]`/zero-length-axis assertions,
+above) already treats these as separate cases rather than folding them into
+a general property, and this test follows that precedent. This relation is
+not wired into any shipped code path -- `affine_ramp`/`normalize_group`
+remain deliberately NOT applied to `plan_contract`'s composites (per-call
+floor's own "Deferred" note) -- it is recorded here as a correction to the
+planning record, not a new mechanism.
+
+**Verification.** Full suite **66447/66447** (baseline before this item
+64443 + 2004 new assertions: the 2000-point relation property test + 4
+cross-check assertions in the two-methods-agree testset). Runic clean
+(`src/driver.jl`, `test/test_driver.jl`). Both forced-ISA profiles show
+only their by-now-documented residues (`avx2`: 1 failed + 1 errored;
+`unknown`: same two + 2 broken from the pre-existing `nregisters == 0`
+`skip=` condition, unrelated to this item).
+
+**AC6 (non-regression on the per-call-floor fixtures).** `plan_contract`
+timing/allocation, reused workspace, on `plain_64`, `smallMN_16x256x16`,
+`ao2mo_2_dim16`-shaped (a rank-4 analog at extent 16), and `ccsd_t_1`-shaped
+(dim 4) fixtures, before (`96c976e`, archived) vs. after (this item):
+
+| fixture | alloc before | alloc after | time before (ns) | time after (ns) |
+|---|---|---|---|---|
+| `plain_64` | 1664 B | 1664 B | 910.8 | 903.5 |
+| `smallMN_16x256x16` | 1664 B | 1664 B | 868.4 | 1393.0 (single-shot) |
+| `ao2mo_2_dim16`-ish | 2000 B | 2000 B | 3974.9 | 4039.9 |
+| `ccsd_t_1_dim4` | 2384 B | 2384 B | 1168.3 | 1150.0 |
+
+Allocation is byte-identical on all four (expected -- this item removes a
+redundant computation, it does not change what's allocated). The single-shot
+`smallMN` timing looked like a ~60% regression; re-measured as a median of 9
+rounds of 3000 calls each, alternating trees, and it converged to the same
+~815-950 ns range on BOTH trees across all 4 rounds -- a warm-up/GC-pause
+artifact of that one single-shot sample, not a real effect. No regression
+found; consistent with the change being pure dead-computation removal.
+
+**Commit**: `65ae65a` "Item 3: one run-length derivation, explicit consumers,
+no decision change".
+
 ## ComplexF64 `:tccg` slowdown: root-caused to the planar store path, no fix shipped (2026-09-22)
 
 **Trigger.** Job 7087420's evidence-gate run (`benchmark/results/worker6160-2026-09-22/bench_to_suite.csv`) showed QuasiStrided's median ComplexF64/Float64 GFLOP/s ratio on `:tccg` sitting at **0.29** across all 48 (dtype, case) pairs, against StridedBLAS's **0.68** on the identical cases. A truly efficient complex kernel doing ~4x the real arithmetic of its real counterpart (complex MAC = 4 real multiplies + rounding, against `flops(spec)`'s dtype-blind nominal count) would land near 0.25 by construction; QuasiStrided sits right on that naive floor while StridedBLAS's ZGEMM extracts real efficiency beyond it. That gap, not "complex is inherently slower," is what needed explaining.
@@ -5855,3 +6306,5 @@ A ~2 point shift, within noise for a single profiling run each side -- effective
 
   1. **Extend `_demote_for_run` to complex** (higher expected value for `:tccg`-like cases such as `ccsd_t_1_dim16`): per the landmine now recorded at its definition site (`src/driver.jl`), this is not a simple `T <: Real` bound relaxation -- the function's demotion search reads the single-argument `kernel_shapes(T)`, whose complex fallback is `_legacy_shape(T)` at register pressure 30 (over AVX2's 16 ymm register budget). A correct extension must route through the two-argument `kernel_shapes(T, method::ComplexMethod)`/`_complex_kernel_from_shape` construction path instead. Needs its own before/after measurement on `ccsd_t_1_dim16`-shaped cases once built.
   2. **Extend `_prefer_swap` to complex**: now that `PlanarKernel` has a vector store to potentially win with a swap, the old "nothing to win" rationale (recorded stale at `_prefer_swap`'s definition and call site, `src/driver.jl`) no longer holds by construction, but whether the swap is actually a net win for complex on real workloads is unmeasured. Needs its own before/after measurement, separate from (1) -- the two guards interact (a swap changes which orientation's `mr`/run-length `_demote_for_run` would need to fix) and should not be bundled into one unvalidated change.
+
+**Merge note (2026-09-23, tensorcontract-rs-comparison / complex-fast-paths reconciliation).** These two follow-ups and the "tensorcontract-rs comparison" milestone above landed independently on separate branches, both touching `_demote_for_run`/`_prefer_swap`. No conflict in substance: this branch's `_demote_for_run` extension (item 2, the `Qk` cutoff) stayed real-dtype-only, exactly per the landmine warning in follow-up (1) above, and item 3's run-length dedup is orthogonal to both follow-ups (it changes how `run_m`/`run_n` are computed and threaded, not the real-vs-complex scope of either guard). Both follow-ups above remain open and unmeasured after this merge.

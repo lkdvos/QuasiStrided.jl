@@ -228,14 +228,19 @@ function _leading_unit_run(
     return run
 end
 
-# Whether to swap the operand roles (B feeds M, A feeds N). The vectorized
-# store (`_vector_store_eligible`) needs a register sliver -- `mr(kernel)`
-# consecutive M coordinates -- to be unit-stride in C, so a leading run shorter
-# than `mr` buys nothing (measured: swapping onto a 16-wide run under a 32-wide
-# kernel is a ~1.2x REGRESSION). Swap only when the as-is orientation misses
-# that bar and the swapped one clears it. The two `mr` arguments are the widths
-# of the kernel each orientation would actually run (they differ only when the
-# default kernel's small-Qm demotion applies to one side).
+# Whether to swap the operand roles (B feeds M, A feeds N), given the two
+# composites' OWN leading unit-stride run lengths (`_leading_unit_run` above
+# -- the one and only place that quantity is computed; `plan_contract` derives
+# `run_m`/`run_n` once and reuses them here and at both `_demote_for_run` call
+# sites, rather than recomputing per call site as an earlier revision did).
+# The vectorized store (`_vector_store_eligible`) needs a register sliver --
+# `mr(kernel)` consecutive M coordinates -- to be unit-stride in C, so a
+# leading run shorter than `mr` buys nothing (measured: swapping onto a
+# 16-wide run under a 32-wide kernel is a ~1.2x REGRESSION). Swap only when the
+# as-is orientation misses that bar and the swapped one clears it. The two `mr`
+# arguments are the widths of the kernel each orientation would actually run
+# (they differ only when the default kernel's small-Qm demotion applies to one
+# side).
 #
 # Callers must additionally restrict this to real dtypes -- measured directly
 # (`ccsd_t_3`, dim=16, both complex dtypes): the swap is a ~2-4% regression
@@ -251,12 +256,45 @@ end
 # first and measure it, with any extension here to be a separate later change
 # with its own before/after measurement. See the `T <: Real` guard at the
 # call site.
+function _prefer_swap(run_m::Int, run_n::Int, mr_asis::Int, mr_swapped::Int = mr_asis)
+    return run_m < mr_asis && run_n >= mr_swapped
+end
+
+# Label-list form, kept for its existing external test coverage and for any
+# caller that has `morder`/`norder` but not their run lengths in hand; derives
+# the same two run lengths `plan_contract` itself now derives once and passes
+# to the method above directly.
 function _prefer_swap(
         morder::Vector{Int}, norder::Vector{Int}, indC::NTuple{NC, Int}, C::StridedView,
         mr_asis::Int, mr_swapped::Int = mr_asis
     ) where {NC}
-    return _leading_unit_run(morder, indC, C) < mr_asis &&
-        _leading_unit_run(norder, indC, C) >= mr_swapped
+    return _prefer_swap(
+        _leading_unit_run(morder, indC, C), _leading_unit_run(norder, indC, C),
+        mr_asis, mr_swapped
+    )
+end
+
+# Fraction of the `cld(Qm, mr)` register slivers `[s*mr, min((s+1)*mr,
+# Qm))` (`s` in `0:cld(Qm,mr)-1`) that lie ENTIRELY inside one run of length
+# `run` -- i.e. `lo ÷ run == hi ÷ run`, `hi` the sliver's last valid index.
+# By construction this is exactly `1.0` iff `Qm == run || run % mr == 0` (the
+# predicate `_demote_for_run` has always used) -- checked over a randomized
+# grid in `test/test_driver.jl`, not merely asserted. Feeds the
+# `F2_BROKEN_ENOUGH` guard below. Precondition (T5 review, N4): `1 <= run <=
+# Qm`, which every caller satisfies (`_leading_unit_run` never returns more
+# than `Qm`, and `_demote_for_run`'s callers never pass `run == 0`); NOT
+# checked here, so a hypothetical future caller passing `run > Qm` would get
+# a wrong (too high) fraction silently rather than an error.
+function _unbroken_fraction(Qm::Int, run::Int, mr::Int)::Float64
+    nslivers = cld(Qm, mr)
+    nslivers == 0 && return 1.0
+    whole = 0
+    for s in 0:(nslivers - 1)
+        lo = s * mr
+        hi = min((s + 1) * mr, Qm) - 1
+        whole += lo ÷ run == hi ÷ run
+    end
+    return whole / nslivers
 end
 
 # Run-length-aware kernel-shape demotion (docs/decisions.md, "F2"). Applied
@@ -291,10 +329,36 @@ end
 # a different construction path entirely (see `_default_kernel(::Type{T})
 # where {T<:Complex}` above). A correct fix must route the demotion search
 # through `kernel_shapes(T, method)`/`_complex_kernel_from_shape`, not just
-# relax this type bound.
-function _demote_for_run(::Type{T}, kernel, run::Int, Qm::Int) where {T <: Real}
+# relax this type bound. **Also applies to the K-depth guard immediately
+# below**: it too is real-dtype-only today, for the same reason.
+#
+# K-depth guard (`Qk`, the contracted extent): a 28-point sweep
+# (2026-09-22, docs/decisions.md, "tensorcontract-rs comparison") found F2
+# fires unconditionally regardless of `Qk` and regresses once `Qk` grows
+# past `F2_DEMOTE_KMAX_F64`/`F2_DEMOTE_KMAX_F32` -- the demotion's win comes
+# from fixing the store path, but the packing/microkernel cost it also
+# perturbs grows with `Qk` and eventually dominates. Declining to demote
+# above that cutoff (or, once `F2_BROKEN_ENOUGH` moves below `1.0` and stops
+# being inert) keeps the original shallow-K win (`ccsd_t_1`, `Qk=16`) while
+# dropping the deep-K loss.
+#
+# Order matters for cost, not just correctness (T5 review, S1): the cheap
+# `Qm == run` / `run % mr == 0` short-circuits run BEFORE the O(Qm/mr)
+# `_unbroken_fraction` loop, and that loop is additionally gated on
+# `F2_BROKEN_ENOUGH < 1.0` so it (and the fraction it would compute) is
+# unreachable dead code while the guard is inert -- not merely "always
+# false once reached". Equivalent to evaluating it first: whenever either
+# short-circuit holds, `_unbroken_fraction` is provably `1.0` there too (by
+# its own definition), so `> F2_BROKEN_ENOUGH` (`>= 1.0`) was always going
+# to be false regardless of evaluation order; reordering only removes a
+# wasted O(Qm/mr) scan on every real auto-selected plan with `Qk <= kmax`,
+# it changes no decision.
+function _demote_for_run(::Type{T}, kernel, run::Int, Qm::Int, Qk::Int) where {T <: Real}
+    kmax = T === Float64 ? F2_DEMOTE_KMAX_F64 : F2_DEMOTE_KMAX_F32
+    Qk > kmax && return kernel
     Qm == run && return kernel
     run % mr(kernel) == 0 && return kernel
+    F2_BROKEN_ENOUGH < 1.0 && _unbroken_fraction(Qm, run, mr(kernel)) > F2_BROKEN_ENOUGH && return kernel
     best = nothing
     for shape in kernel_shapes(T)
         m = shape[1]
@@ -304,7 +368,7 @@ function _demote_for_run(::Type{T}, kernel, run::Int, Qm::Int) where {T <: Real}
     end
     return best === nothing ? kernel : _kernel_from_shape(best, T)
 end
-_demote_for_run(::Type{T}, kernel, run::Int, Qm::Int) where {T} = kernel
+_demote_for_run(::Type{T}, kernel, run::Int, Qm::Int, Qk::Int) where {T} = kernel
 
 # Engine-wide default kernel: shape from ONE detected capability, the vector
 # register width -- `W = vector_bytes/sizeof(T)`, `MR = 2W`, `NR = NR_DEFAULT`,
@@ -426,6 +490,25 @@ end
 # Closed set, so compiled SIMDKernel (and driver) specializations are bounded.
 const KERNEL_SHAPES_F64 = ((8, 6, 4), (16, 6, 8))
 const KERNEL_SHAPES_F32 = ((8, 6, 8), (32, 6, 16), (16, 6, 8))
+
+# F2 (run-length demotion, `_demote_for_run` above) regresses large-K cases;
+# measured via a 28-point sweep, 2026-09-22 (docs/decisions.md,
+# "tensorcontract-rs comparison"): demotion crosses over from a win to a loss
+# between Qk=32 and Qk=64 for Float64 (kmax=32) and between Qk=64 and Qk=128
+# for Float32 (kmax=64).
+const F2_DEMOTE_KMAX_F64 = 32
+const F2_DEMOTE_KMAX_F32 = 64
+# The "broken-enough" fraction guard tested in the same sweep gave
+# conflicting evidence between dtypes (Float64 supported adopting 0.75;
+# Float32 contradicted it, with demotion winning at small Qk even at a
+# less-broken 0.8 default fraction) -- kept as ONE constant per the
+# planning contract's instruction not to split by dtype, set inert (1.0,
+# i.e. never blocks demotion on its own) pending better evidence. This
+# means the Qk cutoff above is the only active guard; known residual: on
+# less-broken shapes, demotion still fires (and measurably loses, up to
+# 37.4% over the pointwise-optimal choice at some Qk) between Qk=1 and
+# kmax(T) -- recorded, not fixed, see docs/decisions.md.
+const F2_BROKEN_ENOUGH = 1.0
 
 # Complex menus, seeded from the reference's measured AVX-512 shapes, with `MR`
 # in LOGICAL complex rows and `W` in real lanes; at most three each, so the
@@ -1056,6 +1139,20 @@ function plan_contract(
     morder = _order_free_labels(mlabels, indC, C)
     norder = _order_free_labels(nlabels, indC, C)
 
+    # Each composite's own leading unit-stride run length, derived ONCE here
+    # (not per call site): both the swap decision and the F2 demotion below
+    # consume these same two values, keyed on the composite (M or N), not on
+    # which orientation ends up feeding the driver's own M role. Computed
+    # only for real `T` (T5 review, S4): the swap decision below is already
+    # `T <: Real`-gated, and `_demote_for_run`'s generic complex method
+    # ignores `run`/`Qm` entirely, so a complex plan pays for neither
+    # `_leading_unit_run` call -- unlike before item 3, when `_prefer_swap`'s
+    # short-circuit already skipped both for complex; the placeholder `0`
+    # keeps this genuinely a no-added-cost refactor for complex, not merely
+    # "unused but computed".
+    run_m = T <: Real ? _leading_unit_run(morder, indC, C) : 0
+    run_n = T <: Real ? _leading_unit_run(norder, indC, C) : 0
+
     mgroup = _build_pair_group(morder, indA, A, indC, C)  # maps: (A, C)
     ngroup = _build_pair_group(norder, indB, B, indC, C)  # maps: (B, C)
     kgroup = _build_pair_group(klabels, indA, A, indB, B)  # maps: (A, B)
@@ -1079,8 +1176,11 @@ function plan_contract(
     # `T <: Real` guard is a deliberately deferred, unmeasured follow-up
     # (docs/proposals/complex-fast-paths.md Decision 3), not a settled case of
     # nothing to gain. Real kernels (`SIMDKernel` and, for this run-length
-    # rule, `ScalarKernel` too) keep the swap.
-    if T <: Real && _prefer_swap(morder, norder, indC, C, mr(kernel_asis), mr(kernel_swapped))
+    # rule, `ScalarKernel` too) keep the swap. Uses the pre-computed
+    # `run_m`/`run_n` (the core `_prefer_swap` method) rather than the
+    # label-list wrapper, per the tensorcontract-rs-comparison milestone's
+    # run-length dedup -- see `_prefer_swap`'s definition above.
+    if T <: Real && _prefer_swap(run_m, run_n, mr(kernel_asis), mr(kernel_swapped))
         # B takes the M role and A the N role. Everything operand-bound moves
         # together: the groups (each already carries its own C map), the K
         # group's two maps, the storage/base pair `_plan_contract` reads off
@@ -1092,7 +1192,7 @@ function plan_contract(
         # kernel, keyed on the CHOSEN (post-swap) M orientation, i.e. N's own
         # run against the kernel it would actually run.
         kernel_final = kernel === nothing ?
-            _demote_for_run(T, kernel_swapped, _leading_unit_run(norder, indC, C), Qn) :
+            _demote_for_run(T, kernel_swapped, run_n, Qn, Qk) :
             kernel_swapped
         return _plan_contract(
             C, B, A, indC, ngroup, mgroup, kgroup_swapped, Qn, Qm, Qk,
@@ -1100,7 +1200,7 @@ function plan_contract(
         )
     end
     kernel_final = kernel === nothing ?
-        _demote_for_run(T, kernel_asis, _leading_unit_run(morder, indC, C), Qm) :
+        _demote_for_run(T, kernel_asis, run_m, Qm, Qk) :
         kernel_asis
     return _plan_contract(
         C, A, B, indC, mgroup, ngroup, kgroup, Qm, Qn, Qk,

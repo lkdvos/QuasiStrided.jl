@@ -109,8 +109,14 @@ end
 # Real packing
 # ----------------------------------------------------------------------------
 
-# Shared inner loop for pack_a!/pack_b!; `load`/`packed_offset` close over the
-# operand-specific index mapping. `kc == 0` is handled by the caller.
+# Shared inner loop for pack_a!/pack_b!, real and complex alike; `load`/
+# `plane_offset` close over the operand-specific index mapping and `format`
+# dispatches the per-lane store through `_pack_emit!`/`_pack_emit_zero!`
+# (defined below, alongside the complex formats). This used to be two
+# structurally separate loops -- see the retired rationale where the complex
+# one lived, right below `_pack_emit_zero!` -- unified as part of the
+# tensorcontract-rs comparison milestone so the complex path picks up the same
+# full/tail split the real path already had.
 #
 # `PD` (the physical dim: MR or NR) is a compile-time constant. A full sliver
 # (`valid == PD`) gets a constant-trip-count inner loop that LLVM fully
@@ -122,27 +128,52 @@ end
 # 1.13 against the driver's argument types). The per-K-step store order
 # (0, 1, ..., PD-1) and the padding contract (padding lanes never read
 # `source` and never call `transform`) are unchanged.
+#
+# `transform` applies to the loaded (complex, for a complex format) element
+# BEFORE `_pack_emit!` splits it into planes; padding lanes go through
+# `_pack_emit_zero!` instead, which writes literal zeros without calling
+# `transform` (a `-0.0` hazard for `OneEFormat`'s `-im` plane otherwise).
 @inline function _pack_panel!(
-        packed::V, ::Type{T}, ::Val{PD}, kc::Int, valid::Int,
-        transform::F, load::L, packed_offset::P
-    ) where {V, T, PD, F, L, P}
+        packed::V, ::Type{T}, format::FMT, ::Val{PD}, kc::Int, valid::Int,
+        transform::F, load::L, plane_offset::P
+    ) where {V, T, FMT <: PackFormat, PD, F, L, P}
     if valid == PD
         @inbounds for p in 0:(kc - 1)
-            for i in 0:(PD - 1)
-                panel_store!(packed, packed_offset(i, p), convert(T, transform(load(i, p)))::T)
+            for t in 0:(PD - 1)
+                z = convert(T, transform(load(t, p)))::T
+                _pack_emit!(packed, format, plane_offset, t, p, z)
             end
         end
     else
         @inbounds for p in 0:(kc - 1)
-            for i in 0:(valid - 1)
-                panel_store!(packed, packed_offset(i, p), convert(T, transform(load(i, p)))::T)
+            for t in 0:(valid - 1)
+                z = convert(T, transform(load(t, p)))::T
+                _pack_emit!(packed, format, plane_offset, t, p, z)
             end
-            for i in valid:(PD - 1)
-                panel_store!(packed, packed_offset(i, p), zero(T))
+            for t in valid:(PD - 1)
+                _pack_emit_zero!(packed, format, plane_offset, t, p, real(T))
             end
         end
     end
     return packed
+end
+
+# RealFormat ("plain"): one real per element, no plane split. `plane_offset`
+# is still called with a leading `plane` argument (always `0` here) so the
+# real and complex call sites share the same closure shape; `packed_a_offset`/
+# `packed_b_offset` ignore it.
+@inline function _pack_emit!(
+        packed::V, ::RealFormat, plane_offset::P, t::Int, p::Int, z::T
+    ) where {V, P, T}
+    panel_store!(packed, plane_offset(0, t, p), z)
+    return nothing
+end
+
+@inline function _pack_emit_zero!(
+        packed::V, ::RealFormat, plane_offset::P, t::Int, p::Int, ::Type{R}
+    ) where {V, P, R}
+    panel_store!(packed, plane_offset(0, t, p), zero(R))
+    return nothing
 end
 
 # `transform` is `identity` or `conj` (src/driver.jl, `plan_contract`). On a
@@ -261,8 +292,8 @@ end
     end
 
     load = (i, p) -> tile_load(source, i, p)
-    packed_offset = (i, p) -> packed_a_offset(kernel, i, p)
-    _pack_panel!(packed, T2, Val(MR), kc, m, transform, load, packed_offset)
+    plane_offset = (plane, i, p) -> packed_a_offset(kernel, i, p)
+    _pack_panel!(packed, T2, RealFormat(), Val(MR), kc, m, transform, load, plane_offset)
     return packed
 end
 
@@ -308,21 +339,28 @@ end
     kc == 0 && return packed
 
     load = (j, p) -> tile_load(source, p, j)  # source.rows=K, source.cols=N
-    packed_offset = (j, p) -> packed_b_offset(kernel, j, p)
-    _pack_panel!(packed, T2, Val(NR), kc, n, transform, load, packed_offset)
+    plane_offset = (plane, j, p) -> packed_b_offset(kernel, j, p)
+    _pack_panel!(packed, T2, RealFormat(), Val(NR), kc, n, transform, load, plane_offset)
     return packed
 end
 
 # ===========================================================================
 # Complex packing
 #
-# `_pack_panel_complex!` below is a parallel loop rather than a generalisation
-# of `_pack_panel!`, so that the complex milestone left the real path
-# byte-identical as a `git diff` fact rather than an argument
-# (docs/decisions.md, "Complex element-type milestone"); the later real-path
-# restructuring (full/tail split, contiguous A fast path) likewise left THIS
-# loop untouched. Only the validation preamble is shared, which cannot change
-# either loop's generated code.
+# Real and complex packing used to be two structurally separate loops here
+# (`_pack_panel!` for real, `_pack_panel_complex!` for complex), deliberately
+# kept apart so the complex milestone left the real path byte-identical as a
+# `git diff` fact rather than an argument (docs/decisions.md, "Complex
+# element-type milestone"), and so the later real-path restructuring
+# (full/tail split, contiguous A fast path) likewise left the complex loop
+# untouched. That rationale is retired on purpose as of the
+# tensorcontract-rs comparison milestone: the complex loop's per-element `t <
+# valid ? load : zero` conditional load was confirmed to compile to a genuine
+# branch (not a `select`), the same defect the real path's full/tail split
+# had already fixed once, so the two loops are now one -- `_pack_panel!`
+# above, format-dispatched through `_pack_emit!`/`_pack_emit_zero!` below --
+# and the complex path picks up the same fix rather than needing it fixed
+# twice.
 #
 # Everything below writes `real(T)` into the packed buffer. The `transform`
 # contract, frozen format-independently in that section:
@@ -402,36 +440,19 @@ end
     return nothing
 end
 
-# Complex counterpart of `_pack_panel!`. `T` is the *storage* (complex) type;
-# the buffer holds `real(T)`. `kc == 0` is handled by the caller.
-@inline function _pack_panel_complex!(
-        packed::V, ::Type{T}, format::FMT, physical_dim::Int, kc::Int, valid::Int,
-        transform::F, load::L, plane_offset::P
-    ) where {V, T, FMT, F, L, P}
-    @inbounds for p in 0:(kc - 1)
-        for t in 0:(physical_dim - 1)
-            if t < valid
-                # transform applies to the complex element, THEN it is split.
-                z = convert(T, transform(load(t, p)))::T
-                _pack_emit!(packed, format, plane_offset, t, p, z)
-            else
-                _pack_emit_zero!(packed, format, plane_offset, t, p, real(T))
-            end
-        end
-    end
-    return packed
-end
-
 # ---------------------------------------------------------------------------
 # Complex packing fast path (deinterleave-and-copy)
 #
 # Phase 1 of docs/proposals/complex-fast-paths.md, Sections 4.3 (PlanarFormat)
 # and 4.4 (OneEFormat's A panel). It is the complex counterpart of
 # `_pack_a_contiguous!` above and nothing more: a leaf-level alternative inside
-# `_pack_a!`/`_pack_b!` for the ONE sliver shape it can serve, with the scalar
-# `_pack_panel_complex!` loop above left byte-identical as the fallback for
-# everything else. No format, offset formula or transform contract changes; the
-# fast path is required to produce the same bytes the scalar loop would have.
+# `_pack_a!`/`_pack_b!` for the ONE sliver shape it can serve, with the shared
+# `_pack_panel!` loop above (reconciled from this section's original
+# `_pack_panel_complex!` fallback during the tensorcontract-rs-comparison /
+# complex-fast-paths merge -- both landed independently around the same
+# complex packing path and both are kept) as the fallback for everything
+# else. No format, offset formula or transform contract changes; the fast
+# path is required to produce the same bytes the scalar loop would have.
 #
 # Why this is the easy half of the complex round trip (proposal Section 4.3):
 # packing applies no `alpha`/`beta`, never reads its destination, and its only
@@ -710,7 +731,7 @@ end
 
     load = (i, p) -> tile_load(source, i, p)
     plane_offset = (plane, i, p) -> packed_a_plane_offset(kernel, plane, i, p)
-    _pack_panel_complex!(packed, T2, FA(), MR, kc, m, transform, load, plane_offset)
+    _pack_panel!(packed, T2, FA(), Val(MR), kc, m, transform, load, plane_offset)
     return packed
 end
 
@@ -768,6 +789,6 @@ end
 
     load = (j, p) -> tile_load(source, p, j)  # source.rows=K, source.cols=N
     plane_offset = (plane, j, p) -> packed_b_plane_offset(kernel, plane, j, p)
-    _pack_panel_complex!(packed, T2, FB(), NR, kc, n, transform, load, plane_offset)
+    _pack_panel!(packed, T2, FB(), Val(NR), kc, n, transform, load, plane_offset)
     return packed
 end

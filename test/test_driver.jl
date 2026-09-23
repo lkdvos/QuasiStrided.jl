@@ -1137,6 +1137,78 @@ end
     @test !_lo_swap([b, i, j], Int[], indC, C6, 1)
 end
 
+@testset "label order: the two _prefer_swap methods agree" begin
+    # `_prefer_swap(run_m, run_n, mr...)` is now the core; the label-list form
+    # is a one-line wrapper kept for its own external test coverage above.
+    # Cross-check them directly rather than just trusting the wrapper reads
+    # correctly.
+    d = 4
+    C6 = StridedView(zeros(Float64, d, d, d, d, d, d))
+    indC = (1, 2, 3, 4, 5, 6)
+    a, b, c, i, j, k = indC
+    for (morder, norder, mr_asis, mr_swapped) in (
+            ([b, i, j], [a, c, k], 4, 4), ([b, i, j], [a, c, k], 8, 8),
+            ([c, i, j], [a, b, k], 8, 16), ([a, i, j], [b, c, k], 4, 8),
+        )
+        run_m = _lo_run(morder, indC, C6)
+        run_n = _lo_run(norder, indC, C6)
+        @test _lo_swap(run_m, run_n, mr_asis, mr_swapped) ==
+            _lo_swap(morder, norder, indC, C6, mr_asis, mr_swapped)
+    end
+end
+
+@testset "label order: _leading_unit_run's full-coverage condition is a single-map affine_ramp on C's own strides" begin
+    # `_leading_unit_run(order, indC, C) == Qm` (every label in `order`
+    # consumed without breaking, i.e. the WHOLE composite is one leading
+    # unit-stride run) depends only on C's OWN per-label strides/extents --
+    # not on any paired operand. The two-map `AxisGroup`s `_build_pair_group`
+    # returns (`mgroup`/`ngroup`) pair a composite with an OPERAND (A or B),
+    # so their `affine_ramp` is a STRICTLY STRONGER condition (it also
+    # requires the operand's map to ramp) -- not equivalent to this quantity,
+    # and testing against `mgroup` directly would be a wrong (occasionally
+    # failing) test. The matching primitive is a single-map (`P=1`)
+    # `AxisGroup` built from C's map alone, checked here over a randomized
+    # grid. Two edge cases are excluded, both by this project's own existing
+    # convention of covering them as separate, explicit assertions rather
+    # than folding them into a general equivalence: zero-length axes (per
+    # `_lo_run`'s own coverage above, `affine_ramp`'s "vacuously a ramp"
+    # convention for an empty DOMAIN), and an empty `order` list, i.e. rank-0
+    # (`affine_ramp` conventionally reports `steps = (0,)`, not `(1,)`, for a
+    # rank-0 group -- `_lo_run(Int[], ...)` returns `1` unconditionally, so
+    # `run == Qm == 1` trivially while `steps[1] == 1` is, by that same
+    # convention, false; a real, reproduced mismatch this test caught before
+    # this exclusion was added). The same ambiguity recurs whenever EVERY
+    # label drawn into `order` happens to be a singleton axis (`Qm == 1`
+    # with no non-singleton dim ever inspected) -- both algorithms skip every
+    # entry and never leave their respective "nothing happened yet" state, so
+    # `steps[1] == 0` again while `run == Qm == 1` -- excluded by requiring at
+    # least one non-singleton dim in the draw (`Qm > 1`), also reproduced and
+    # confirmed before adding this exclusion.
+    rng = Random.MersenneTwister(0x01E3A3E1)
+    ntested = 0
+    while ntested < 2000
+        D = rand(rng, 1:5)
+        indCr = ntuple(identity, D)
+        lens = ntuple(_ -> rand(rng, (1, 2, 3, 5)), D)
+        strides = ntuple(_ -> rand(rng, (-3, -1, 1, 2, 3, 7)), D)
+        Cr = _lo_view(lens, strides)
+        nlabels = rand(rng, 1:D)
+        order = Random.shuffle(rng, collect(1:D))[1:nlabels]
+        Qm = prod(lens[l] for l in order)
+        Qm == 1 && continue
+        ntested += 1
+
+        run = QuasiStrided._leading_unit_run(order, indCr, Cr)
+
+        clens = ntuple(d -> lens[order[d]], nlabels)
+        cstrides = ntuple(d -> strides[order[d]], nlabels)
+        cgroup = QuasiStrided.AxisGroup(clens, (cstrides,))
+        (isramp, steps) = QuasiStrided.affine_ramp(cgroup)
+
+        @test (run == Qm) == (isramp && steps[1] == 1)
+    end
+end
+
 @testset "label order: pinning test on the ccsd_t shapes (composite order and swap)" begin
     d = 5
     for (name, IA, IB) in _LO_CASES
@@ -1297,6 +1369,105 @@ end
         Cref = Amat * Bmat
         execute!(plan, 1.0, 0.0)
         @test Cmat ≈ Cref
+    end
+end
+
+@testset "F2 K-depth guard: _unbroken_fraction equivalence" begin
+    # `_unbroken_fraction(Qm, run, mr) == 1.0` must hold EXACTLY when the
+    # predicate `_demote_for_run` has always used (`Qm == run || run % mr ==
+    # 0`) holds -- checked over a randomized grid, not just hand-picked
+    # cases, per the task brief.
+    rng = Random.MersenneTwister(0xF2_F2A_C7)
+    for _ in 1:5000
+        Qm = rand(rng, 1:200)
+        run = rand(rng, 1:Qm)
+        mr_ = rand(rng, (4, 6, 8, 16, 32))
+        frac = QuasiStrided._unbroken_fraction(Qm, run, mr_)
+        predicate = Qm == run || run % mr_ == 0
+        @test (frac == 1.0) == predicate
+        @test 0.0 <= frac <= 1.0
+    end
+end
+
+@testset "F2 K-depth guard: deep-K no longer demotes, shallow-K still does" begin
+    # Same fixture family as `benchmark/probes/probe_f2_kdepth.jl`:
+    # C[a,b,c,i,j,k] = A[i,j,m,a] * B[m,k,b,c], i=j=k=b=c=6, a fixed, m swept.
+    # Qm = a*36, Qn = 216 (both independent of m); Qk = m.
+    IA = (:i, :j, :m, :a)
+    IB = (:m, :k, :b, :c)
+    IC = (:a, :b, :c, :i, :j, :k)
+    (indA, indB, indC), _ = _lo_labels(IA, IB)
+
+    function _f2_fixture(::Type{T}, a::Int, m::Int) where {T}
+        i = j = k = b = c = 6
+        A = randn(T, i, j, m, a)
+        B = randn(T, m, k, b, c)
+        C = zeros(T, a, b, c, i, j, k)
+        return StridedView(C), StridedView(A), StridedView(B)
+    end
+
+    kmax_of(::Type{Float64}) = QuasiStrided.F2_DEMOTE_KMAX_F64
+    kmax_of(::Type{Float32}) = QuasiStrided.F2_DEMOTE_KMAX_F32
+
+    for (T, a) in ((Float64, 8), (Float32, 16))
+        Qm = a * 36
+        Qn = 216
+        default_kernel = QuasiStrided._default_kernel(T, Qm, Qn)
+
+        # Deep-K: Qk = 2*kmax(T), well past the crossover measured by the
+        # sweep -- the guard must block demotion entirely regardless of the
+        # run-length predicate (this fixture never swaps: `a` is C's own
+        # leading axis, so the as-is orientation always feeds M -- checked
+        # below via `plan.Astorage`, not assumed).
+        m_deep = 2 * kmax_of(T)
+        Cv, Av, Bv = _f2_fixture(T, a, m_deep)
+        plan_deep = plan_contract(Cv, Av, indA, Bv, indB, indC)
+        @test plan_deep.Astorage === parent(Av)
+        @test plan_deep.kernel === default_kernel
+
+        # Shallow-K: Qk = 8, deep inside kmax(T) for both dtypes -- confirms
+        # the original, still-valid F2 case (a run-length-broken default
+        # kernel at a shallow contraction) is unaffected by the new guard.
+        # Whether the run-length predicate itself is already satisfied by
+        # the shipped default kernel is ISA-dependent (a smaller `mr` on a
+        # narrower ISA can already divide the run) -- so, like the existing
+        # F2 testset above, the expectation is DERIVED from the predicate,
+        # never hardcoded to "must demote": on this host/ISA the sweep's own
+        # data confirms it always demotes, but forced-ISA runs may
+        # legitimately land on the "predicate already holds" branch instead.
+        m_shallow = 8
+        Cv2, Av2, Bv2 = _f2_fixture(T, a, m_shallow)
+        plan_shallow = plan_contract(Cv2, Av2, indA, Bv2, indB, indC)
+        @test plan_shallow.Astorage === parent(Av2)
+        mlab, = QuasiStrided._classify_labels(indA, indB, indC)
+        msorted = _lo_order(mlab, indC, Cv2)
+        run = _lo_run(msorted, indC, Cv2)
+        if Qm == run || run % mr(default_kernel) == 0
+            @test plan_shallow.kernel === default_kernel
+        else
+            @test plan_shallow.kernel !== default_kernel
+            @test typeof(plan_shallow.kernel) !== typeof(default_kernel)
+            @test run % mr(plan_shallow.kernel) == 0
+        end
+
+        # Boundary (T5 review, N9): the guard is `Qk > kmax`, so `Qk ==
+        # kmax` must still be ELIGIBLE to demote (subject to the same
+        # run-length predicate as any other in-range point) and `Qk ==
+        # kmax + 1` must NEVER demote, regardless of the predicate. Pins the
+        # `>` (not `>=`) boundary directly rather than only sampling well
+        # inside/outside it.
+        Cv_b, Av_b, Bv_b = _f2_fixture(T, a, kmax_of(T))
+        plan_b = plan_contract(Cv_b, Av_b, indA, Bv_b, indB, indC)
+        run_b = _lo_run(msorted, indC, Cv_b)  # same M order at every m in this fixture
+        if Qm == run_b || run_b % mr(default_kernel) == 0
+            @test plan_b.kernel === default_kernel
+        else
+            @test plan_b.kernel !== default_kernel
+        end
+
+        Cv_b1, Av_b1, Bv_b1 = _f2_fixture(T, a, kmax_of(T) + 1)
+        plan_b1 = plan_contract(Cv_b1, Av_b1, indA, Bv_b1, indB, indC)
+        @test plan_b1.kernel === default_kernel
     end
 end
 

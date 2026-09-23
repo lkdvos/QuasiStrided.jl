@@ -214,6 +214,45 @@ end
     end
 end
 
+# `kc == 1` is the loop's minimal nonzero trip count (one `p` step, so the
+# unified real/complex `_pack_panel!`'s outer loop body runs exactly once);
+# none of the fixed-`kc = 5` correctness tests above exercise it. Covered here
+# for full and tail slivers, Planar A, Planar B, and 1e A under `conj` (the
+# conjugation-pin combination), per T.
+@testset "pack_a!/pack_b!: kc == 1, full and tail slivers ($T)" for T in (ComplexF64, ComplexF32)
+    MR, NR = 4, 3
+    R = real(T)
+    storage = sample_storage(T, 4000)
+
+    # Planar A
+    kernel_pp = ComplexKernelDescriptor(Val(MR), Val(NR), T, PlanarFormat(), PlanarFormat())
+    fix_a = fixture_a(storage, "scatter", MR, 1)
+    for m in (MR, 1, 0), f in (identity, conj)
+        source = SourceTile(storage, fix_a.base, resized(fix_a.rows, m), fix_a.cols)
+        packed = fill(R(-777), packed_a_length(kernel_pp, 1))
+        pack_a!(packed, source, kernel_pp, f)
+        @test packed == ref_pack(PlanarFormat(), T, MR, 1, m, fix_a.g, f)
+    end
+
+    # Planar B
+    fix_b = fixture_b(storage, "scatter", NR, 1)
+    for n in (NR, 1, 0), f in (identity, conj)
+        source = SourceTile(storage, fix_b.base, fix_b.rows, resized(fix_b.cols, n))
+        packed = fill(R(-777), packed_b_length(kernel_pp, 1))
+        pack_b!(packed, source, kernel_pp, f)
+        @test packed == ref_pack(PlanarFormat(), T, NR, 1, n, fix_b.g, f)
+    end
+
+    # 1e A, with conj (the conjugation-pin combination)
+    kernel_ep = ComplexKernelDescriptor(Val(MR), Val(NR), T, OneEFormat(), PlanarFormat())
+    for m in (MR, 1, 0), f in (identity, conj)
+        source = SourceTile(storage, fix_a.base, resized(fix_a.rows, m), fix_a.cols)
+        packed = fill(R(-777), packed_a_length(kernel_ep, 1))
+        pack_a!(packed, source, kernel_ep, f)
+        @test packed == ref_pack(OneEFormat(), T, MR, 1, m, fix_a.g, f)
+    end
+end
+
 # =====================================================================
 # The conjugation pin: transform applies to the complex element, and the
 # result is split afterwards -- NOT per real half, where `conj` is a no-op.
@@ -467,6 +506,13 @@ probe_b(packed, src, kernel, f) =
 
         src_kc0 = SourceTile(storage, 0, AffineAxis(0, 1, MR), AffineAxis(0, MR, 0))
 
+        # Tail slivers (T5 review, S5): every probe above uses a FULL sliver
+        # (m == MR / n == NR); the unified `_pack_panel!` gave complex
+        # formats a genuinely separate tail branch (the valid-lanes loop plus
+        # `_pack_emit_zero!` padding), which had no allocation coverage.
+        src_a_tail = SourceTile(storage, 0, AffineAxis(0, 1, MR - 1), AffineAxis(0, MR, kc))
+        src_b_tail = SourceTile(storage, 0, AffineAxis(0, 1, kc), AffineAxis(0, kc, NR - 1))
+
         return (
             probe_a(packed_a, src_a, kernel, identity),
             probe_a(packed_a, src_a, kernel, conj),
@@ -481,6 +527,10 @@ probe_b(packed, src, kernel, f) =
             probe_b(packed_b, src_b_s, kernel, conj),
             probe_b(packed_b, src_b_s, kernel, nontrivial),
             probe_a(packed_a, src_kc0, kernel, identity),
+            probe_a(packed_a, src_a_tail, kernel, identity),
+            probe_a(packed_a, src_a_tail, kernel, conj),
+            probe_b(packed_b, src_b_tail, kernel, identity),
+            probe_b(packed_b, src_b_tail, kernel, conj),
         )
     end
 
