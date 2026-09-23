@@ -17,14 +17,15 @@ using Printf
 # `_classify_backtrace`), NOT a single first-match-wins pass over one bucket
 # list: `SPECIFIC_QS_BUCKETS` matches on function names (unambiguous: a
 # frame named `pack_a!` is packing, wherever it lives), `FALLBACK_QS_BUCKETS`
-# matches on bare file-path substrings (`"kernels/"`, `"driver.jl"`, ...),
+# matches on file-path substrings (the `src/` stage folders: `"microkernels/"`,
+# `"planning/"`, ...),
 # used only if NO frame anywhere in the sample's stack matched a specific
 # name. This two-pass split matters: a stack's leaf is very often a generic
 # or third-party frame (an inlined `SIMD.jl` intrinsic, a `macro expansion`
 # thunk, `Base.range`'s `iterate`) that itself matches nothing specific, and
 # that leaf's *file* can be misleading -- e.g. a `macro expansion` frame
 # inside `_store_tile_vector!`'s generated body lives in the same file
-# (`src/kernels/simd.jl`) as the FMA microkernel, so checking file
+# (`src/microkernels/simd.jl`) as the FMA microkernel, so checking file
 # substrings before walking further up the stack to the actual
 # `_store_tile_vector!` frame would misclassify the whole sample as
 # "microkernel" instead of "store". Running the specific-name pass across
@@ -40,11 +41,10 @@ const SPECIFIC_QS_BUCKETS = [
         [
             "plan_contract", "_plan_contract", "_classify_labels", "_order_free_labels",
             "_prefer_swap", "_default_kernel", "_kernel_from_shape",
-            "_complex_kernel_from_shape", "default_blocking",
-            # Per-call-floor milestone (2026-09-21). These already landed in
-            # "planning" through the ancestor walk -- `plan_contract` is their
-            # only caller -- so naming them makes the attribution explicit
-            # rather than incidental; it cannot change any classification.
+            "default_blocking",
+            # These would land in "planning" through the ancestor walk anyway
+            # (`plan_contract` is their only caller); naming them makes the
+            # attribution explicit and cannot change any classification.
             "_build_pair_group", "_pair_group_rank", "_pair_group_static",
         ],
     ),
@@ -62,10 +62,9 @@ const SPECIFIC_QS_BUCKETS = [
         "driver_loop",
         [
             "_execute_nest!", "execute!", "_axis_of", "_classify_slivers!",
-            "_sliver_panel", "_sliver_range", "_scale_micro_tile!", "_scale_all_of_C!",
+            "_sliver_panel", "_scale_micro_tile!", "_scale_all_of_C!",
             "fill_offsets!", "describe_block", "block_descriptors!", "checked_tile_storage_bounds",
-            # Per-call-floor milestone (2026-09-21): the closed-form affine
-            # block path and the hoisted once-per-macro-block bounds check.
+            # The closed-form affine block path and the hoisted once-per-macro-block bounds check.
             # Same note as under "planning" -- `_execute_nest!` is the only
             # caller of each, so these names change no classification; the
             # `unsafe_pack_*!`/`unsafe_execute_*!` entry points need no entry
@@ -78,11 +77,11 @@ const SPECIFIC_QS_BUCKETS = [
 ]
 const FALLBACK_QS_BUCKETS = [
     ("gc/alloc", ["gc"]),
-    ("adapter/prepare", ["tensoroperations.jl", "StridedView"]),
-    ("packing", ["packing.jl"]),
-    ("microkernel", ["kernels/"]),
-    ("driver_loop", ["axis_group.jl"]),
-    ("planning", ["driver.jl"]),
+    ("adapter/prepare", ["integrations/", "StridedView"]),
+    ("packing", ["packing/"]),
+    ("microkernel", ["microkernels/"]),
+    ("driver_loop", ["execution/", "layout/"]),
+    ("planning", ["planning/"]),
 ]
 
 const SPECIFIC_BLAS_BUCKETS = [

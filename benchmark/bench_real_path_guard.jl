@@ -1,24 +1,19 @@
-# Real-path regression guard for the complex element-type milestone.
-#
-# The milestone's first acceptance criterion is that adding complex support did
-# not slow the real path down. The suite proves the real path is *correct* and
-# `git diff` proves the hot functions are textually unedited, but neither can
-# see a regression caused by (say) a new `ContractPlan` type parameter
-# defeating a specialization. Only a measurement can, and this is it.
+# Real-path performance regression guard. The suite proves the real path is
+# *correct*, but cannot see a regression caused by (say) a new `ContractPlan`
+# type parameter defeating a specialization. Only a measurement can, and this
+# is it.
 #
 # It is NOT `bench_default_vs_legacy.jl`, which compares two configurations
 # *within* one tree. This measures the same real default configuration so it
-# can be compared *across two trees* -- the working tree against the
-# milestone's base commit -- which cannot be done in a single process, because
+# can be compared *across two trees* -- the working tree against a base
+# commit -- which cannot be done in a single process, because
 # both trees define a module named `QuasiStrided`.
 #
 # Usage: run once per tree, back to back, then diff the two CSVs.
 #
 #   julia --project=. benchmark/bench_real_path_guard.jl
 #
-# HOW TO RUN AND READ IT -- all three points cost this project time to find,
-# and the full account is in docs/decisions.md, "The real-path regression
-# guard: no regression, and the resolution is ~5%":
+# HOW TO RUN AND READ IT (the resolution of this guard is ~5%):
 #
 #   * Sequence in ABBA order, with nothing else on the machine. Straight
 #     base-then-new twice is confounded by wall-clock drift, and an 11-rep

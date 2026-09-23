@@ -1,8 +1,7 @@
 # Head-to-head timing of `@tensor` under `StridedNative()`, `StridedBLAS()`
 # and `QuasiStridedBackend()` on identical inputs, over the same shape grid as
 # `benchmark/bench_driver.jl`. An honest comparison, not a search for a win:
-# see docs/decisions.md, "Not hooked into `select_backend`", which these
-# numbers are the evidence base for.
+# these numbers are why the backend is not hooked into `select_backend`.
 #
 #   julia --project=. benchmark/bench_tensoroperations.jl
 #
@@ -34,9 +33,9 @@ end
 #
 # `reps` was 9, which is below this project's standing discipline: ccqlin038 is
 # not reliably exclusive, canary spreads of 4-15% are normal, and an 11-rep
-# comparison in the panel-addressing milestone invented two regressions that 21
-# reps erased (STATUS.md, "Measurement hygiene"). 15 is the floor; pass more for
-# anything whose conclusion depends on a difference under ~10%.
+# comparison once invented two regressions that 21 reps erased. 15 is the
+# floor; pass more for anything whose conclusion depends on a difference under
+# ~10%.
 function median_time_s(f!::Function; reps::Int = 15)
     f!()  # warm-up, discarded
     ts = Vector{Float64}(undef, reps)
@@ -53,12 +52,8 @@ end
 # (matrix-shaped contraction C[m,n] = A[m,k]*B[k,n]), reproduced here verbatim
 # rather than included.
 #
-# The original reason -- "bench_driver.jl is not meant to be used as a library"
-# -- expired when the hardware-derived-register-shape milestone factored
-# `benchmark/harness.jl` out of it for exactly this purpose. What keeps the
-# duplication now is narrower and worth stating rather than silently fixing:
-# every committed number in `benchmark/results/` for this script was taken
-# against these literals, and this is the script whose output the README quotes.
+# The duplication is deliberate: every committed number in `benchmark/results/`
+# for this script was taken against these literals.
 # Collapsing onto the harness is a safe cleanup only when done together with a
 # re-run, not as a drive-by edit. Until then the two must be kept in step by
 # hand; they are identical today.
@@ -206,8 +201,8 @@ open(joinpath(OUTDIR, "summary_tensoroperations.txt"), "w") do io
 end
 println(read(joinpath(OUTDIR, "summary_tensoroperations.txt"), String))
 
-# Provenance -- format matched to
-# benchmark/results/ccqlin038.flatironinstitute.org-2026-09-08/PROVENANCE.txt.
+# Provenance -- same format as the other PROVENANCE.txt files under
+# benchmark/results/.
 commit = try
     strip(read(`git -C $(joinpath(@__DIR__, "..")) rev-parse HEAD`, String))
 catch
@@ -228,8 +223,7 @@ open(PROVENANCE_PATH, "w") do io
     println(
         io,
         "  not averaged across machines or repeated sessions. Numbers are indicative of ",
-        "this reference machine only, matching the caveat in the macro-blocking ",
-        "milestone's benchmark/results/ccqlin038.flatironinstitute.org-2026-09-08/PROVENANCE.txt."
+        "this reference machine only."
     )
 end
 

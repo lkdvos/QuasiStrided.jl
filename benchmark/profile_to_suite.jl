@@ -4,11 +4,9 @@
 # and the permuted/negative-stride/sliced "scattered" fixture), bucketing
 # sampled cost into adapter/planning/packing/microkernel/store/blas/etc.
 #
-# Extended 2026-09-21 ("profile-grid" pass, see docs/decisions.md's "T4"
-# section) from the original 7 CASES + 1 DIRECT_CASES entry to the full
-# MAIN_SHAPES/SMALL_SHAPES/EXTRA_SHAPES x 4-dtype grid (38 CASES + 5
-# DIRECT_CASES, including two explicit OneMKernel entries) -- see the
-# "Full-grid extension" comment below for the additive rules.
+# Covers the full MAIN_SHAPES/SMALL_SHAPES/EXTRA_SHAPES x 4-dtype grid (38
+# CASES + 5 DIRECT_CASES, including two explicit OneMKernel entries) -- see
+# the "Full-grid extension" comment below for the additive rules.
 #
 #   julia --project=benchmark benchmark/profile_to_suite.jl [caseid ...]
 #
@@ -86,10 +84,8 @@ const CASES = [
         ),
         dtype = Float32,
     ),
-    # Same shape as ccsd_t_1_dim16, at ComplexF64 -- added 2026-09-22 to
-    # investigate why QuasiStrided's ComplexF64/Float64 GFLOP/s ratio on
-    # :tccg (bench_to_suite.jl, job 7087420) sits at ~0.29 median vs
-    # StridedBLAS's ~0.68 (docs/decisions.md, "ComplexF64 tccg slowdown").
+    # Same shape as ccsd_t_1_dim16, at ComplexF64: probes why QuasiStrided's
+    # ComplexF64/Float64 GFLOP/s ratio on :tccg sits well below StridedBLAS's.
     (
         id = "ccsd_t_1_dim16_c64",
         IA = [:i, :j, :m, :a], IB = [:m, :k, :b, :c],
@@ -130,8 +126,8 @@ const CASES = [
         dims = Dict(:m => 512, :k => 512, :n => 512),
         dtype = Float64,
     ),
-    # Same GEMM shape, but N=12: STATUS.md's "Next task" flags this as the
-    # regime where packing/per-call overhead, not the microkernel, dominates.
+    # Same GEMM shape, but N=12: the regime where packing/per-call overhead,
+    # not the microkernel, dominates.
     (
         id = "smallN_256x256x12",
         IA = [:m, :k], IB = [:k, :n], IC = [:m, :n],
@@ -141,12 +137,12 @@ const CASES = [
 ]
 
 # ---------------------------------------------------------------------------
-# Full-grid extension (2026-09-21 "profile-grid" pass): every
-# MAIN_SHAPES/SMALL_SHAPES/EXTRA_SHAPES shape from harness.jl, at both real
-# dtypes and (MAIN_SHAPES union SMALL_SHAPES only) both complex dtypes.
-# Additive only -- the seven case ids above are untouched; `_EXISTING_CASE_IDS`
-# below guards against ever emitting a duplicate id for the three shapes
-# (`plain_256`, `plain_512`, `smallN_256x256x12`) already covered at Float64.
+# Full grid: every MAIN_SHAPES/SMALL_SHAPES/EXTRA_SHAPES shape from
+# harness.jl, at both real dtypes and (MAIN_SHAPES union SMALL_SHAPES only)
+# both complex dtypes, on top of the seven hand-picked cases above.
+# `_EXISTING_CASE_IDS` below guards against emitting a duplicate id for the
+# three shapes (`plain_256`, `plain_512`, `smallN_256x256x12`) already covered
+# at Float64.
 # ---------------------------------------------------------------------------
 
 # (ShapeSpec name in harness.jl, case id base for Float64 / `_f32` suffix).
@@ -184,7 +180,7 @@ end
 # 1024x256x1024 at ComplexF64 is a >1 GB fixture and not needed for coverage
 # here). These go through the default complex kernel the driver picks for
 # a plain label/dims contraction -- the "planar" method
-# (`_default_complex_method` in src/driver.jl always returns `PlanarMethod()`
+# (`_default_method` in src/planning/kernel_selection.jl always returns `PlanarMethod()`
 # unless a kernel is explicitly named, which only the DIRECT_CASES 1m entries
 # below do). `_c64`/`_c32` suffix distinguishes these from the real-dtype ids.
 const _COMPLEX_GRID = [
@@ -232,13 +228,13 @@ const DIRECT_CASES = Any[
 ]
 
 # 1m (`OneMKernel`) is reachable ONLY by explicitly naming the kernel to
-# `plan_contract` (src/driver.jl: `_default_complex_method` always returns
+# `plan_contract` (src/planning/kernel_selection.jl: `_default_method` always returns
 # `PlanarMethod()`), so the label/dims `CASES` above -- which all go through
 # the default kernel -- never exercise it. Exercise it here via
 # `plan_contract(...; kernel = ...)` on a couple of MAIN_SHAPES, both complex
 # dtypes, at 1m's own shipped default register shape (mirrors
 # `bench_complex_efficiency.jl`'s `time_kernel`, which does the same thing
-# through the `kernel_shapes`/`_complex_kernel_from_shape` menu).
+# through the `kernel_shapes`/`_kernel_from_shape` menu).
 _onem_default_kernel(::Type{T}) where {T} = ((MR, NR, W) = kernel_shapes(T, OneMMethod())[end]; OneMKernel(Val(MR), Val(NR), T, Val(W)))
 
 const _ONEM_GRID = [("256^3", "onem_256"), ("512^3", "onem_512")]

@@ -3,50 +3,63 @@ module QuasiStrided
 using LinearAlgebra
 using StridedViews: StridedView, offset
 
-# --- Hardware detection (pure; no kernel or blocking dependencies) ---
-include("target.jl")
+# Module-import convention, not to be changed: TensorOperations names are
+# always qualified; a bare `using TensorOperations` would collide on
+# `scalartype`.
+import TensorOperations as TO
 
-# --- Phase 1: indexing ---
-include("axis_group.jl")
+# A contraction C[indC] = alpha * A[indA] * B[indB] + beta * C runs through the
+# stages below, in order. `plan_contract` resolves labels into M/N/K axis
+# groups, picks a microkernel and cache blocking, and sizes a workspace;
+# `execute!` runs a BLIS five-loop nest that packs A/B slivers into panels and
+# drives the microkernel over register tiles of C.
+#
+# Include order follows type dependencies, which mostly coincide with the
+# stage order; the exceptions are noted inline.
 
-# --- Phase 2: tiles, packing, scalar kernel ---
-include("kernel_descriptor.jl")
+# --- Hardware: ISA and cache detection ---
+include("hardware/target.jl")
 
-# --- Complex milestone: packed formats, methods, the complex descriptor ---
-include("complex_format.jl")
+# --- Layout: zero-based strided/scattered addressing ---
+include("layout/axis_group.jl")
+include("layout/pair_group.jl")
+include("layout/tiles.jl")
 
-include("panel.jl")
+# --- Packing: packed-panel formats and the packers that fill them ---
+include("packing/format.jl")
+include("packing/panel.jl")
+include("packing/pack.jl")
+include("packing/pack_contiguous.jl")
 
-include("tiles.jl")
+# --- Microkernels: accumulate over one packed K panel, store into C ---
+include("microkernels/interface.jl")
+include("microkernels/scalar.jl")
+include("microkernels/simd.jl")
+include("microkernels/planar.jl")
+include("microkernels/onem.jl")
 
-include("packing.jl")
+# --- Planning: labels, conjugation, kernel and blocking choice, the plan ---
+include("planning/labels.jl")
+include("planning/conjugation.jl")
+include("planning/kernel_selection.jl")
+include("planning/blocking.jl")
+# `ContractPlan` holds a `ContractWorkspace`, so the workspace comes first.
+include("execution/workspace.jl")
+include("planning/plan.jl")
 
-include("kernel.jl")
+# --- Execution: the five-loop nest, and the tile-by-tile oracle ---
+include("execution/macrokernel.jl")
+include("execution/execute.jl")
+include("execution/oracle.jl")
 
-# --- Phase 3: SIMD kernel + serial driver ---
-include("kernels/simd.jl")
-
-# --- Complex milestone: planar (split-complex) microkernel ---
-include("kernels/planar.jl")
-
-# --- Complex milestone: 1m (induced) microkernel, reusing the real body ---
-include("kernels/onem.jl")
-
-# --- Macro-blocking milestone: BLIS five-loop driver ---
-include("blocking.jl")
-
-include("workspace.jl")
-
-include("driver.jl")
-
-# --- TensorOperations integration milestone: QuasiStridedBackend adapter ---
-include("tensoroperations.jl")
+# --- Integrations ---
+include("integrations/tensoroperations.jl")
 
 export QuasiStridedBackend
 
 # Hardware detection runs once per process, never at precompile time: a .ji
 # cached on one node class of a shared depot must not carry another node's
-# feature set (src/target.jl).
+# feature set (src/hardware/target.jl).
 function __init__()
     _init_target!()
     return nothing
@@ -58,7 +71,7 @@ end
             :public, :contract!, :plan_contract, :execute!, :ContractPlan,
             :ContractWorkspace, :Blocking, :default_blocking,
             :ScalarKernel, :SIMDKernel,
-            # Complex milestone. `PlanarKernel` is the default for a complex
+            # `PlanarKernel` is the default for a complex
             # element type, and `OneMKernel` is reachable ONLY by naming it in
             # `plan_contract(...; kernel = ...)` -- the engine never picks it,
             # deliberately. A selection mechanism whose only handle is an

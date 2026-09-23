@@ -1,4 +1,4 @@
-# The complex element-type milestone's headline metric, plus the planar-vs-1m
+# The headline complex metric, plus the planar-vs-1m
 # head-to-head.
 #
 #   julia --project=. benchmark/bench_complex_efficiency.jl
@@ -20,19 +20,18 @@
 # number does not. It is still a single-machine measurement and is labelled as
 # one.
 #
-# On the planar-vs-1m arm, read `docs/decisions.md`'s "Method ranking does not
-# transfer between machines" first. The reference project measured four
-# different orderings on four machines; this arm produces a ccqlin038 number
-# and **must not** become an auto-dispatch rule. Its more interesting output is
-# arguably the register-pressure question Phase C left open: whether the
-# menu-head shape that spills (16x6 planar, 26 stores per K step) actually
-# loses to the clean alternative (24x3, zero spills), which spill counts alone
-# cannot answer.
+# On the planar-vs-1m arm: method ranking does not transfer between machines.
+# The reference project measured four different orderings on four machines;
+# this arm produces a ccqlin038 number and **must not** become an auto-dispatch
+# rule. Its more interesting output is arguably the register-pressure question:
+# whether the menu-head shape that spills (16x6 planar, 26 stores per K step)
+# actually loses to the clean alternative (24x3, zero spills), which spill
+# counts alone cannot answer.
 
 include(joinpath(@__DIR__, "harness.jl"))
 
 using QuasiStrided: PlanarMethod, OneMMethod, complex_method, kernel_shapes,
-    _complex_kernel_from_shape, _default_kernel, default_blocking
+    _kernel_from_shape, _default_kernel, default_blocking
 
 const REPS = 21
 const SWEEP_SHAPES = vcat(MAIN_SHAPES, SMALL_SHAPES)
@@ -110,24 +109,24 @@ function arm_efficiency(csv, canaries, crng)
             @warn "$T complex efficiency geomean $(round(g, digits = 3)) < 0.9: " *
                 "that indicates a structural overhead specific to complex " *
                 "(packing cost or accumulator spill), and is a finding rather " *
-                "than a result to publish. See docs/decisions.md."
+                "than a result to publish."
         end
     end
     return (geomean(ratios64), geomean(ratios32))
 end
 
 # ---------------------------------------------------------------------------
-# Arm 2: planar vs 1m, and the shape question Phase C left open
+# Arm 2: planar vs 1m, and the register-shape question
 # ---------------------------------------------------------------------------
 function arm_methods(csv, canaries, crng)
     println("\n== arm 2: complex methods x register shapes (ccqlin038 only) ==")
-    println("(NO auto-dispatch rule is derived from this; see docs/decisions.md)\n")
+    println("(NO auto-dispatch rule is derived from this)\n")
     for T in CDTYPES
         rows = NamedTuple[]
         for method in (PlanarMethod(), OneMMethod())
             for shape in kernel_shapes(T, method)
                 kernel = try
-                    _complex_kernel_from_shape(shape, T, method)
+                    _kernel_from_shape(shape, T, method)
                 catch err
                     @info "skipping $T $(method) $(shape): $(sprint(showerror, err))"
                     continue

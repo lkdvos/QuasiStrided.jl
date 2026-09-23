@@ -2,7 +2,7 @@
 #
 # kc is swept jointly with the shape, never held fixed: MR*kc*sizeof(T) is the
 # A-micropanel L1 footprint, so doubling MR at fixed kc measures the wrong
-# thing. Rationale and results in docs/decisions.md, Phases G and H.
+# thing.
 #
 #   julia --project=. benchmark/bench_kernel_shape.jl
 
