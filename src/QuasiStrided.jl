@@ -19,6 +19,7 @@ import TensorOperations as TO
 
 # --- Hardware: ISA and cache detection ---
 include("hardware/target.jl")
+include("hardware/prefetch.jl")
 
 # --- Layout: zero-based strided/scattered addressing ---
 include("layout/axis_group.jl")
