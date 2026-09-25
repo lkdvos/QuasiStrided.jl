@@ -58,7 +58,8 @@ const NSLICE = (48, 96, 192, 384, 768, 1536, 3072, 6144)
 const MSLICE = (24, 48, 96, 192, 384, 768, 1536)
 
 const PROFILE = target_profile()
-const OUTDIR = results_dir()
+# One directory per Slurm job, so same-day reruns on one node never collide.
+const OUTDIR = results_dir() * (haskey(ENV, "SLURM_JOB_ID") ? "-job" * ENV["SLURM_JOB_ID"] : "")
 mkpath(OUTDIR)
 const CSV_PATH = joinpath(OUTDIR, "blocking_model.csv")
 const SUMMARY_PATH = joinpath(OUTDIR, "summary.txt")

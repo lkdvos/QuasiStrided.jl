@@ -28,11 +28,13 @@ end
 
 Cache-blocking factors keyed on the detected vector ISA
 ([`target_profile`](@ref)), `scalartype(kernel)` and the kernel's method.
-Measured constants, not a cache model: the measured grid spans only 9%/11%
-best-to-worst, so a model's upside is a few percent while a mis-fitted model
-can lose tens of percent. [`cache_topology`](@ref) is exposed for reporting
-only. `plan_contract` rounds `mc`/`nc` to `mr`/`nr`
-multiples and clamps them to the contraction's extents.
+AVX-512 uses measured constants; AVX2 uses an analytical model of the
+detected cache geometry (`_modelled_blocking`); every other ISA, and AVX2
+with undetected caches, uses the fallback constants. Measured grids are wide
+plateaus (1.7-17% best-to-worst over `bench_driver.jl`'s 36 points, 4-24%
+over 157) whose one cliff is small `kc`, so none of these is a sharp optimum.
+`plan_contract` rounds `mc`/`nc` to `mr`/`nr` multiples and clamps them to
+the contraction's extents.
 """
 default_blocking(kernel) =
     default_blocking(Val(target_profile().isa), scalartype(kernel), complex_method(kernel))
@@ -118,12 +120,20 @@ function _modelled_blocking(profile::TargetProfile, ::Type{T}) where {T <: Real}
 end
 
 # Where the model replaces the fallback: only where it has been measured
-# against it (the same gate as `_rule_applies`). AVX2 on Rome (znver2),
-# 2026-09-25, job 7107932: geomean over the sweep's 9 shapes, normalized per
-# shape by the best of 157 grid points, Float64 1.030 against the fallback's
-# 1.070 (1.003 vs 1.091 at 2048x256x2048), Float32 1.011 vs 1.017. NEON and
-# `:unknown` have no measurement of either and keep the fallback. `:avx512`
-# keeps its measured row, which the model matches within ~1% on Genoa.
+# against it (the same gate as `_rule_applies`). bench_blocking_model.jl,
+# 2026-09-25, geomean over its 9 shapes of time normalized per shape by the
+# best of 157 grid points (1.000 = best everywhere), model / fallback / AVX-512 row:
+#
+#   Rome (znver2, AVX2), job 7108316   Float64 1.028 / 1.070 / 1.033
+#                                      Float32 1.007 / 1.014 / 1.008
+#   Genoa (znver4), job 7108317        Float64 1.009 / 1.029 / 1.013
+#   Ice Lake-SP, job 7108318           Float64 1.029 / 1.048 / 1.016
+#   Cascade Lake (ccqlin038, local)    Float64 1.102 / 1.090 / 1.071
+#
+# (Float32 within 1% of the row everywhere; complex rows, scaled as below, at
+# or ahead of the row everywhere.) So AVX2 takes the model; AVX-512 keeps its
+# row, which the model ties on AMD but trails by 1-3% on Intel. NEON and
+# `:unknown` have no measurement of either and keep the fallback.
 _model_applies(::Val) = false
 _model_applies(::Val{:avx2}) = true
 
