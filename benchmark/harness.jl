@@ -93,6 +93,71 @@ function build_scattered(::Type{T}, rng) where {T}
     return (Av = Aperm, indA = indA, Bv = Bneg, indB = indB, Cv = Cv, indC = indC)
 end
 
+# More scattered/gathered fixtures, for benchmark/bench_prefetch.jl: each
+# forces the packers off their contiguous fast paths in a different way, so
+# the gather loops -- not the microkernel -- carry a real share of the time.
+# `build_scattered(T, rng)` above is unchanged and is the `:default` entry.
+# Every entry returns the same fields as `build_scattered`, plus `M`/`K`/`N`
+# (the free and contracted extents, for GFLOP/s).
+const SCATTER_VARIANTS = (
+    :default, :negstride_big, :transposed_AB, :interleaved_groups, :tn4,
+)
+
+function build_scattered(::Type{T}, rng, variant::Symbol) where {T}
+    if variant === :default
+        # M = a*b = 64*16, K = 64, N = 64 (see `build_scattered` above).
+        return (; build_scattered(T, rng)..., M = 64 * 16, K = 64, N = 64)
+    elseif variant === :negstride_big
+        # Large negative strides on both operands: A[m,k] with M stride -2
+        # (so A's unit-stride fast path is ineligible), B[k,n] with K stride
+        # -3 and N stride -6K. C plain.
+        M, K, N = 192, 192, 192
+        Abig = randn(rng, T, 2M, K)
+        Bbig = randn(rng, T, 3K, 2N)
+        Av = StridedView(view(Abig, (2M):-2:1, :))
+        Bv = StridedView(view(Bbig, (3K):-3:1, (2N):-2:1))
+        Cv = StridedView(zeros(T, M, N))
+        return (Av = Av, indA = (1, 2), Bv = Bv, indB = (2, 3), Cv = Cv, indC = (1, 3), M = M, K = K, N = N)
+    elseif variant === :transposed_AB
+        # Both operands transposed views: A's M axis has stride K and B's K
+        # axis has stride N, i.e. every packed lane of A is its own cache line
+        # and B's K steps are N elements apart. Still one plain GEMM.
+        M, K, N = 256, 256, 256
+        Av = permutedims(StridedView(randn(rng, T, K, M)), (2, 1))
+        Bv = permutedims(StridedView(randn(rng, T, N, K)), (2, 1))
+        Cv = StridedView(zeros(T, M, N))
+        return (Av = Av, indA = (1, 2), Bv = Bv, indB = (2, 3), Cv = Cv, indC = (1, 3), M = M, K = K, N = N)
+    elseif variant === :interleaved_groups
+        # Six small axes per operand with the M, K and N legs interleaved in
+        # memory, so no group merges into one affine axis: every M/K/N group
+        # is a genuine 3-axis composite whose offsets come in runs of 6, and
+        # the engine takes the scattered (`PtrScatterAxis`) path everywhere.
+        d = 6
+        # labels: a1..a3 = 1..3 (M), k1..k3 = 4..6 (K), n1..n3 = 7..9 (N)
+        Av = StridedView(randn(rng, T, d, d, d, d, d, d))   # (a1,k1,a2,k2,a3,k3)
+        Bv = StridedView(randn(rng, T, d, d, d, d, d, d))   # (k1,n1,k2,n2,k3,n3)
+        Cv = StridedView(zeros(T, d, d, d, d, d, d))        # (a1,n1,a2,n2,a3,n3)
+        return (
+            Av = Av, indA = (1, 4, 2, 5, 3, 6), Bv = Bv, indB = (4, 7, 5, 8, 6, 9),
+            Cv = Cv, indC = (1, 7, 2, 8, 3, 9), M = d^3, K = d^3, N = d^3,
+        )
+    elseif variant === :tn4
+        # A tensor-network-style 4-index contraction
+        # C[a,b,c,d] = A[a,k,b,l] * B[l,c,k,d]: A's M legs (a,b) and K legs
+        # (k,l) interleave, and B's K legs arrive in the opposite order.
+        e = 16
+        Av = StridedView(randn(rng, T, e, e, e, e))   # (a,k,b,l)
+        Bv = StridedView(randn(rng, T, e, e, e, e))   # (l,c,k,d)
+        Cv = StridedView(zeros(T, e, e, e, e))        # (a,b,c,d)
+        # labels: a=1 b=2 c=3 d=4 k=5 l=6
+        return (
+            Av = Av, indA = (1, 5, 2, 6), Bv = Bv, indB = (6, 3, 5, 4),
+            Cv = Cv, indC = (1, 2, 3, 4), M = e^2, K = e^2, N = e^2,
+        )
+    end
+    throw(ArgumentError("unknown scattered variant $(repr(variant)); expected one of $SCATTER_VARIANTS"))
+end
+
 function full_grid(mcs, kcs, ncs)
     combos = Tuple{Int, Int, Int}[]
     for kc in kcs, mc in mcs, nc in ncs
