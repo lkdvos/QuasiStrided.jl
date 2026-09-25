@@ -181,10 +181,9 @@ The package implements:
   would be a regression for existing users.
 - einsum string parsing; batch axes, diagonals, or isolated reductions; a
   separate beta-addend tensor; autotuning across shapes; runtime cache
-  probing or analytical block-size derivation (`mc`/`kc`/`nc` remain
-  measured constants — the detected cache geometry is reported by
-  `cache_topology()` and used for nothing that picks a number at runtime);
-  threading; GPU execution; K padding.
+  probing (no benchmark ever runs at load or first call; `mc`/`kc`/`nc` are
+  picked by an analytical model of the sysfs/sysctl-detected cache geometry,
+  with fixed constants only where that is undetected -- see `default_blocking`); threading; GPU execution; K padding.
 - On the complex side specifically: the **3m** (Karatsuba) method; **mixed
   real/complex operands** (promotion belongs in TensorOperations'
   `promote_contract` layer, not here); writing into a **conjugated output**

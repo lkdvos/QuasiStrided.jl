@@ -196,7 +196,9 @@ end
 
 Detected cache hierarchy as `(; l1d, l2, l3)` of [`CacheLevel`](@ref), or
 `nothing`. Reads Linux sysfs or macOS `sysctl` on demand; any field may be `0`.
-Exposed for reporting -- nothing that picks a number at runtime consults it.
+Read once into [`target_profile`](@ref), whose cache levels feed the
+blocking model (`_modelled_blocking`, src/planning/blocking.jl); nothing else
+that picks a number at runtime consults it.
 """
 function cache_topology()
     return try
