@@ -31,7 +31,9 @@ cd "${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR not set -- run this script via sbatch, 
 # since the official Julia builds need only glibc 2.17.
 module load modules/2.5-beta1 || true
 module load julia/1.12.6 || true
-JULIA=${QS_JULIA:-$(command -v julia || ls -d "$HOME"/.julia/juliaup/julia-1.12*/bin/julia 2>/dev/null | tail -1)}
+MODJULIA=$(command -v julia 2>/dev/null || true)
+case "$MODJULIA" in /mnt/sw/*) ;; *) MODJULIA="" ;; esac  # only a module-provided one
+JULIA=${QS_JULIA:-${MODJULIA:-$(ls -d "$HOME"/.julia/juliaup/julia-1.12*/bin/julia 2>/dev/null | tail -1)}}
 [ -x "${JULIA:-}" ] || { echo "no julia found; set QS_JULIA" >&2; exit 127; }
 echo "julia = $JULIA"
 
