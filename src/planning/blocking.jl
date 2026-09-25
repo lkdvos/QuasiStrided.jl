@@ -130,8 +130,8 @@ end
 #   Ice Lake-SP, job 7108318           Float64 1.029 / 1.048 / 1.016
 #   Cascade Lake (ccqlin038, local)    Float64 1.102 / 1.090 / 1.071
 #
-# (Float32 within 1% of the row everywhere; complex rows, scaled as below, at
-# or ahead of the row everywhere.) So AVX2 takes the model; AVX-512 keeps its
+# (Float32 within 1% of the row everywhere; complex rows, scaled as below,
+# within 0.6% of the row and ahead of the fallback everywhere.) So AVX2 takes the model; AVX-512 keeps its
 # row, which the model ties on AMD but trails by 1-3% on Intel. NEON and
 # `:unknown` have no measurement of either and keep the fallback.
 _model_applies(::Val) = false
