@@ -241,6 +241,11 @@ function _execute_nest!(
                         rfirst = r * MRk
                         rowsC = _axis_of(ws.m_desc_C[r + 1], ws.m_buf_C, rfirst)
                         apanel = _sliver_panel(ws.packed_a, MRp, kblock, r)
+                        # Off by default; folds to nothing (src/execution/macrokernel.jl).
+                        _macro_prefetch!(
+                            ws.packed_a, ws.packed_b, MRp * kblock, NRp * kblock,
+                            r, s, m_slivers, n_slivers
+                        )
                         unsafe_execute_micro_tile!(
                             kernel, plan.Cstorage, plan.Cbase, rowsC, colsC,
                             apanel, bpanel, kblock, alphaT, beta_eff

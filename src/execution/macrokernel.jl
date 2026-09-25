@@ -83,6 +83,54 @@ end
     return packed_panel(buffer, s * stride + 1, stride)
 end
 
+# Panel-ahead software prefetch (site `:macro`, src/hardware/prefetch.jl;
+# EXPERIMENTAL, off by default) -- the classic BLIS `a_next`/`b_next` hint.
+# Called right before the microkernel consumes A micropanel `r` against B
+# micropanel `s`, it prefetches the first `distance` cache lines of the A
+# micropanel the NEXT call will read (`r + 1`, wrapping to `0` after the last,
+# which is where the next `s` restarts), and on the last `r` also the head of
+# B micropanel `s + 1`. The current B micropanel needs nothing: every `r`
+# re-reads it, so it is already hot. Heads only, because the microkernel then
+# walks each micropanel sequentially and the hardware stream prefetcher takes
+# over from there; a whole micropanel would be hundreds of prefetches per
+# tile.
+#
+# `packed_a`/`packed_b` are the workspace's packed buffers; their pointers are
+# valid under `execute!`'s `GC.@preserve ws`. Every prefetched address lies inside the
+# current block's packed panels (`r' < m_slivers`, `s' < n_slivers`); a line
+# past a short micropanel's end is still inside the buffer or, at worst, a
+# harmless hint -- a prefetch never faults.
+#
+# With the site off, `distance` is the literal `0` and the whole body folds
+# away (checked in test/hardware/test_prefetch.jl).
+const _PREFETCH_LINE_BYTES = 64
+
+@inline function _macro_prefetch!(
+        packed_a::VA, packed_b::VB, a_stride::Int, b_stride::Int,
+        r::Int, s::Int, m_slivers::Int, n_slivers::Int
+    ) where {VA, VB}
+    L = _prefetch_distance(Val(:macro))
+    L > 0 || return nothing
+    # Only a dense buffer has a plain `pointer`; any other workspace vector type
+    # simply gets no prefetch. Folds at compile time either way.
+    (packed_a isa DenseVector && packed_b isa DenseVector) || return nothing
+    R = eltype(packed_a)
+    pa = pointer(packed_a)
+    pb = pointer(packed_b)
+    rnext = r + 1 < m_slivers ? r + 1 : 0
+    a_head = pa + sizeof(R) * (rnext * a_stride)
+    for l in 0:(L - 1)
+        prefetch(a_head + _PREFETCH_LINE_BYTES * l)
+    end
+    if r + 1 == m_slivers && s + 1 < n_slivers
+        b_head = pb + sizeof(R) * ((s + 1) * b_stride)
+        for l in 0:(L - 1)
+            prefetch(b_head + _PREFETCH_LINE_BYTES * l)
+        end
+    end
+    return nothing
+end
+
 # Classify each register sliver of a just-filled macro block. Shared by the
 # N side (jc: B/C) and the M side (ic: A/C), which are structurally identical.
 #
