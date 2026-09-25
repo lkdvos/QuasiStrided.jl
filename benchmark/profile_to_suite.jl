@@ -134,6 +134,25 @@ const CASES = [
         dims = Dict(:m => 256, :k => 256, :n => 12),
         dtype = Float64,
     ),
+    # bench_to_suite.jl's :pairwise "dim63_2_1_2" (2 open-only-A axes, 1
+    # contracted axis, 2 open-only-B axes, all extent 63): the evidence-gate
+    # run's worst regression at a size too large to be call-overhead noise --
+    # QS/BLAS = 14.6x (Float64), 13.4x (ComplexF64) in job 7101019's
+    # bench_to_suite.csv, versus <2x on every other mid/large pairwise case.
+    (
+        id = "dim63_2_1_2",
+        IA = [:a1, :a2, :c1], IB = [:c1, :b1, :b2],
+        IC = [:a1, :a2, :b1, :b2],
+        dims = Dict(:a1 => 63, :a2 => 63, :c1 => 63, :b1 => 63, :b2 => 63),
+        dtype = Float64,
+    ),
+    (
+        id = "dim63_2_1_2_c64",
+        IA = [:a1, :a2, :c1], IB = [:c1, :b1, :b2],
+        IC = [:a1, :a2, :b1, :b2],
+        dims = Dict(:a1 => 63, :a2 => 63, :c1 => 63, :b1 => 63, :b2 => 63),
+        dtype = ComplexF64,
+    ),
 ]
 
 # ---------------------------------------------------------------------------

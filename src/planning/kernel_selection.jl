@@ -141,11 +141,16 @@ _shape_override(::Val{:avx512}, ::Type{ComplexF32}, ::PlanarMethod) = (48, 3, 16
 _shape_override(::Val{:neon}, ::Type{ComplexF64}, ::PlanarMethod) = (4, 6, 2)
 _shape_override(::Val{:neon}, ::Type{ComplexF32}, ::PlanarMethod) = (8, 6, 4)
 
-# AVX2, modelled rather than measured, after the same sibling project's
-# provisional `(MV, NR) = (1, 5)`: at `MV = 1`, `NR = 6` costs all 16 of AVX2's
-# vector registers (`2*6 + 2 + 2`), leaving none for address arithmetic, while
-# `NR = 5` costs 14. `benchmark/bench_complex_efficiency.jl` arm 2 is the sweep
-# that would measure it; it needs AVX2-only hardware to be meaningful.
+# AVX2, measured: `benchmark/bench_complex_efficiency.jl` arm 2 on a Rome
+# (znver2) node (2026-09-24, job 7102205) ranks every menu shape for both
+# planar and 1m; `(4, 5, 4)` wins ComplexF64 outright (next best, 1m `8x8/W8`,
+# is 1.397x slower) and `(8, 5, 8)` wins ComplexF32 outright (next best, 1m
+# `16x8/W16`, is 1.476x slower) -- confirming the register-budget reasoning
+# these rows originally shipped with (at `MV = 1`, `NR = 6` costs all 16 of
+# AVX2's vector registers (`2*6 + 2 + 2`), leaving none for address
+# arithmetic, while `NR = 5` costs 14). No larger menu shape closes the gap to
+# StridedBLAS on this ISA -- that gap is a throughput ceiling, not a
+# shape-selection miss.
 _shape_override(::Val{:avx2}, ::Type{ComplexF64}, ::PlanarMethod) = (4, 5, 4)
 _shape_override(::Val{:avx2}, ::Type{ComplexF32}, ::PlanarMethod) = (8, 5, 8)
 
