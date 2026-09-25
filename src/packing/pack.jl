@@ -226,12 +226,17 @@ end
 # BEFORE `_pack_emit!` splits it into planes; padding lanes go through
 # `_pack_emit_zero!` instead, which writes literal zeros without calling
 # `transform` (a `-0.0` hazard for `OneEFormat`'s `-im` plane otherwise).
+#
+# `pf` is the software-prefetch hook (`nothing` unless a prefetch site is
+# switched on; see `_gather_prefetcher` below): it is called once at the top of
+# each K step, before that step's loads, with the step and the lane count.
 @inline function _pack_panel!(
         packed::V, ::Type{T}, format::FMT, ::Val{PD}, kc::Int, valid::Int,
-        transform::F, load::L, plane_offset::P
-    ) where {V, T, FMT <: PackFormat, PD, F, L, P}
+        transform::F, load::L, plane_offset::P, pf::PF = nothing
+    ) where {V, T, FMT <: PackFormat, PD, F, L, P, PF}
     if valid == PD
         @inbounds for p in 0:(kc - 1)
+            _prefetch_step!(pf, p, PD)
             for t in 0:(PD - 1)
                 z = convert(T, transform(load(t, p)))::T
                 _pack_emit!(packed, format, plane_offset, t, p, z)
@@ -239,6 +244,7 @@ end
         end
     else
         @inbounds for p in 0:(kc - 1)
+            _prefetch_step!(pf, p, valid)
             for t in 0:(valid - 1)
                 z = convert(T, transform(load(t, p)))::T
                 _pack_emit!(packed, format, plane_offset, t, p, z)
@@ -249,6 +255,56 @@ end
         end
     end
     return packed
+end
+
+# ----------------------------------------------------------------------------
+# Software prefetch in the gather loop (EXPERIMENTAL, off by default)
+# ----------------------------------------------------------------------------
+#
+# Sites `:pack_a` and `:pack_b` (src/hardware/prefetch.jl). When on, K step `p`
+# of the gather first prefetches every valid lane of K step `p + distance`
+# (clamped to the sliver's last step), one `prefetcht0` per lane -- the same
+# addresses `load` will read `distance` steps later. The clamp, not a branch,
+# keeps the loop body straight-line; its cost is a few redundant prefetches of
+# the last step's lines at the end of the sliver. It never reads outside the
+# sliver: a scattered axis's offset is only ever looked up at a valid step.
+#
+# One prefetch per LANE, not per cache line, deliberately: the lanes of one K
+# step may share a line (unit-stride lanes) or each sit on their own (a
+# scattered or long-stride lane axis), and the loop cannot tell which without
+# a runtime test. On a unit-stride K axis this also re-prefetches a line the
+# previous step already asked for; whether any of that pays is what
+# benchmark/bench_prefetch.jl measures.
+#
+# `nothing` is the disabled hook. `_prefetch_distance` is a literal, so with
+# the site off `_gather_prefetcher` returns `nothing` at compile time and
+# `_prefetch_step!(nothing, ...)` is an empty inlined method: the disabled
+# gather loop is the same code as before this hook existed.
+@inline _prefetch_step!(::Nothing, p::Int, nlanes::Int) = nothing
+@inline _prefetch_step!(pf::PF, p::Int, nlanes::Int) where {PF} = pf(p, nlanes)
+
+# `LANES_ON_ROWS` is `true` for A (lane `t` is row `t`, K step `p` is column
+# `p`) and `false` for B (K step is the row, lane the column), matching the
+# `load` closures of the sliver packers below. Only a `DenseArray` storage has
+# a `pointer` to prefetch through; anything else gets no prefetch.
+@inline function _gather_prefetcher(
+        site::Val, source::QSTile, kc::Int, ::Val{LANES_ON_ROWS}
+    ) where {LANES_ON_ROWS}
+    D = _prefetch_distance(site)
+    D > 0 || return nothing
+    storage = source.storage
+    storage isa DenseArray || return nothing
+    base = pointer(storage)
+    E = sizeof(eltype(storage))
+    qmax = kc - 1
+    return function (p::Int, nlanes::Int)
+        q = min(p + D, qmax)
+        for t in 0:(nlanes - 1)
+            o = LANES_ON_ROWS ? tile_offset(source, t, q) : tile_offset(source, q, t)
+            prefetch(base + E * o)
+        end
+        return nothing
+    end
 end
 
 # RealFormat: one real per element, no plane split. `plane_offset` is still
@@ -268,7 +324,8 @@ end
     return nothing
 end
 
-# The real sliver packers. A has a contiguous fast path; B does not.
+# The real sliver packers. A has a contiguous fast path; B does not. Both
+# gather fallbacks carry the (default-off) prefetch hook above.
 @inline function _pack_a_sliver!(
         ::RealFormat, packed::V, source::QSTile, kernel::Descriptor{MR, NR, T2},
         transform::F, m::Int, kc::Int
@@ -280,7 +337,11 @@ end
 
     load = (i, p) -> tile_load(source, i, p)
     plane_offset = (plane, i, p) -> packed_a_offset(kernel, i, p)
-    _pack_panel!(packed, T2, RealFormat(), Val(MR), kc, m, transform, load, plane_offset)
+    pf = _gather_prefetcher(Val(:pack_a), source, kc, Val(true))
+    storage = source.storage
+    GC.@preserve storage begin
+        _pack_panel!(packed, T2, RealFormat(), Val(MR), kc, m, transform, load, plane_offset, pf)
+    end
     return packed
 end
 
@@ -290,7 +351,11 @@ end
     ) where {V, MR, NR, T2, F}
     load = (j, p) -> tile_load(source, p, j)  # source.rows=K, source.cols=N
     plane_offset = (plane, j, p) -> packed_b_offset(kernel, j, p)
-    _pack_panel!(packed, T2, RealFormat(), Val(NR), kc, n, transform, load, plane_offset)
+    pf = _gather_prefetcher(Val(:pack_b), source, kc, Val(false))
+    storage = source.storage
+    GC.@preserve storage begin
+        _pack_panel!(packed, T2, RealFormat(), Val(NR), kc, n, transform, load, plane_offset, pf)
+    end
     return packed
 end
 
@@ -412,7 +477,11 @@ end
 
     load = (i, p) -> tile_load(source, i, p)
     plane_offset = (plane, i, p) -> packed_a_plane_offset(kernel, plane, i, p)
-    _pack_panel!(packed, T2, format, Val(MR), kc, m, transform, load, plane_offset)
+    pf = _gather_prefetcher(Val(:pack_a), source, kc, Val(true))
+    storage = source.storage
+    GC.@preserve storage begin
+        _pack_panel!(packed, T2, format, Val(MR), kc, m, transform, load, plane_offset, pf)
+    end
     return packed
 end
 
@@ -436,6 +505,10 @@ end
 
     load = (j, p) -> tile_load(source, p, j)  # source.rows=K, source.cols=N
     plane_offset = (plane, j, p) -> packed_b_plane_offset(kernel, plane, j, p)
-    _pack_panel!(packed, T2, format, Val(NR), kc, n, transform, load, plane_offset)
+    pf = _gather_prefetcher(Val(:pack_b), source, kc, Val(false))
+    storage = source.storage
+    GC.@preserve storage begin
+        _pack_panel!(packed, T2, format, Val(NR), kc, n, transform, load, plane_offset, pf)
+    end
     return packed
 end
