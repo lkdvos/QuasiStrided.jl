@@ -7,7 +7,7 @@ using QuasiStrided: TargetProfile, CacheLevel, target_profile, cache_topology,
     _parse_size, _count_cpu_list, NR_DEFAULT, _rule_applies,
     _isa_nregisters, packed_a_per_k, packed_b_per_k, realtype, complex_method,
     RealMethod, PlanarMethod, OneMMethod, accumulator_planes, a_reals, b_reals,
-    _modelled_blocking, _model_applies
+    _modelled_blocking, _balanced_kc
 
 @testset "kernel shape selection" begin
 
@@ -20,15 +20,12 @@ using QuasiStrided: TargetProfile, CacheLevel, target_profile, cache_topology,
             @test k isa SIMDKernel
             @test (mr(k), nr(k), lanewidth(k)) === _fallback_shape(T)
         end
-        # The measured block-size defaults.
-        @test _fallback_blocking(Float64) === Blocking(64, 128, 768)
-        @test _fallback_blocking(Float32) === Blocking(96, 384, 1152)
-        for key in (:unknown, :neon, :somethingelse), T in (Float64, Float32)
-            @test default_blocking(Val(key), T) === _fallback_blocking(T)
-        end
-        # AVX2 takes the cache model, or the fallback when nothing is detected.
-        for T in (Float64, Float32)
-            @test default_blocking(Val(:avx2), T) ===
+        # The fallback block sizes, for undetected caches.
+        @test _fallback_blocking(Float64) === Blocking(128, 256, 768)
+        @test _fallback_blocking(Float32) === Blocking(96, 768, 1152)
+        # Every ISA takes the cache model, or the fallback when nothing is detected.
+        for key in (:unknown, :avx2, :avx512, :neon, :somethingelse), T in (Float64, Float32)
+            @test default_blocking(Val(key), T) ===
                 something(_modelled_blocking(target_profile(), T), _fallback_blocking(T))
         end
         # The type-argument form ignores detection.
@@ -330,10 +327,10 @@ end
         :avx512, :x86_64, "cascadelake", 64, 32, CacheLevel(32KiB, 8, 64, 2),
         CacheLevel(1MiB, 16, 64, 2), CacheLevel(25952256, 11, 64, 16)
     )
-    @test _modelled_blocking(rome, Float64, 8, 6) === Blocking(96, 341, 1728)
-    @test _modelled_blocking(rome, Float32, 16, 6) === Blocking(96, 682, 1728)
+    @test _modelled_blocking(rome, Float64, 8, 6) === Blocking(128, 256, 2304)
+    @test _modelled_blocking(rome, Float32, 16, 6) === Blocking(128, 512, 2304)
     # SMT siblings share one core's slice, so this is 1 MiB + 24.75/8 MiB.
-    @test _modelled_blocking(clx, Float64, 16, 6) === Blocking(192, 341, 1572)
+    @test _modelled_blocking(clx, Float64, 16, 6) === Blocking(256, 256, 2094)
     # The two-argument form uses the derived real shape.
     @test _modelled_blocking(rome, Float64) === _modelled_blocking(rome, Float64, 8, 6)
     for p in (rome, clx), T in (Float64, Float32)
@@ -347,7 +344,7 @@ end
         :neon, :aarch64, "", 16, 32, CacheLevel(64KiB, 4, 64, 1),
         CacheLevel(4MiB, 16, 64, 4), CacheLevel()
     )
-    @test _modelled_blocking(nol3, Float64, 4, 6).nc == (1MiB ÷ (682 * 8)) ÷ 6 * 6
+    @test _modelled_blocking(nol3, Float64, 4, 6).nc == (1MiB ÷ (341 * 8)) ÷ 6 * 6
     # Tiny caches still give a valid Blocking (every field >= its floor).
     tiny = TargetProfile(
         :avx2, :x86_64, "", 32, 16, CacheLevel(64, 1, 64, 1),
@@ -360,8 +357,22 @@ end
         TargetProfile(:avx2, :x86_64, "", 32, 16, CacheLevel(32KiB, 8, 64, 1), CacheLevel(), CacheLevel()),
         Float64, 8, 6
     ) === nothing
-    @test _model_applies(Val(:avx2))
-    @test !_model_applies(Val(:avx512)) && !_model_applies(Val(:neon)) && !_model_applies(Val(:unknown))
+    # Associativity undetected (macOS): half of L1 for the B sliver.
+    noways = TargetProfile(
+        :neon, :aarch64, "", 16, 32, CacheLevel(128KiB, 0, 128, 1),
+        CacheLevel(12MiB, 0, 128, 4), CacheLevel()
+    )
+    @test _modelled_blocking(noways, Float64, 8, 6).kc == 64KiB ÷ 48
+    # Equal K blocks under a default kc.
+    @test _balanced_kc(341, 512) == 256
+    @test _balanced_kc(256, 512) == 256
+    @test _balanced_kc(426, 1000) == 334
+    @test _balanced_kc(512, 100) == 100
+    for kc in (1, 7, 64, 341), Qk in (1, 5, 100, 512, 1000)
+        b = _balanced_kc(kc, Qk)
+        @test 1 <= b <= min(kc, Qk)
+        @test cld(Qk, b) <= cld(Qk, kc)       # never more blocks than plain kc
+    end
 end
 
 @testset "complex blocking derives from the measured real row, never a new table" begin
@@ -381,10 +392,10 @@ end
         @test onem.nc === planar.nc
         @test planar.mc * a_reals(PlanarMethod()) === onem.mc * a_reals(OneMMethod())
     end
-    # Worked example: the AVX-512 rows for real and both complex methods.
-    @test default_blocking(Val(:avx512), Float64) === Blocking(128, 256, 768)
-    @test default_blocking(Val(:avx512), ComplexF64, PlanarMethod()) === Blocking(64, 256, 384)
-    @test default_blocking(Val(:avx512), ComplexF64, OneMMethod()) === Blocking(32, 256, 384)
+    # Worked example: the fallback rows for real and both complex methods.
+    @test _fallback_blocking(Float64) === Blocking(128, 256, 768)
+    @test _fallback_blocking(ComplexF64, PlanarMethod()) === Blocking(64, 256, 384)
+    @test _fallback_blocking(ComplexF64, OneMMethod()) === Blocking(32, 256, 384)
     # `RealMethod` reaches the same real rows as the two-argument form.
     for key in VALID_ISAS, T in (Float64, Float32)
         @test default_blocking(Val(key), T, RealMethod()) === default_blocking(Val(key), T)
@@ -392,12 +403,12 @@ end
     end
     # A direct `_fallback_blocking` call degrades through the same formula rather
     # than throwing a MethodError.
-    @test _fallback_blocking(ComplexF64) === Blocking(32, 128, 384)
-    @test _fallback_blocking(ComplexF64, OneMMethod()) === Blocking(16, 128, 384)
-    @test _fallback_blocking(ComplexF32) === Blocking(48, 384, 576)
+    @test _fallback_blocking(ComplexF64) === Blocking(64, 256, 384)
+    @test _fallback_blocking(ComplexF64, OneMMethod()) === Blocking(32, 256, 384)
+    @test _fallback_blocking(ComplexF32) === Blocking(48, 768, 576)
     # The real rows.
-    @test _fallback_blocking(Float64) === Blocking(64, 128, 768)
-    @test _fallback_blocking(Float32) === Blocking(96, 384, 1152)
+    @test _fallback_blocking(Float64) === Blocking(128, 256, 768)
+    @test _fallback_blocking(Float32) === Blocking(96, 768, 1152)
 end
 
 @testset "the complex kernel constructor is an explicit, single seam" begin

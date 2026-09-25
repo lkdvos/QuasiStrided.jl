@@ -5,9 +5,13 @@
 # Times `execute!` at the engine's own real SIMD kernel (`_default_kernel(T)`)
 # over, per real dtype:
 #
-#   * named points: the analytical model (`_modelled_blocking`), the shipped
-#     fallback row (`_fallback_blocking`), and the AVX-512 measured row --
-#     whatever ISA this host is;
+#   * named points: the analytical model (`_modelled_blocking`), the same model
+#     with `kc` from half of L1 instead of L1 associativity (`halfL1`), the
+#     fallback row (`_fallback_blocking`) and the previous fallback
+#     (`oldfallback`, the pre-2026-09-25 constants); the two model rows also
+#     with K split into equal blocks per shape (`*_bal`, what `plan_contract`
+#     does to a default `kc`), including on `KSHAPES`, whose K extents are
+#     not powers of two;
 #   * `orig`: bench_driver.jl's 36-point grid, the grid behind
 #     `default_blocking`'s "9%/11% best-to-worst" figure;
 #   * `wide`: a log-spaced factorial, wide enough that model variants can be
@@ -16,8 +20,8 @@
 #     factors on a 2048x256x2048 shape, the only one large enough for `nc`
 #     to bind.
 #
-# and, for the complex dtypes, the three named rows scaled by
-# `_scale_blocking` at the default planar kernel.
+# and, for the complex dtypes, the named rows scaled by `_scale_blocking` at
+# the default planar kernel.
 #
 # Every configuration of one shape is timed back to back, 21 reps, median,
 # with the start/middle/end canary bracket. Ranking is harness.jl's `rank_by`:
@@ -31,8 +35,8 @@
 
 include(joinpath(@__DIR__, "harness.jl"))
 
-using QuasiStrided: Blocking, target_profile, _default_kernel, _modelled_blocking,
-    _fallback_blocking, default_blocking, _scale_blocking, complex_method
+using QuasiStrided: Blocking, TargetProfile, CacheLevel, target_profile, _default_kernel,
+    _modelled_blocking, _fallback_blocking, _scale_blocking, _balanced_kc, complex_method
 
 const SMOKE = hasflag("smoke")  # 1 rep, a few points: checks the script runs
 const REPS = SMOKE ? 1 : 21
@@ -41,6 +45,12 @@ thin(v) = SMOKE ? v[1:min(end, 3)] : v
 
 const GRID_SHAPES = vcat(MAIN_SHAPES, EXTRA_SHAPES, SMALL_SHAPES)
 const BIG_SHAPE = ShapeSpec("2048x256x2048", 2048, 256, 2048)
+# K extents that no power-of-two `kc` divides, where equal K blocks matter.
+const KSHAPES = [
+    ShapeSpec("512x768x512", 512, 768, 512),
+    ShapeSpec("256x1000x256", 256, 1000, 256),
+    ShapeSpec("384x600x384", 384, 600, 384),
+]
 
 const ORIG = Dict(
     Float64 => full_grid((64, 128, 256, 512), (128, 256, 512), (768, 1536, 3072)),
@@ -66,11 +76,35 @@ const SUMMARY_PATH = joinpath(OUTDIR, "summary.txt")
 const PROV_PATH = joinpath(OUTDIR, "PROVENANCE.txt")
 
 tup(b::Blocking) = (b.mc, b.kc, b.nc)
+
+# `PROFILE` with L1 associativity hidden, so the model takes half of L1 for
+# the B sliver (its rule when `ways` is undetected, and its rule on every
+# host before 2026-09-25).
+const HALF_L1 = let p = PROFILE, l = p.l1d
+    TargetProfile(
+        p.isa, p.arch, p.cpu_name, p.vector_bytes, p.nregisters,
+        CacheLevel(l.bytes, 0, l.line, l.sharing), p.l2, p.l3
+    )
+end
+
 named_rows(::Type{T}) where {T <: Real} = (
     model = _modelled_blocking(PROFILE, T),
+    halfL1 = _modelled_blocking(HALF_L1, T),
     fallback = _fallback_blocking(T),
-    avx512row = default_blocking(Val(:avx512), T),
+    oldfallback = T === Float64 ? Blocking(64, 128, 768) : Blocking(96, 384, 1152),
 )
+
+# The named rows as (set, combo) at one shape, plus the model rows with K
+# split into equal blocks at this shape's K extent.
+function named_points(rows, spec)
+    pts = [(string(k), tup(v)) for (k, v) in pairs(rows) if v !== nothing]
+    for k in (:model, :halfL1)
+        v = rows[k]
+        v === nothing && continue
+        push!(pts, (string(k, "_bal"), (v.mc, _balanced_kc(v.kc, spec.Ka), v.nc)))
+    end
+    return pts
+end
 
 csv = open(CSV_PATH, "w")
 println(csv, "set,kernel,dtype,shape,Ma,Ka,Na,mc,kc,nc,mc_eff,kc_eff,nc_eff,reps,median_seconds,gflops")
@@ -114,17 +148,17 @@ function main()
         rows = named_rows(T)
         println("\n$T kernel $(mr(kernel))x$(nr(kernel))/W$(lanewidth(kernel))  ", rows)
         rows.model === nothing && @warn "no cache geometry detected: model undefined"
-        named = [(string(k), tup(v)) for (k, v) in pairs(rows) if v !== nothing]
-        points = vcat(
-            named, [("orig", c) for c in thin(ORIG[T])], [("wide", c) for c in thin(WIDE[T])]
-        )
+        grid = vcat([("orig", c) for c in thin(ORIG[T])], [("wide", c) for c in thin(WIDE[T])])
         for spec in thin(GRID_SHAPES)
-            sweep_shape!(raw, "SIMDKernel", kernel, T, spec, points)
+            sweep_shape!(raw, "SIMDKernel", kernel, T, spec, vcat(named_points(rows, spec), grid))
             println("  $T $(spec.name) done")
+        end
+        for spec in KSHAPES
+            sweep_shape!(raw, "SIMDKernel", kernel, T, spec, named_points(rows, spec))
         end
         m = something(rows.model, rows.fallback)
         slices = vcat(
-            named,
+            named_points(rows, BIG_SHAPE),
             [("nslice", (m.mc, m.kc, n)) for n in NSLICE],
             [("mslice", (x, m.kc, m.nc)) for x in MSLICE],
         )
@@ -142,13 +176,10 @@ function main()
     for T in CDTYPES
         kernel = _default_kernel(T)
         meth = complex_method(kernel)
-        rows = named_rows(real(T))
-        named = [
-            (string(k), tup(_scale_blocking(v, meth))) for (k, v) in pairs(rows) if v !== nothing
-        ]
-        println("\n$T kernel $(mr(kernel))x$(nr(kernel))/W$(lanewidth(kernel))  ", named)
-        for spec in MAIN_SHAPES
-            sweep_shape!(raw, "PlanarKernel", kernel, T, spec, named)
+        rows = map(v -> v === nothing ? nothing : _scale_blocking(v, meth), named_rows(real(T)))
+        println("\n$T kernel $(mr(kernel))x$(nr(kernel))/W$(lanewidth(kernel))  ", rows)
+        for spec in vcat(MAIN_SHAPES, KSHAPES)
+            sweep_shape!(raw, "PlanarKernel", kernel, T, spec, named_points(rows, spec))
         end
     end
     push!(canaries, run_canary(crng, "end"))
@@ -190,28 +221,28 @@ function rank_sets(raw, T, sets, shapes; kernels = ("SIMDKernel",))
     return sort([(k, geomean(v)) for (k, v) in g]; by = last)
 end
 
-# Geomean over `shapes` of `combo`'s time normalized by the best time at each
-# shape over every configuration measured there (all sets); a combo measured
-# in several sets contributes the mean of its repeats at a shape.
-function score(raw, T, combo, shapes)
-    rows = filter(r -> r.dtype == T && r.kernel != "ScalarKernel" && r.shape in shapes, raw)
+# Geomean over `shapes` of set `set`'s time, each normalized by the best time
+# any configuration of any set reached at that shape (per dtype and kernel).
+function score_set(raw, T, set, shapes; kernel = r -> r.kernel != "ScalarKernel")
+    rows = filter(r -> r.dtype == T && kernel(r) && r.shape in shapes, raw)
     best = Dict{String, Float64}()
-    mine = Dict{String, Vector{Float64}}()
     for r in rows
         best[r.shape] = min(get(best, r.shape, Inf), r.t)
-        (r.mc, r.kc, r.nc) == combo && push!(get!(mine, r.shape, Float64[]), r.t)
     end
-    isempty(mine) && return NaN
-    return geomean([sum(ts) / length(ts) / best[s] for (s, ts) in mine])
+    mine = [r.t / best[r.shape] for r in rows if r.set == set]
+    return isempty(mine) ? NaN : geomean(mine)
 end
+
+const NAMED_SETS = ("model", "model_bal", "halfL1", "halfL1_bal", "fallback", "oldfallback")
 
 function summarize(io, raw)
     main_names = [s.name for s in MAIN_SHAPES]
     grid_names = [s.name for s in GRID_SHAPES]
+    k_names = [s.name for s in KSHAPES]
     println(io, "\n# host ", gethostname(), "  cpu ", Sys.CPU_NAME, "  isa ", PROFILE.isa)
     for T in DTYPES
         rows = named_rows(T)
-        println(io, "\n## $T")
+        println(io, "\n## $T   ", rows)
         o = rank_sets(raw, T, ("orig",), main_names)
         @printf(io, "orig 36-grid, MAIN_SHAPES, SIMD only: best %.4f %s  worst %.4f %s  spread %.1f%%\n",
             o[1][2], o[1][1], o[end][2], o[end][1], 100 * (o[end][2] / o[1][2] - 1))
@@ -220,17 +251,16 @@ function summarize(io, raw)
             @printf(io, "orig 36-grid, MAIN_SHAPES, SIMD+Scalar jointly (the 9%%/11%% method): spread %.1f%%\n",
                 100 * (os[end][2] / os[1][2] - 1))
         end
-        w = rank_sets(raw, T, ("wide", "orig", "model", "fallback", "avx512row"), grid_names)
-        @printf(io, "all grid points, GRID_SHAPES: best %.4f %s  worst %.4f %s  spread %.1f%%\n",
+        w = rank_sets(raw, T, ("wide", "orig"), grid_names)
+        @printf(io, "grid points, GRID_SHAPES: best %.4f %s  worst %.4f %s  spread %.1f%%\n",
             w[1][2], w[1][1], w[end][2], w[end][1], 100 * (w[end][2] / w[1][2] - 1))
         within(tol) = count(x -> x[2] <= w[1][2] * (1 + tol), w)
         println(io, "points within 3%/6%/10% of best: ", within(0.03), "/", within(0.06), "/", within(0.10), " of ", length(w))
         println(io, "top 5: ", w[1:min(5, end)])
-        for (k, v) in pairs(rows)
-            v === nothing && continue
-            @printf(io, "  %-10s %-18s GRID_SHAPES %.4f   MAIN_SHAPES %.4f   big %.4f\n", k, tup(v),
-                score(raw, T, tup(v), grid_names), score(raw, T, tup(v), main_names),
-                score(raw, T, tup(v), [BIG_SHAPE.name]))
+        @printf(io, "  %-12s %12s %12s %12s\n", "set", "GRID_SHAPES", "KSHAPES", "big")
+        for set in NAMED_SETS
+            @printf(io, "  %-12s %12.4f %12.4f %12.4f\n", set, score_set(raw, T, set, grid_names),
+                score_set(raw, T, set, k_names), score_set(raw, T, set, [BIG_SHAPE.name]))
         end
         for s in ("nslice", "mslice")
             pts = sort([r for r in raw if r.dtype == T && r.set == s]; by = r -> s == "nslice" ? r.nc : r.mc)
@@ -241,16 +271,9 @@ function summarize(io, raw)
     end
     for T in CDTYPES
         println(io, "\n## $T (planar default kernel, scaled rows)")
-        rows = filter(r -> r.dtype == T, raw)
-        isempty(rows) && continue
-        best = Dict{String, Float64}()
-        for r in rows
-            best[r.shape] = min(get(best, r.shape, Inf), r.t)
-        end
-        for set in unique(r.set for r in rows)
-            v = [r.t / best[r.shape] for r in rows if r.set == set]
-            c = first(r for r in rows if r.set == set)
-            @printf(io, "  %-10s %-18s MAIN_SHAPES %.4f\n", set, (c.mc, c.kc, c.nc), geomean(v))
+        @printf(io, "  %-12s %12s %12s\n", "set", "MAIN_SHAPES", "KSHAPES")
+        for set in NAMED_SETS
+            @printf(io, "  %-12s %12.4f %12.4f\n", set, score_set(raw, T, set, main_names), score_set(raw, T, set, k_names))
         end
     end
     return nothing

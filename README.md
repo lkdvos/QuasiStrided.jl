@@ -182,8 +182,8 @@ The package implements:
 - einsum string parsing; batch axes, diagonals, or isolated reductions; a
   separate beta-addend tensor; autotuning across shapes; runtime cache
   probing (no benchmark ever runs at load or first call; `mc`/`kc`/`nc` are
-  measured constants, except on AVX2, where an analytical model of the
-  sysfs-detected cache geometry picks them -- see `default_blocking`); threading; GPU execution; K padding.
+  picked by an analytical model of the sysfs/sysctl-detected cache geometry,
+  with fixed constants only where that is undetected -- see `default_blocking`); threading; GPU execution; K padding.
 - On the complex side specifically: the **3m** (Karatsuba) method; **mixed
   real/complex operands** (promotion belongs in TensorOperations'
   `promote_contract` layer, not here); writing into a **conjugated output**

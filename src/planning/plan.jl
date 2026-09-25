@@ -90,7 +90,8 @@ factors (see [`Blocking`](@ref)); a `nothing` keyword takes the corresponding
 field of `default_blocking(kernel)`. Each must be `>= 1`, and is then rounded
 and clamped into the *effective* blocking stored on the plan: `mc`/`nc` round
 up to a whole `mr(kernel)`/`nr(kernel)` multiple, then cap at the M/N extent
-(likewise rounded up); `kc` caps at the K extent. Throws
+(likewise rounded up); `kc` caps at the K extent, and a default `kc` is
+further lowered so K splits into equal blocks. Throws
 `ArgumentError`/`DimensionMismatch` on invalid input.
 
 Buffers:
@@ -247,7 +248,9 @@ function _plan_contract(
     # well-formed.
     mc_eff = Qm == 0 ? MRk : min(mc_rounded, _roundup(Qm, MRk))
     nc_eff = Qn == 0 ? NRk : min(nc_rounded, _roundup(Qn, NRk))
-    kc_eff = Qk == 0 ? 1 : min(requested.kc, Qk)
+    # A default `kc` is a model's bound, so K is split into equal blocks under
+    # it (`_balanced_kc`); an explicit one is honoured exactly.
+    kc_eff = Qk == 0 ? 1 : kc === nothing ? _balanced_kc(requested.kc, Qk) : min(requested.kc, Qk)
 
     blocking = Blocking(mc_eff, kc_eff, nc_eff)
 

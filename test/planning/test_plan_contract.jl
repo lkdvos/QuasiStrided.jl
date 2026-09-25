@@ -73,6 +73,21 @@ end
     @test plan.blocking.nc == 9   # NR=3: roundup(8,3)=9, requested 100 clamped down to that
 end
 
+@testset "plan_contract: a default kc splits K into equal blocks, an explicit one does not" begin
+    kernel = ScalarKernel(Val(4), Val(3), Float64)
+    kc0 = default_blocking(kernel).kc
+    Qk = kc0 + 3                 # plain kc0 would leave a 3-deep tail block
+    Amat, Bmat, Cmat = randn(8, Qk), randn(Qk, 6), zeros(8, 6)
+    @test _mm_plan(Cmat, Amat, Bmat; kernel = kernel).blocking.kc == cld(Qk, 2)
+    @test _mm_plan(Cmat, Amat, Bmat; kernel = kernel, kc = kc0).blocking.kc == kc0
+    # And the result is the same either way.
+    C1, C2 = zeros(8, 6), zeros(8, 6)
+    QuasiStrided.execute!(_mm_plan(C1, Amat, Bmat; kernel = kernel), 1.0, 0.0)
+    QuasiStrided.execute!(_mm_plan(C2, Amat, Bmat; kernel = kernel, kc = kc0), 1.0, 0.0)
+    @test C1 ≈ Amat * Bmat
+    @test C2 ≈ Amat * Bmat
+end
+
 
 # =====================================================================
 # Conjugation plumbing: the predicates themselves, that the real path is
