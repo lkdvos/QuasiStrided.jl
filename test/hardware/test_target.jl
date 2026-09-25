@@ -36,7 +36,14 @@ using QuasiStrided: TargetProfile, CacheLevel, target_profile, cache_topology,
         @test probe in (:avx512, :avx2, :unknown)
         if Sys.ARCH === :x86_64
             table = get(QuasiStrided._UARCH_ISA, Sys.CPU_NAME, :miss)
-            (table === :miss || probe === :unknown) || @test probe === table
+            # A hypervisor can mask CPUID features down from what the named
+            # microarchitecture nominally supports without renaming the CPU
+            # (observed on a GitHub Actions runner: an AVX-512-listed name,
+            # AVX2-only live probe) -- `_detect_isa` itself now defers to the
+            # narrower of the two (src/hardware/target.jl), so only a probe
+            # reporting something WIDER than the table is a real table bug.
+            (table === :miss || probe === :unknown) ||
+                @test QuasiStrided._isa_rank(probe) <= QuasiStrided._isa_rank(table)
             # Base's CPUID submodule is undocumented: if these names move,
             # `_isa_from_cpuid` silently returns :unknown and every unlisted
             # x86 CPU quietly loses the derived shape. Fail loudly instead.

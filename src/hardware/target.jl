@@ -73,10 +73,27 @@ function _isa_from_cpuid()
     end
 end
 
+# Capability ordering, narrowest first: used to reconcile the name table
+# against the live CPUID probe below.
+_isa_rank(k::Symbol) = k === :avx512 ? 2 : k === :avx2 ? 1 : 0
+
 function _detect_isa()
     if Sys.ARCH === :x86_64 || Sys.ARCH === :i686
         key = get(_UARCH_ISA, Sys.CPU_NAME, :miss)
-        return key === :miss ? _isa_from_cpuid() : key
+        key === :miss && return _isa_from_cpuid()
+        # The table names a microarchitecture's nominal capability, but a
+        # hypervisor can mask CPUID features down from what the silicon
+        # actually supports without changing the reported CPU name (observed
+        # on a GitHub Actions runner: `Sys.CPU_NAME` matched an AVX-512
+        # microarchitecture while the live CPUID probe read AVX2 only).
+        # Trusting the table there would select AVX-512 codegen that SIGILLs
+        # on the masked host, so the live probe wins whenever it reports a
+        # narrower ISA; an unavailable probe (`:unknown`, e.g. the CPUID
+        # submodule moved) falls back to the table, since that carries no
+        # evidence the table is wrong.
+        probe = _isa_from_cpuid()
+        probe === :unknown && return key
+        return _isa_rank(probe) < _isa_rank(key) ? probe : key
     elseif Sys.ARCH === :aarch64
         # 128-bit NEON is baseline. SVE is deliberately not detected: its
         # vector length is runtime-variable, which a fixed SIMDKernel shape
