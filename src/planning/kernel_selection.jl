@@ -44,16 +44,28 @@ _fallback_shape(::Type{T}) where {T} = (8, NR_DEFAULT, _default_lanewidth(real(T
 # width the package compiles, so that `_fitted_shape` finds a fitting entry for
 # any (lane count, register budget >= 16) pair. They are unmeasured and are not
 # claimed to be good, only to fit.
+#
+# 2026-09-25: each 1m menu's LAST entry is its AVX2-native ("MR = 2W") rule
+# shape, added because both menus previously held AVX-512-only (W=8/W=16)
+# shapes -- 1m had never been measured on AVX2 hardware at a correctly-sized
+# shape. Derived the same way as the AVX-512 entry (real-MR/2 at the real
+# kernel's own AVX2 rule shape): `KERNEL_SHAPES_F64`'s AVX2 shape is
+# `(8,6,4)` -> 1m `(4,6,4)`; `KERNEL_SHAPES_F32`'s AVX2 shape is `(16,6,8)` ->
+# 1m `(8,6,8)`. Measured, job 7107477: `(4,6,4)` is the new ComplexF64 AVX2
+# winner outright (see the AVX2 override block below); `(8,6,8)` is
+# ComplexF32's best 1m shape but does not beat planar there, so it stays
+# menu-only (reachable via an explicit `kernel = OneMMethod()`, never picked
+# automatically).
 const KERNEL_SHAPES_F64 = ((8, 6, 4), (16, 6, 8))
 const KERNEL_SHAPES_F32 = ((8, 6, 8), (32, 6, 16), (16, 6, 8))
 const KERNEL_SHAPES_C64_PLANAR = (
     (24, 3, 8), (16, 6, 8), (8, 8, 8), (4, 5, 4), (4, 6, 2), (2, 6, 2),
 )
-const KERNEL_SHAPES_C64_ONEM = ((12, 8, 8), (16, 6, 8), (8, 8, 8))
+const KERNEL_SHAPES_C64_ONEM = ((12, 8, 8), (16, 6, 8), (8, 8, 8), (4, 6, 4))
 const KERNEL_SHAPES_C32_PLANAR = (
     (48, 3, 16), (32, 6, 16), (16, 8, 16), (8, 5, 8), (8, 6, 4), (4, 6, 4),
 )
-const KERNEL_SHAPES_C32_ONEM = ((24, 8, 16), (32, 6, 16), (16, 8, 16))
+const KERNEL_SHAPES_C32_ONEM = ((24, 8, 16), (32, 6, 16), (16, 8, 16), (8, 6, 8))
 
 """
     kernel_shapes(T, method::ComplexMethod = _default_method(T)) -> NTuple{<:Any,NTuple{3,Int}}
@@ -143,16 +155,36 @@ _shape_override(::Val{:neon}, ::Type{ComplexF32}, ::PlanarMethod) = (8, 6, 4)
 
 # AVX2, measured: `benchmark/bench_complex_efficiency.jl` arm 2 on a Rome
 # (znver2) node (2026-09-24, job 7102205) ranks every menu shape for both
-# planar and 1m; `(4, 5, 4)` wins ComplexF64 outright (next best, 1m `8x8/W8`,
-# is 1.397x slower) and `(8, 5, 8)` wins ComplexF32 outright (next best, 1m
-# `16x8/W16`, is 1.476x slower) -- confirming the register-budget reasoning
-# these rows originally shipped with (at `MV = 1`, `NR = 6` costs all 16 of
-# AVX2's vector registers (`2*6 + 2 + 2`), leaving none for address
-# arithmetic, while `NR = 5` costs 14). No larger menu shape closes the gap to
-# StridedBLAS on this ISA -- that gap is a throughput ceiling, not a
-# shape-selection miss.
+# planar and 1m; at the time, `(4, 5, 4)` won ComplexF64 outright (next best,
+# 1m `8x8/W8`, was 1.397x slower) and `(8, 5, 8)` won ComplexF32 outright
+# (next best, 1m `16x8/W16`, was 1.476x slower) -- confirming the
+# register-budget reasoning these rows originally shipped with (at `MV = 1`,
+# `NR = 6` costs all 16 of AVX2's vector registers (`2*6 + 2 + 2`), leaving
+# none for address arithmetic, while `NR = 5` costs 14). Neither 1m entry
+# available at the time was AVX2-native (both were AVX-512-sized, `W = 8`),
+# so this did not yet measure 1m at a correctly-sized AVX2 shape.
+#
+# 2026-09-25, job 7107477 (same node class, canary spread 1.3%): with the
+# AVX2-native 1m shapes `(4, 6, 4)`/`(8, 6, 8)` added to the menus (see the
+# menu comment above), 1m `4x6/W4` WINS ComplexF64 outright, 6.3% faster than
+# planar `4x5/W4` (the prior champion; geomean 32.95 vs 30.98 GF/s) --
+# 1m sidesteps the planar broadcast:FMA problem at `MV = 1` entirely by
+# reusing the real kernel's `accumulate`, which needs no scalar-to-vector
+# broadcast at all. ComplexF32 does NOT flip: 1m `8x6/W8` (53.55 GF/s) is
+# 4.3% slower than planar `8x5/W8` (54.81 GF/s, still champion) -- so the
+# override below is added for ComplexF64 only; ComplexF32 keeps its planar
+# override unchanged.
 _shape_override(::Val{:avx2}, ::Type{ComplexF64}, ::PlanarMethod) = (4, 5, 4)
 _shape_override(::Val{:avx2}, ::Type{ComplexF32}, ::PlanarMethod) = (8, 5, 8)
+
+# AVX2, measured, job 7107477 (2026-09-25, see above): `(4, 6, 4)` is the
+# correctly AVX2-sized 1m shape and the outright ComplexF64 AVX2 winner
+# across both methods. Pinned here (not left to `_fitted_shape`, which would
+# still hand 1m the AVX-512-sized `(12, 8, 8)` on AVX2) so a caller who
+# explicitly opts into `kernel = OneMMethod()` gets it. This does not change
+# automatic dispatch: `_default_method` still returns `PlanarMethod()` for
+# complex `T`, so nothing selects 1m unless the caller names it.
+_shape_override(::Val{:avx2}, ::Type{ComplexF64}, ::OneMMethod) = (4, 6, 4)
 
 # Where the `MR = 2W` rule is validated. Real: AVX-512 and AVX2 (on NEON it
 # would pick MR = 4 on 128-bit lanes, not obviously better than the fallback).

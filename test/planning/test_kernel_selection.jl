@@ -298,11 +298,13 @@ end
     end
     # Menus stay bounded so the compiled specialization set does. Planar's is
     # six: three measured AVX-512 shapes plus one `MV = 1` entry per lane width
-    # for `_fitted_shape` to land on off `:avx512`. 1m's is three --
-    # it is never selected automatically, so it needs no fitted entries.
+    # for `_fitted_shape` to land on off `:avx512`. 1m's is four -- three
+    # AVX-512 shapes plus its AVX2-native rule shape (2026-09-25, job
+    # 7107477); it is never selected automatically, so it needs no fitted
+    # entries beyond that.
     for T in (ComplexF64, ComplexF32)
         @test length(kernel_shapes(T, PlanarMethod())) <= 6
-        @test length(kernel_shapes(T, OneMMethod())) <= 3
+        @test length(kernel_shapes(T, OneMMethod())) <= 4
     end
     # `RealMethod` forwards to the one-argument form.
     for T in (Float64, Float32)

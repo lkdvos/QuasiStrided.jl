@@ -13,11 +13,13 @@
 #
 # Adjust --partition/--time/--mem below for your cluster (Rusty/Popeye) and
 # account as needed; see https://wiki.flatironinstitute.org/SCC/Software/Slurm.
-# NOTE: this only measures whatever ISA the allocated node actually has --
-# check the job's PROVENANCE/env header for `cpu =` before trusting an AVX2
-# conclusion from it; resubmit if Slurm lands it on an AVX-512 node instead.
+# Pinned to `--constraint=rome`: this script's whole point is an AVX2-only
+# (no AVX-512) measurement, and ccq's rome (AMD Rome/znver2) nodes are the
+# only AVX2-only microarchitecture on this cluster -- still check the job's
+# PROVENANCE/env header for `cpu = znver2` before trusting the result.
 #SBATCH --job-name=qs-complex-efficiency
 #SBATCH --partition=ccq
+#SBATCH --constraint=rome
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1

@@ -117,9 +117,11 @@ const _QS = QuasiStrided
         return out
     end
 
-    # 1m's shape menus (src/execution/execute.jl), plus a small shape for cheap exercises.
-    MENU64 = ((12, 8, 8), (16, 6, 8), (8, 8, 8))
-    MENU32 = ((24, 8, 16), (32, 6, 16), (16, 8, 16))
+    # 1m's shape menus (src/planning/kernel_selection.jl), plus a small shape
+    # for cheap exercises. Last entry of each is the AVX2-native rule shape
+    # (2026-09-25, job 7107477).
+    MENU64 = ((12, 8, 8), (16, 6, 8), (8, 8, 8), (4, 6, 4))
+    MENU32 = ((24, 8, 16), (32, 6, 16), (16, 8, 16), (8, 6, 8))
     SMALL = (8, 4, 4)
 
     ALL64 = (MENU64..., SMALL)
