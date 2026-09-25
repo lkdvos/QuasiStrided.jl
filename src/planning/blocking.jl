@@ -71,6 +71,43 @@ default_blocking(::Val, ::Type{T}) where {T} = _fallback_blocking(T)
 default_blocking(::Val{:avx512}, ::Type{Float64}) = Blocking(128, 256, 768)
 default_blocking(::Val{:avx512}, ::Type{Float32}) = Blocking(96, 768, 1152)
 
+# --- analytical real row, from the detected cache geometry -------------------
+#
+# Byte accounting of `_execute_nest!` (src/execution/execute.jl): per (jc, pc)
+# the packed B panel is `nc*kc` elements, per (jc, pc, ic) the packed A block is
+# `mc*kc`, and loop 2 (jr) is outside loop 1 (ir), so one `NR x kc` B sliver is
+# reused by every A sliver of the block while those stream past it. Hence
+#
+#     NR*kc*S  <= L1/2          the reused B sliver, half of L1
+#     mc*kc*S  <= L2core/2      the A block, reused by every B sliver
+#     nc*kc*S  <= LLCcore/2     the B panel, reused by every A block
+#
+# with `S = sizeof(T)`, rounded down to MR/NR multiples. Shared levels are
+# divided by the cores sharing them (`sharing ÷ l1d.sharing`, L1d being private
+# to one core's SMT siblings): on a shared node a single-threaded contraction
+# cannot count on another core's slice. With no L3, the L2 is the last level.
+# Real rows only; complex rows go through `_scale_blocking` as for every other
+# row. `nothing` when a needed cache size is undetected.
+function _modelled_blocking(profile::TargetProfile, ::Type{T}, MR::Int, NR::Int) where {T}
+    l1, l2, l3 = profile.l1d, profile.l2, profile.l3
+    (l1.bytes > 0 && l2.bytes > 0) || return nothing
+    smt = max(1, l1.sharing)
+    core_share(c) = c.bytes ÷ max(1, c.sharing ÷ smt)
+    l2core = core_share(l2)
+    llc = l3.bytes > 0 ? core_share(l3) : l2core
+    S = sizeof(T)
+    kc = max(1, (l1.bytes ÷ 2) ÷ (NR * S))
+    mc = max(MR, ((l2core ÷ 2) ÷ (kc * S)) ÷ MR * MR)
+    nc = max(NR, ((llc ÷ 2) ÷ (kc * S)) ÷ NR * NR)
+    return Blocking(mc, kc, nc)
+end
+
+# At the real kernel shape the engine derives for `T` on `profile`.
+function _modelled_blocking(profile::TargetProfile, ::Type{T}) where {T <: Real}
+    MR, NR, _ = _derived_shape(profile, T)
+    return _modelled_blocking(profile, T, MR, NR)
+end
+
 # For a bare scalar type: the fallback row, independent of the host.
 default_blocking(::Type{Float64}) = _fallback_blocking(Float64)
 default_blocking(::Type{Float32}) = _fallback_blocking(Float32)
