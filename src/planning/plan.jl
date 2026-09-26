@@ -69,7 +69,8 @@ hardware-derived shape; for a complex one a [`PlanarKernel`](@ref) at the
 measured shape on AVX-512, and at a shape fitted to the register file
 elsewhere (see src/planning/kernel_selection.jl). Pass `kernel` explicitly to
 override. [`OneMKernel`](@ref) is never selected automatically; naming it is
-the only way to use 1m.
+the only way to use 1m. On AVX-512 a complex `Qm` below the planar tile's `MR`
+demotes to an [`FMAddSubKernel`](@ref) instead (`_small_m_shape`).
 
 Planning phase of [`contract!`](@ref): resolves labels into M/N/K
 `AxisGroup`s, validates matched axis lengths and eltypes, and preallocates

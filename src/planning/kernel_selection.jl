@@ -14,8 +14,9 @@
 #     explicit override row, else the `MR = 2W` rule where it has been
 #     validated, else a conservative fitted shape (`_fitted_shape`);
 #   * two plan-time demotions: to the fitted shape when M cannot fill one
-#     register tile (`_default_kernel`), and to a menu shape that keeps every
-#     register sliver unit-stride in C (`_demote_for_run`).
+#     register tile (`_default_kernel`; complex on `:avx512` goes to an
+#     FMAddSub shape instead, `_small_m_shape`), and to a menu shape that
+#     keeps every register sliver unit-stride in C (`_demote_for_run`).
 
 # ----------------------------------------------------------------------------
 # Methods, menus and kernel types
@@ -68,7 +69,7 @@ const KERNEL_SHAPES_C32_PLANAR = (
 const KERNEL_SHAPES_C32_ONEM = ((24, 8, 16), (32, 6, 16), (16, 8, 16), (8, 6, 8))
 
 # FMAddSub (src/microkernels/fmaddsub.jl): not the default method, like 1m;
-# selected only by naming the kernel.
+# auto-selected only by the AVX-512 small-M demotion (`_small_m_shape`).
 # Its accumulator has 1m's layout and count, so the menus START from 1m's
 # shapes (a same-shape head-to-head isolates the A-format/swap trade), plus the
 # AVX2 `NR = 5` sibling of 1m's AVX2 rule shape, which fits AVX2's 16
@@ -100,7 +101,7 @@ const KERNEL_SHAPES_C32_ONEM = ((24, 8, 16), (32, 6, 16), (16, 8, 16), (8, 6, 8)
 # So: a ~4% AVX2 ComplexF64 win, and nothing elsewhere. Too small, and on one
 # machine, to justify an auto-dispatch rule (see `ComplexMethod`'s docstring);
 # the menus stay reachable by naming `FMAddSubKernel`, and no override row is
-# added.
+# added. The small-M case (2x, not 4%) is the exception: `_small_m_shape`.
 const KERNEL_SHAPES_C64_FMADDSUB = ((12, 8, 8), (8, 8, 8), (4, 6, 4), (4, 5, 4))
 const KERNEL_SHAPES_C32_FMADDSUB = ((24, 8, 16), (16, 8, 16), (8, 6, 8), (8, 5, 8))
 
@@ -340,8 +341,58 @@ _default_kernel(::Type{T}) where {T} = _kernel_for(target_profile(), T)
     profile = target_profile()
     kernel = _kernel_for(profile, T)
     (Qm > 0 && Qm < mr(kernel)) || return kernel
+    small = _small_m_shape(Val(profile.isa), profile, T, Qm)
+    small === nothing || return _kernel_from_shape(small, T, FMAddSubMethod())
     method = _default_method(T)
     return _kernel_from_shape(_fitted_shape(profile, T, method), T, method)
+end
+
+# Small-M demotion target for complex `T` on AVX-512: the native-width
+# (`W == lanes`) FMAddSub menu shape that pads `Qm` least (`cld(Qm, MR) * MR`),
+# ties by the larger `MR * NR` tile; `nothing` (keep the planar fitted shape)
+# everywhere else. Reached only through the demotion above, i.e. when `Qm` is
+# below the planar override's `MR` (24 for ComplexF64, 48 for ComplexF32).
+#
+# Why: the planar fitted shape is the LARGEST fitting tile, `(16,6,8)` /
+# `(32,6,16)` on AVX-512 -- the planar shape measured 38-41% worst there (see
+# the override rows), and at ComplexF32 `Qm = 12` it still pads to 32 rows.
+# Measured 2026-09-25, ccqlin038 (Cascade Lake, `:avx512`), Julia 1.13.0,
+# `benchmark/bench_vs_openblas.jl` (21 reps, default blocking per kernel),
+# GF/s default-before -> FMAddSub at the shape this rule picks [best 1m]:
+#
+#   ComplexF64 12x256x256: planar 16x6/W8 18.1 -> fmaddsub 12x8/W8 37.3 [1m 12x8 36.4]
+#   ComplexF64 16x256x16:  planar 16x6/W8 21.5 -> fmaddsub  8x8/W8 42.1 [1m  8x8 37.9]
+#   ComplexF32 12x256x256: planar 32x6/W16 20.7 -> fmaddsub 16x8/W16 61.7 [1m 16x8 56.4]
+#   ComplexF32 16x256x16:  planar 32x6/W16 20.9 -> fmaddsub 16x8/W16 75.0 [1m 16x8 67.5]
+#
+# (OpenBLAS: 49.1 / 38.6 / 59.2 / 58.9.) The best planar shape at any size in
+# the menu is 28.0 / 32.1 / 42.7 / 58.3, so the method switch, not just a
+# smaller planar tile, is what closes the gap; FMAddSub beats 1m at 3 of 4
+# cells (the fourth ties). Every larger-M shape in the sweep has
+# `Qm >= mr(override)` and never reaches this: an interleaved old/new re-run
+# of the whole sweep (all four dtypes, 3 ABAB rounds, canary spread 3.7%/7.1%)
+# plans the identical kernel at the other 32 cells, and the four above land at
+# 1.52-1.65x (ComplexF64) and 2.35-2.95x (ComplexF32) the old default. The
+# rest of the range this rule covers, probed at `Mx256x256` the same way
+# (canary spread 5.4%): ComplexF64 M = 1, 4, 8, 20, 23 all gain 1.91-1.93x
+# (M >= 24 keeps planar `24x3`); ComplexF32 M = 1, 4, 8, 20, 23, 24, 32, 37,
+# 47 all gain 1.54-2.53x (M = 23..47 reach 80-143% of OpenBLAS, against
+# 45-79% before). Not extended to `:avx2` (where
+# the planar override has `MR = 4`, so demotion needs `Qm < 4`; unmeasured)
+# or to other ISAs.
+_small_m_shape(::Val, ::TargetProfile, ::Type, ::Int) = nothing
+function _small_m_shape(::Val{:avx512}, profile::TargetProfile, ::Type{T}, Qm::Int) where {T <: Complex}
+    lanes = profile.vector_bytes ÷ sizeof(real(T))
+    best = nothing
+    for shape in kernel_shapes(T, FMAddSubMethod())
+        MR, NR, W = shape
+        W == lanes || continue
+        key = (-(cld(Qm, MR) * MR), MR * NR)
+        if best === nothing || key > best[1]
+            best = (key, shape)
+        end
+    end
+    return best === nothing ? nothing : best[2]
 end
 
 # Run-length-aware demotion, applied to whichever operand the M/N swap decision

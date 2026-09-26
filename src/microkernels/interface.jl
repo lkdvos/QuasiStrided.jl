@@ -21,8 +21,11 @@ branch.
 
 **No auto-dispatch rule is derived from any measurement**: the ranking of
 methods differs from machine to machine.
-[`PlanarMethod`](@ref) is the unconditional default; [`OneMMethod`](@ref) and
-[`FMAddSubMethod`](@ref) are selected only by naming the kernel.
+[`PlanarMethod`](@ref) is the default; [`OneMMethod`](@ref) is
+selected only by naming the kernel. One narrow exception: on `:avx512`, when
+M is too small to fill the planar override's register tile, the extent
+demotion picks an [`FMAddSubMethod`](@ref) shape (`_small_m_shape` in
+src/planning/kernel_selection.jl, measured 2x there).
 """
 abstract type ComplexMethod end
 
@@ -62,8 +65,9 @@ Interleaved complex accumulation with x86 `vfmaddsub`: A packed in
 B in [`PlanarFormat`](@ref) (broadcast `re`/`im` scalars), and ONE
 interleaved accumulator plane, updated per (A-vector, B-column) pair by two
 chained fmaddsub ops on `a` and its in-register pair-swap. Same FMA count as
-planar and 1m; see src/microkernels/fmaddsub.jl. Never selected
-automatically; naming [`FMAddSubKernel`](@ref) is the only way to use it.
+planar and 1m; see src/microkernels/fmaddsub.jl. Selected by naming
+[`FMAddSubKernel`](@ref), and automatically only by the AVX-512 small-M
+demotion (`_small_m_shape`, src/planning/kernel_selection.jl).
 """
 struct FMAddSubMethod <: ComplexMethod end
 
