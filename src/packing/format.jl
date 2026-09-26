@@ -54,13 +54,32 @@ proportionally smaller `mc`.
 struct OneEFormat <: PackFormat end
 
 """
+    InterleavedFormat()
+
+Two reals per complex element in `Complex{T}`'s own native order, one
+region per logical K step: `[re_0, im_0, re_1, im_1, ..., re_{n-1}, im_{n-1}]`.
+Operand A under [`FMAddSubMethod`](@ref). Byte for byte the FIRST of
+[`OneEFormat`](@ref)'s two regions, without the second (`[-im, re]`) one: the
+fmaddsub kernel derives that pair-swap in a register instead of reading it
+from memory, so its packed A footprint equals [`PlanarFormat`](@ref)'s, half
+of 1e's.
+
+Like 1e (and unlike planar), it does not fit the "`plane * reg_tile`" shape
+the plane-offset helpers describe: `packed_a_plane_offset(k, 0, i, p)` is
+addressed with `i` running over REALS (`0:2MR-1`), and plane 1 is never used.
+"""
+struct InterleavedFormat <: PackFormat end
+
+"""
     reals_per_element(::PackFormat) -> Int
 
-Reals emitted per source element per *logical* K step: 1, 2 and 4 for
-[`RealFormat`](@ref), [`PlanarFormat`](@ref) and [`OneEFormat`](@ref).
+Reals emitted per source element per *logical* K step: 1, 2, 2 and 4 for
+[`RealFormat`](@ref), [`PlanarFormat`](@ref), [`InterleavedFormat`](@ref) and
+[`OneEFormat`](@ref).
 """
 reals_per_element(::RealFormat) = 1
 reals_per_element(::PlanarFormat) = 2
+reals_per_element(::InterleavedFormat) = 2
 reals_per_element(::OneEFormat) = 4
 
 # ----------------------------------------------------------------------------
@@ -115,7 +134,8 @@ const KernelDescriptor{MR, NR, T} = Descriptor{MR, NR, T, RealFormat, RealFormat
     ComplexKernelDescriptor{MR,NR,T,FA,FB}
 
 The [`Descriptor`](@ref) of a complex kernel: `T ∈ (ComplexF32, ComplexF64)`,
-with [`PlanarFormat`](@ref) or [`OneEFormat`](@ref) panels.
+with [`PlanarFormat`](@ref), [`InterleavedFormat`](@ref) or
+[`OneEFormat`](@ref) panels.
 """
 const ComplexKernelDescriptor{MR, NR, T <: Complex, FA, FB} = Descriptor{MR, NR, T, FA, FB}
 

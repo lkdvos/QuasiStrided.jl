@@ -38,6 +38,7 @@ using QuasiStrided: AxisGroup, axis_length, offsets, fill_offsets!, BlockDescrip
     include("microkernels/test_planar_kernel.jl")
     include("microkernels/test_planar_store_fastpath.jl")
     include("microkernels/test_onem_kernel.jl")
+    include("microkernels/test_fmaddsub_kernel.jl")
 
     include("planning/test_kernel_selection.jl")
     include("planning/test_plan_contract.jl")

@@ -67,6 +67,43 @@ const KERNEL_SHAPES_C32_PLANAR = (
 )
 const KERNEL_SHAPES_C32_ONEM = ((24, 8, 16), (32, 6, 16), (16, 8, 16), (8, 6, 8))
 
+# FMAddSub (src/microkernels/fmaddsub.jl): not the default method, like 1m;
+# selected only by naming the kernel.
+# Its accumulator has 1m's layout and count, so the menus START from 1m's
+# shapes (a same-shape head-to-head isolates the A-format/swap trade), plus the
+# AVX2 `NR = 5` sibling of 1m's AVX2 rule shape, which fits AVX2's 16
+# registers by `fmaddsub_register_pressure` (16) where `NR = 6` (18) does not:
+# `-C znver2` codegen of `(4,6,4)`/`(8,6,8)` spills (25 stores / 22 reloads per
+# K step, Julia 1.12.7) and `(4,5,4)`/`(8,5,8)` is clean
+# (benchmark/probes/fmaddsub_codegen.jl, 2026-09-25). `NR = 6` stays for the
+# same-shape head-to-head with 1m.
+#
+# Measured 2026-09-25, `benchmark/submit_fmaddsub.sh` (bench_complex_efficiency.jl
+# arm 2, Julia 1.12.7, 21 reps, geomean GF/s over its 8 cases):
+#
+#   AVX2, Rome/znver2, job 7109276 (canary spread 1.27%): fmaddsub `4x5/W4` is
+#   the ComplexF64 winner across all three methods, 32.36 GF/s against 1m
+#   `4x6/W4` 31.10 (+4.1%) and planar `4x5/W4` 31.01 (+4.4%). Against planar it
+#   wins every one of the 8 cases (+1% to +10%); against 1m it is mixed (+7..11%
+#   at 64^3/shallow-K/small-N, -2% at 256^3/512^3/small-M). Same shape as 1m,
+#   `4x6/W4`, it LOSES (23.93 GF/s) to the Cliff A spill above. ComplexF32: no
+#   win -- fmaddsub `8x5/W8` 51.97 ties 1m `8x6/W8` 52.02 and trails planar
+#   `8x5/W8` 54.95 (-5.4%), the unchanged champion.
+#
+#   AVX-512, Ice Lake-SP/icelake-server, job 7109277 (canary spread 0.95%): at
+#   1m's own ComplexF64 shapes fmaddsub beats 1m by +14% (`12x8/W8`, 51.19 vs
+#   44.88) and +22% (`8x8/W8`, 50.01 vs 40.87), every case >= +1% -- half the
+#   packed-A bytes paying for the swap -- but the overall winner stays planar
+#   `24x3/W8` (55.50; fmaddsub's best is 7.8% behind). ComplexF32: fmaddsub
+#   `16x8/W16` 87.27 ties 1m `16x8/W16` 87.01; planar `48x3/W16` 93.55 wins.
+#
+# So: a ~4% AVX2 ComplexF64 win, and nothing elsewhere. Too small, and on one
+# machine, to justify an auto-dispatch rule (see `ComplexMethod`'s docstring);
+# the menus stay reachable by naming `FMAddSubKernel`, and no override row is
+# added.
+const KERNEL_SHAPES_C64_FMADDSUB = ((12, 8, 8), (8, 8, 8), (4, 6, 4), (4, 5, 4))
+const KERNEL_SHAPES_C32_FMADDSUB = ((24, 8, 16), (16, 8, 16), (8, 6, 8), (8, 5, 8))
+
 """
     kernel_shapes(T, method::ComplexMethod = _default_method(T)) -> NTuple{<:Any,NTuple{3,Int}}
 
@@ -81,12 +118,15 @@ kernel_shapes(::Type{ComplexF64}, ::PlanarMethod) = KERNEL_SHAPES_C64_PLANAR
 kernel_shapes(::Type{ComplexF64}, ::OneMMethod) = KERNEL_SHAPES_C64_ONEM
 kernel_shapes(::Type{ComplexF32}, ::PlanarMethod) = KERNEL_SHAPES_C32_PLANAR
 kernel_shapes(::Type{ComplexF32}, ::OneMMethod) = KERNEL_SHAPES_C32_ONEM
+kernel_shapes(::Type{ComplexF64}, ::FMAddSubMethod) = KERNEL_SHAPES_C64_FMADDSUB
+kernel_shapes(::Type{ComplexF32}, ::FMAddSubMethod) = KERNEL_SHAPES_C32_FMADDSUB
 
 # The kernel type implementing `method` for `T`, or `nothing` when there is none
 # (exactly the pairs `kernel_shapes` has a menu for).
 _kernel_type(::RealMethod, ::Type{<:Union{Float32, Float64}}) = SIMDKernel
 _kernel_type(::PlanarMethod, ::Type{<:Union{ComplexF32, ComplexF64}}) = PlanarKernel
 _kernel_type(::OneMMethod, ::Type{<:Union{ComplexF32, ComplexF64}}) = OneMKernel
+_kernel_type(::FMAddSubMethod, ::Type{<:Union{ComplexF32, ComplexF64}}) = FMAddSubKernel
 _kernel_type(::Any, ::Type) = nothing
 
 """
@@ -257,6 +297,10 @@ _fitted_shape(::TargetProfile, ::Type{T}, ::RealMethod) where {T} = _fallback_sh
 # 1m's menus hold AVX-512 shapes only; its head is spill-free at every lane
 # width it compiles, so it is the conservative choice.
 _fitted_shape(::TargetProfile, ::Type{T}, method::OneMMethod) where {T} =
+    first(kernel_shapes(T, method))
+
+# FMAddSub: same reasoning as 1m -- the menu head, unmeasured.
+_fitted_shape(::TargetProfile, ::Type{T}, method::FMAddSubMethod) where {T} =
     first(kernel_shapes(T, method))
 
 function _fitted_shape(profile::TargetProfile, ::Type{T}, method::PlanarMethod) where {T}

@@ -30,13 +30,27 @@
 
 include(joinpath(@__DIR__, "harness.jl"))
 
-using QuasiStrided: PlanarMethod, OneMMethod, complex_method, kernel_shapes,
-    _kernel_from_shape, _default_kernel, default_blocking
+using QuasiStrided: PlanarMethod, OneMMethod, FMAddSubMethod, complex_method,
+    kernel_shapes, _kernel_from_shape, _default_kernel, default_blocking
+
+# Which arms to run: `QS_COMPLEX_ARMS=2` runs only the methods x shapes sweep
+# (e.g. benchmark/submit_fmaddsub.sh); default both. Which methods arm 2
+# sweeps: `QS_COMPLEX_METHODS=planar,1m,fmaddsub` (the default: all three).
+const ARMS = split(get(ENV, "QS_COMPLEX_ARMS", "1,2"), ',')
+const METHOD_NAMES = Dict(
+    "planar" => PlanarMethod(), "1m" => OneMMethod(), "fmaddsub" => FMAddSubMethod(),
+)
+const METHODS = Tuple(
+    METHOD_NAMES[strip(m)]
+        for m in split(get(ENV, "QS_COMPLEX_METHODS", "planar,1m,fmaddsub"), ',')
+)
 
 const REPS = 21
 const SWEEP_SHAPES = vcat(MAIN_SHAPES, SMALL_SHAPES)
 
-const OUTDIR = results_dir()
+# `QS_RESULTS_DIR` gives one job its own directory (two same-day runs on one
+# node would otherwise collide on `<host>-<date>`).
+const OUTDIR = get(ENV, "QS_RESULTS_DIR", results_dir())
 mkpath(OUTDIR)
 const CSV_PATH = joinpath(OUTDIR, "complex_efficiency.csv")
 const METHOD_CSV = joinpath(OUTDIR, "complex_method_shapes.csv")
@@ -123,7 +137,7 @@ function arm_methods(csv, canaries, crng)
     println("(NO auto-dispatch rule is derived from this)\n")
     for T in CDTYPES
         rows = NamedTuple[]
-        for method in (PlanarMethod(), OneMMethod())
+        for method in METHODS
             for shape in kernel_shapes(T, method)
                 kernel = try
                     _kernel_from_shape(shape, T, method)
@@ -195,8 +209,8 @@ function main()
     crng = Random.MersenneTwister(0x0CA9A121)
     push!(canaries, run_canary(crng, "start"))
 
-    g64, g32 = arm_efficiency(csv, canaries, crng)
-    arm_methods(csv, canaries, crng)
+    g64, g32 = "1" in ARMS ? arm_efficiency(csv, canaries, crng) : (NaN, NaN)
+    "2" in ARMS && arm_methods(csv, canaries, crng)
 
     push!(canaries, run_canary(crng, "end"))
     close(csv)
@@ -212,6 +226,7 @@ function main()
         print_env_header(io, "bench_complex_efficiency.jl")
         println(io, "git commit = ", git_commit())
         println(io, "reps = ", REPS)
+        println(io, "arms = ", join(ARMS, ","), "   methods = ", join(string.(METHODS), ","))
         @printf(io, "geomean complex efficiency: ComplexF64 %.4f  ComplexF32 %.4f\n", g64, g32)
         println(io, "canaries = ", canaries)
         @printf(io, "canary spread = %.2f%%\n", 100spread)

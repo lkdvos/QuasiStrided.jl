@@ -21,8 +21,8 @@ branch.
 
 **No auto-dispatch rule is derived from any measurement**: the ranking of
 methods differs from machine to machine.
-[`PlanarMethod`](@ref) is the unconditional default; [`OneMMethod`](@ref) is
-selected only by naming the kernel.
+[`PlanarMethod`](@ref) is the unconditional default; [`OneMMethod`](@ref) and
+[`FMAddSubMethod`](@ref) are selected only by naming the kernel.
 """
 abstract type ComplexMethod end
 
@@ -55,6 +55,19 @@ planar-vs-1m measurement compares two methods, not two hand-written kernels.
 struct OneMMethod <: ComplexMethod end
 
 """
+    FMAddSubMethod()
+
+Interleaved complex accumulation with x86 `vfmaddsub`: A packed in
+[`InterleavedFormat`](@ref) (`Complex{T}`'s native `[re, im, ...]` order),
+B in [`PlanarFormat`](@ref) (broadcast `re`/`im` scalars), and ONE
+interleaved accumulator plane, updated per (A-vector, B-column) pair by two
+chained fmaddsub ops on `a` and its in-register pair-swap. Same FMA count as
+planar and 1m; see src/microkernels/fmaddsub.jl. Never selected
+automatically; naming [`FMAddSubKernel`](@ref) is the only way to use it.
+"""
+struct FMAddSubMethod <: ComplexMethod end
+
+"""
     a_reals(::ComplexMethod) -> Int
     b_reals(::ComplexMethod) -> Int
 
@@ -69,6 +82,8 @@ a_reals(::PlanarMethod) = 2
 b_reals(::PlanarMethod) = 2
 a_reals(::OneMMethod) = 4
 b_reals(::OneMMethod) = 2
+a_reals(::FMAddSubMethod) = 2
+b_reals(::FMAddSubMethod) = 2
 
 """
     accumulator_planes(::ComplexMethod) -> Int
@@ -81,6 +96,7 @@ register-budget assertion, which must not assume the real kernel's shape.
 accumulator_planes(::RealMethod) = 1
 accumulator_planes(::PlanarMethod) = 2
 accumulator_planes(::OneMMethod) = 1
+accumulator_planes(::FMAddSubMethod) = 1
 
 """
     complex_method(kernel) -> ComplexMethod
