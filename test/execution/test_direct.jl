@@ -89,18 +89,37 @@ const _DIRECT_SHAPES = (
 end
 
 @testset "execute_direct!: M and N below one register tile of the plan's kernel ($T)" for T in _DIRECT_TYPES
-    for (Ma, Ka, Na) in ((1, 4, 1), (3, 5, 2), (1, 9, 5), (5, 2, 1))
+    # The hardcoded literals this testset used to have (e.g. Ma=5) assumed an
+    # AVX2/AVX-512 planar register tile size and broke on hosts where kernel
+    # selection picks something else at these extents -- observed on GitHub's
+    # hosted CI runners (a smaller fitted planar shape on some, and on
+    # AVX-512 hosts, main's small-M FMAddSub routing -- kernel_selection.jl's
+    # `_small_m_shape` -- picking a DIFFERENT kernel type at small Qm, not
+    # merely a smaller mr of the same one). Predicting which kernel type/shape
+    # kernel selection lands on for a given (Qm, Qn) is exactly the logic this
+    # test must not duplicate, so instead of predicting it, build the ACTUAL
+    # plan for each candidate shape and use it to FILTER: only candidates
+    # whose plan happens to land below one tile in both directions (whatever
+    # kernel that turns out to be, on whatever host/ISA this runs on) are
+    # exercised. This holds by construction on any ISA/kernel-selection
+    # version; the final count assertion just guards against the candidate
+    # list becoming vacuous (e.g. every host resolving a 1-row kernel).
+    candidates = (
+        (1, 4, 1), (3, 5, 2), (1, 9, 5), (5, 2, 1),
+        (2, 4, 2), (4, 3, 1), (1, 6, 3), (6, 4, 4),
+    )
+    exercised = 0
+    for (Ma, Ka, Na) in candidates
         mk = _direct_mm_maker(T, Ma, Ka, Na, 77 + Ma + 10Na)
         Cv, Av, indA, Bv, indB, indC = mk()
         plan = plan_contract(Cv, Av, indA, Bv, indB, indC)
-        # The premise of this testset: the output is smaller than one
-        # register tile in both directions, whichever roles the plan chose.
-        @test axis_length(plan.mgroup) < mr(plan.kernel)
-        @test axis_length(plan.ngroup) < nr(plan.kernel)
+        (axis_length(plan.mgroup) < mr(plan.kernel) && axis_length(plan.ngroup) < nr(plan.kernel)) || continue
+        exercised += 1
         C_exec, C_tw, C_dir = _direct_three_way(mk, 1.25, 0.5)
         @test C_dir ≈ C_exec
         @test C_dir ≈ C_tw
     end
+    @test exercised > 0
 end
 
 @testset "execute_direct!: ignores kernel shape and works without oracle buffers" begin
