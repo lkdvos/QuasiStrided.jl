@@ -37,6 +37,7 @@ include("microkernels/scalar.jl")
 include("microkernels/simd.jl")
 include("microkernels/planar.jl")
 include("microkernels/onem.jl")
+include("microkernels/fmaddsub.jl")
 
 # --- Planning: labels, conjugation, kernel and blocking choice, the plan ---
 include("planning/labels.jl")
@@ -77,7 +78,7 @@ end
             # deliberately. A selection mechanism whose only handle is an
             # internal name is not a selection mechanism, so both belong in
             # this tier alongside `ScalarKernel`/`SIMDKernel`.
-            :PlanarKernel, :OneMKernel,
+            :PlanarKernel, :OneMKernel, :FMAddSubKernel,
             :target_profile, :cache_topology,
             :TargetProfile, :CacheLevel
         )

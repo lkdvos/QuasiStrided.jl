@@ -758,11 +758,14 @@ const _QS = QuasiStrided
             QuasiStrided.execute_tilewise!(plantw, alpha, beta)
             @test maximum(abs.(Ctw .- C1m)) <= tol(T) * 64
 
-            # And against the planar default, which is what the engine picks.
+            # And against the host's planar default kernel, named explicitly:
+            # at M = 37 the extent demotion would pick FMAddSub for
+            # ComplexF32 on AVX-512 (`_small_m_shape`).
             Cpl = copy(Cinit)
             planpl = QuasiStrided.plan_contract(
                 _QS.StridedView(Cpl), _QS.StridedView(Amat), (1, 2),
-                _QS.StridedView(Bmat), (2, 3), (1, 3)
+                _QS.StridedView(Bmat), (2, 3), (1, 3);
+                kernel = _QS._kernel_for(_QS.target_profile(), T)
             )
             @test planpl.kernel isa PlanarKernel
             QuasiStrided.execute!(planpl, alpha, beta)

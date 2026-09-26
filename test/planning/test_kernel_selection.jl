@@ -486,11 +486,40 @@ end
     for T in (ComplexF64, ComplexF32)
         @test _default_kernel(T) isa QuasiStrided.PlanarKernel
         @test _default_kernel(T, 1024, 1024) isa QuasiStrided.PlanarKernel
-        @test _default_kernel(T, 1, 1) isa QuasiStrided.PlanarKernel   # demotion path
+        # Demotion path: FMAddSub on AVX-512 (`_small_m_shape`), planar elsewhere.
+        small = _default_kernel(T, 1, 1)
+        if target_profile().isa === :avx512
+            @test small isa QuasiStrided.FMAddSubKernel
+        else
+            @test small isa QuasiStrided.PlanarKernel
+        end
     end
     # The real path derives or falls back on every ISA, never throws.
     for isakey in (:avx512, :avx2, :neon, :unknown), T in (Float64, Float32)
         @test QuasiStrided._derived_shape(synthetic(isakey, 32), T) isa Tuple{Int, Int, Int}
+    end
+end
+
+@testset "_small_m_shape: AVX-512 complex small-M demotion to FMAddSub" begin
+    sms = QuasiStrided._small_m_shape
+    FM = QuasiStrided.FMAddSubMethod()
+    avx512 = synthetic(:avx512, 64)
+    # The measured cells (see the rule's comment), plus the tie-break: least
+    # padded rows, then the larger tile.
+    @test sms(Val(:avx512), avx512, ComplexF64, 12) === (12, 8, 8)
+    @test sms(Val(:avx512), avx512, ComplexF64, 16) === (8, 8, 8)
+    @test sms(Val(:avx512), avx512, ComplexF64, 20) === (12, 8, 8)  # 24 rows either way
+    @test sms(Val(:avx512), avx512, ComplexF32, 12) === (16, 8, 16)
+    @test sms(Val(:avx512), avx512, ComplexF32, 16) === (16, 8, 16)
+    for T in (ComplexF64, ComplexF32), Qm in 1:47
+        shape = sms(Val(:avx512), avx512, T, Qm)
+        @test shape in kernel_shapes(T, FM)
+        @test shape[3] == 64 ÷ sizeof(real(T))            # native width only
+    end
+    # Real types and every other ISA keep the pre-existing demotion.
+    @test sms(Val(:avx512), avx512, Float64, 4) === nothing
+    for isakey in (:avx2, :neon, :unknown), T in (ComplexF64, ComplexF32)
+        @test sms(Val(isakey), synthetic(isakey, 32), T, 2) === nothing
     end
 end
 

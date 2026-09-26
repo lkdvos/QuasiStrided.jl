@@ -354,6 +354,16 @@ end
     return nothing
 end
 
+# InterleavedFormat: `o[2t] = re; o[2t + 1] = im` -- exactly 1e's first real K
+# step and nothing else, addressed the same way (`index` over reals).
+@inline function _pack_emit!(
+        packed::V, ::InterleavedFormat, plane_offset::P, t::Int, p::Int, z::T
+    ) where {V, P, T}
+    panel_store!(packed, plane_offset(0, 2 * t, p), real(z))
+    panel_store!(packed, plane_offset(0, 2 * t + 1, p), imag(z))
+    return nothing
+end
+
 # Padding lanes: literal zero into every real of the lane, without reading
 # `source` and without calling `transform`. Written separately rather than as
 # `_pack_emit!(..., zero(T))` because 1e's `-im` of a zero is `-0.0`, and the
@@ -363,6 +373,14 @@ end
     ) where {V, P, R}
     panel_store!(packed, plane_offset(0, t, p), zero(R))
     panel_store!(packed, plane_offset(1, t, p), zero(R))
+    return nothing
+end
+
+@inline function _pack_emit_zero!(
+        packed::V, ::InterleavedFormat, plane_offset::P, t::Int, p::Int, ::Type{R}
+    ) where {V, P, R}
+    panel_store!(packed, plane_offset(0, 2 * t, p), zero(R))
+    panel_store!(packed, plane_offset(0, 2 * t + 1, p), zero(R))
     return nothing
 end
 
@@ -381,7 +399,7 @@ end
 @inline function _pack_a_sliver!(
         format::FMT, packed::V, source::QSTile, kernel::Descriptor{MR, NR, T2},
         transform::F, m::Int, kc::Int
-    ) where {FMT <: Union{PlanarFormat, OneEFormat}, V, MR, NR, T2, F}
+    ) where {FMT <: Union{PlanarFormat, InterleavedFormat, OneEFormat}, V, MR, NR, T2, F}
     # A's packed index runs along `source.rows` (the MR logical rows).
     if _pack_complex_contiguous_eligible(
             packed, source.storage, source.rows, transform, format, m, Val(MR), T2
@@ -401,7 +419,7 @@ end
 @inline function _pack_b_sliver!(
         format::FMT, packed::V, source::QSTile, kernel::Descriptor{MR, NR, T2},
         transform::F, n::Int, kc::Int
-    ) where {FMT <: Union{PlanarFormat, OneEFormat}, V, MR, NR, T2, F}
+    ) where {FMT <: Union{PlanarFormat, InterleavedFormat, OneEFormat}, V, MR, NR, T2, F}
     # B's packed index runs along `source.cols` (the NR logical columns), so
     # the unit-stride requirement is on the N axis, not the K axis -- the
     # mirror image of A's. `FB` is `PlanarFormat` under both shipped complex

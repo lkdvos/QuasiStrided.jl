@@ -21,8 +21,11 @@ branch.
 
 **No auto-dispatch rule is derived from any measurement**: the ranking of
 methods differs from machine to machine.
-[`PlanarMethod`](@ref) is the unconditional default; [`OneMMethod`](@ref) is
-selected only by naming the kernel.
+[`PlanarMethod`](@ref) is the default; [`OneMMethod`](@ref) is
+selected only by naming the kernel. One narrow exception: on `:avx512`, when
+M is too small to fill the planar override's register tile, the extent
+demotion picks an [`FMAddSubMethod`](@ref) shape (`_small_m_shape` in
+src/planning/kernel_selection.jl, measured 2x there).
 """
 abstract type ComplexMethod end
 
@@ -55,6 +58,20 @@ planar-vs-1m measurement compares two methods, not two hand-written kernels.
 struct OneMMethod <: ComplexMethod end
 
 """
+    FMAddSubMethod()
+
+Interleaved complex accumulation with x86 `vfmaddsub`: A packed in
+[`InterleavedFormat`](@ref) (`Complex{T}`'s native `[re, im, ...]` order),
+B in [`PlanarFormat`](@ref) (broadcast `re`/`im` scalars), and ONE
+interleaved accumulator plane, updated per (A-vector, B-column) pair by two
+chained fmaddsub ops on `a` and its in-register pair-swap. Same FMA count as
+planar and 1m; see src/microkernels/fmaddsub.jl. Selected by naming
+[`FMAddSubKernel`](@ref), and automatically only by the AVX-512 small-M
+demotion (`_small_m_shape`, src/planning/kernel_selection.jl).
+"""
+struct FMAddSubMethod <: ComplexMethod end
+
+"""
     a_reals(::ComplexMethod) -> Int
     b_reals(::ComplexMethod) -> Int
 
@@ -69,6 +86,8 @@ a_reals(::PlanarMethod) = 2
 b_reals(::PlanarMethod) = 2
 a_reals(::OneMMethod) = 4
 b_reals(::OneMMethod) = 2
+a_reals(::FMAddSubMethod) = 2
+b_reals(::FMAddSubMethod) = 2
 
 """
     accumulator_planes(::ComplexMethod) -> Int
@@ -81,6 +100,7 @@ register-budget assertion, which must not assume the real kernel's shape.
 accumulator_planes(::RealMethod) = 1
 accumulator_planes(::PlanarMethod) = 2
 accumulator_planes(::OneMMethod) = 1
+accumulator_planes(::FMAddSubMethod) = 1
 
 """
     complex_method(kernel) -> ComplexMethod

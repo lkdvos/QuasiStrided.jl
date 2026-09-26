@@ -89,6 +89,7 @@ end
 # leaving a MethodError as the contract.
 @inline _complex_pack_format_eligible(::PlanarFormat) = true
 @inline _complex_pack_format_eligible(::OneEFormat) = true
+@inline _complex_pack_format_eligible(::InterleavedFormat) = true
 @inline _complex_pack_format_eligible(::PackFormat) = false
 
 """
@@ -222,6 +223,29 @@ end
             )
             vstore(
                 _planar_pack_shuffle(src, _pack_alt(src, transform), Val(PD)),
+                dp + sizeof(R) * (2 * PD * p)
+            )
+        end
+    end
+    return packed
+end
+
+# InterleavedFormat: 1e's first region alone, through the very same shuffle
+# (the identity permutation under `identity`, i.e. a plain copy).
+@inline function _pack_complex_contiguous!(
+        ::InterleavedFormat, packed::PackedPanel{R}, storage::DenseVector{Complex{R}},
+        elembase::Int, steps::C, ::Val{PD}, kc::Int, transform::F
+    ) where {R, C, PD, F}
+    GC.@preserve storage begin
+        sp = reinterpret(Ptr{R}, pointer(storage))
+        dp = packed.ptr
+        for p in 0:(kc - 1)
+            src = vload(
+                Vec{2 * PD, R},
+                sp + sizeof(R) * (2 * (elembase + axis_offset(steps, p)))
+            )
+            vstore(
+                _onee_pack_shuffle_a(src, _pack_alt(src, transform), Val(PD)),
                 dp + sizeof(R) * (2 * PD * p)
             )
         end
