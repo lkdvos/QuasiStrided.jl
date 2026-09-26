@@ -93,6 +93,176 @@ function build_scattered(::Type{T}, rng) where {T}
     return (Av = Aperm, indA = indA, Bv = Bneg, indB = indB, Cv = Cv, indC = indC)
 end
 
+# More scattered/gathered fixtures (first used by the software-prefetch
+# experiment on branch `prefetch`): each forces the packers off their
+# contiguous fast paths in a different way, so
+# the gather loops -- not the microkernel -- carry a real share of the time.
+# `build_scattered(T, rng)` above is unchanged and is the `:default` entry.
+# Every entry returns the same fields as `build_scattered`, plus `M`/`K`/`N`
+# (the free and contracted extents, for GFLOP/s).
+const SCATTER_VARIANTS = (
+    :default, :negstride_big, :transposed_AB, :interleaved_groups, :tn4,
+)
+
+function build_scattered(::Type{T}, rng, variant::Symbol) where {T}
+    if variant === :default
+        # M = a*b = 64*16, K = 64, N = 64 (see `build_scattered` above).
+        return (; build_scattered(T, rng)..., M = 64 * 16, K = 64, N = 64)
+    elseif variant === :negstride_big
+        # Large negative strides on both operands: A[m,k] with M stride -2
+        # (so A's unit-stride fast path is ineligible), B[k,n] with K stride
+        # -3 and N stride -6K. C plain.
+        M, K, N = 192, 192, 192
+        Abig = randn(rng, T, 2M, K)
+        Bbig = randn(rng, T, 3K, 2N)
+        Av = StridedView(view(Abig, (2M):-2:1, :))
+        Bv = StridedView(view(Bbig, (3K):-3:1, (2N):-2:1))
+        Cv = StridedView(zeros(T, M, N))
+        return (Av = Av, indA = (1, 2), Bv = Bv, indB = (2, 3), Cv = Cv, indC = (1, 3), M = M, K = K, N = N)
+    elseif variant === :transposed_AB
+        # Both operands transposed views: A's M axis has stride K and B's K
+        # axis has stride N, i.e. every packed lane of A is its own cache line
+        # and B's K steps are N elements apart. Still one plain GEMM.
+        M, K, N = 256, 256, 256
+        Av = permutedims(StridedView(randn(rng, T, K, M)), (2, 1))
+        Bv = permutedims(StridedView(randn(rng, T, N, K)), (2, 1))
+        Cv = StridedView(zeros(T, M, N))
+        return (Av = Av, indA = (1, 2), Bv = Bv, indB = (2, 3), Cv = Cv, indC = (1, 3), M = M, K = K, N = N)
+    elseif variant === :interleaved_groups
+        # Six small axes per operand with the M, K and N legs interleaved in
+        # memory, so no group merges into one affine axis: every M/K/N group
+        # is a genuine 3-axis composite whose offsets come in runs of 6, and
+        # the engine takes the scattered (`PtrScatterAxis`) path everywhere.
+        d = 6
+        # labels: a1..a3 = 1..3 (M), k1..k3 = 4..6 (K), n1..n3 = 7..9 (N)
+        Av = StridedView(randn(rng, T, d, d, d, d, d, d))   # (a1,k1,a2,k2,a3,k3)
+        Bv = StridedView(randn(rng, T, d, d, d, d, d, d))   # (k1,n1,k2,n2,k3,n3)
+        Cv = StridedView(zeros(T, d, d, d, d, d, d))        # (a1,n1,a2,n2,a3,n3)
+        return (
+            Av = Av, indA = (1, 4, 2, 5, 3, 6), Bv = Bv, indB = (4, 7, 5, 8, 6, 9),
+            Cv = Cv, indC = (1, 7, 2, 8, 3, 9), M = d^3, K = d^3, N = d^3,
+        )
+    elseif variant === :tn4
+        # A tensor-network-style 4-index contraction
+        # C[a,b,c,d] = A[a,k,b,l] * B[l,c,k,d]: A's M legs (a,b) and K legs
+        # (k,l) interleave, and B's K legs arrive in the opposite order.
+        e = 16
+        Av = StridedView(randn(rng, T, e, e, e, e))   # (a,k,b,l)
+        Bv = StridedView(randn(rng, T, e, e, e, e))   # (l,c,k,d)
+        Cv = StridedView(zeros(T, e, e, e, e))        # (a,b,c,d)
+        # labels: a=1 b=2 c=3 d=4 k=5 l=6
+        return (
+            Av = Av, indA = (1, 5, 2, 6), Bv = Bv, indB = (6, 3, 5, 4),
+            Cv = Cv, indC = (1, 2, 3, 4), M = e^2, K = e^2, N = e^2,
+        )
+    end
+    throw(ArgumentError("unknown scattered variant $(repr(variant)); expected one of $SCATTER_VARIANTS"))
+end
+
+# ---------------------------------------------------------------------------
+# DRAM-resident and irregular fixtures, for packing work where memory latency
+# matters. Same fields as `build_scattered(T, rng, variant)`.
+# Sizes are for Float64; a Float32 operand is half the bytes.
+# ---------------------------------------------------------------------------
+
+# Operands of 128-256 MB each (Float64): well beyond any node's L3, so the
+# packers stream from DRAM. The small-M/small-N ones make packing a large share
+# of the time (each packed element feeds only 16 microkernel rows/columns).
+const LARGE_VARIANTS = (
+    :smallM_plain, :smallM_negB, :smallN_transA, :square_plain, :square_scattered,
+)
+
+function build_large(::Type{T}, rng, variant::Symbol) where {T}
+    plain(M, K, N) = (
+        Av = StridedView(randn(rng, T, M, K)), indA = (1, 2),
+        Bv = StridedView(randn(rng, T, K, N)), indB = (2, 3),
+        Cv = StridedView(zeros(T, M, N)), indC = (1, 3), M = M, K = K, N = N,
+    )
+    if variant === :smallM_plain
+        # B = 4096 x 8192 (256 MB), plain: B packs through its gather loop
+        # anyway (B has no contiguous fast path), A is tiny.
+        return plain(16, 4096, 8192)
+    elseif variant === :smallM_negB
+        # The same B, reversed along both axes (negative K and N strides).
+        M, K, N = 16, 4096, 8192
+        B = randn(rng, T, K, N)
+        return (
+            Av = StridedView(randn(rng, T, M, K)), indA = (1, 2),
+            Bv = StridedView(view(B, K:-1:1, N:-1:1)), indB = (2, 3),
+            Cv = StridedView(zeros(T, M, N)), indC = (1, 3), M = M, K = K, N = N,
+        )
+    elseif variant === :smallN_transA
+        # A = 8192 x 4096 stored transposed (256 MB): A's M axis has stride K,
+        # so A packs through its gather loop from DRAM.
+        M, K, N = 8192, 4096, 16
+        return (
+            Av = permutedims(StridedView(randn(rng, T, K, M)), (2, 1)), indA = (1, 2),
+            Bv = StridedView(randn(rng, T, K, N)), indB = (2, 3),
+            Cv = StridedView(zeros(T, M, N)), indC = (1, 3), M = M, K = K, N = N,
+        )
+    elseif variant === :square_plain
+        return plain(4096, 4096, 4096)   # 128 MB per operand
+    elseif variant === :square_scattered
+        # 4096^3 with A transposed and B reversed: both gathers, from DRAM.
+        n = 4096
+        B = randn(rng, T, n, n)
+        return (
+            Av = permutedims(StridedView(randn(rng, T, n, n)), (2, 1)), indA = (1, 2),
+            Bv = StridedView(view(B, n:-1:1, :)), indB = (2, 3),
+            Cv = StridedView(zeros(T, n, n)), indC = (1, 3), M = n, K = n, N = n,
+        )
+    end
+    throw(ArgumentError("unknown large variant $(repr(variant)); expected one of $LARGE_VARIANTS"))
+end
+
+# As irregular as the engine can express. It has NO arbitrary-offset input:
+# every operand is a `StridedView` (sizes + strides + offset) and every
+# `AxisGroup` is a stride table, so a random-permutation index vector cannot be
+# passed in. The closest it gets: each free/contracted group is many short
+# axes with large, pseudo-random (odd, non-power-of-two) strides, so a group's
+# offset table -- which the engine then gathers through, `PtrScatterAxis` --
+# is a sum of unrelated jumps with no locality beyond each short axis. Inputs
+# may alias (a read-only operand is allowed to repeat elements), which is what
+# lets the strides be chosen freely inside a buffer of a few hundred MB.
+const IRREGULAR_VARIANTS = (:hypercube_A, :hypercube_AB)
+
+# `n` pseudo-random odd strides in `[lo, hi]` from `rng`.
+_random_strides(rng, n, lo, hi) = Tuple(rand(rng, lo:hi) | 1 for _ in 1:n)
+
+function _hypercube_view(rng, ::Type{T}, dims::NTuple{D, Int}, strides::NTuple{D, Int}) where {T, D}
+    len = 1 + sum((dims[d] - 1) * strides[d] for d in 1:D)
+    return StridedView(randn(rng, T, len), dims, strides, 0)
+end
+
+function build_irregular(::Type{T}, rng, variant::Symbol) where {T}
+    # M = K = 4^6 = 4096 (six length-4 axes each), N = 64.
+    L, nax, N = 4, 6, 64
+    M = K = L^nax
+    # labels: M axes 1..6, K axes 7..12, N axis 13
+    mlab = ntuple(identity, nax)
+    klab = ntuple(d -> nax + d, nax)
+    nlab = 2nax + 1
+    # A: M and K axes interleaved, strides up to ~2^21 elements (16 MB):
+    # buffer ~ 3 * 12 * 2^20 elements (~300 MB Float64).
+    sA = _random_strides(rng, 2nax, 1 << 18, 1 << 21)
+    Av = _hypercube_view(rng, T, ntuple(_ -> L, 2nax), sA)
+    indA = ntuple(d -> isodd(d) ? mlab[(d + 1) >> 1] : klab[d >> 1], 2nax)
+    if variant === :hypercube_A
+        # B plain: K axes as a dense (4,...,4,64) column-major array.
+        Bv = StridedView(randn(rng, T, ntuple(_ -> L, nax)..., N))
+    elseif variant === :hypercube_AB
+        # B irregular too: its six K axes and N get their own random strides.
+        sB = _random_strides(rng, nax + 1, 1 << 16, 1 << 20)
+        Bv = _hypercube_view(rng, T, (ntuple(_ -> L, nax)..., N), sB)
+    else
+        throw(ArgumentError("unknown irregular variant $(repr(variant)); expected one of $IRREGULAR_VARIANTS"))
+    end
+    indB = (klab..., nlab)
+    Cv = StridedView(zeros(T, ntuple(_ -> L, nax)..., N))
+    indC = (mlab..., nlab)
+    return (Av = Av, indA = indA, Bv = Bv, indB = indB, Cv = Cv, indC = indC, M = M, K = K, N = N)
+end
+
 function full_grid(mcs, kcs, ncs)
     combos = Tuple{Int, Int, Int}[]
     for kc in kcs, mc in mcs, nc in ncs
