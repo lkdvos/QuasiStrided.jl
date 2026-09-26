@@ -19,17 +19,36 @@
 #                tensor-network 4-index case. These push both packers onto
 #                their gather loops, which is where a prefetch could matter.
 #
-# Variants (`--variants`, comma-separated; `base` is always measured):
+# `--family` (comma-separated, default `control,scattered`) picks the shape
+# families; the two below are opt-in because of their walltime and memory:
 #
-#   base       every site off (the shipped configuration)
-#   pack_b     B gather loop, distance `--pack-dist` K steps (default 16)
-#   pack_a     A gather loop (non-contiguous case only), `--pack-dist`
-#   macro      macro-kernel panel-ahead, `--macro-lines` lines (default 4)
-#   all        all three at those defaults
-#   <site>@<d> one site at an explicit distance, e.g. `pack_b@32`, `macro@8`
+#   LARGE     -- `LARGE_VARIANTS`: operands of 128-256 MB each (Float64), so
+#                the packers stream from DRAM -- small-M/small-N shapes where
+#                packing is a large share of the time, and 4096^3 square ones,
+#                plain and scattered.
+#   IRREGULAR -- `IRREGULAR_VARIANTS`: the most irregular gathers the engine
+#                can express (many short axes with large pseudo-random
+#                strides; it has no arbitrary-offset input -- see
+#                `build_irregular` in harness.jl).
+#
+# Variants (`--variants`, comma-separated; `base` is always measured; the
+# default is every single site below, i.e. all but `all`):
+#
+#   base         every site off (the shipped configuration)
+#   pack_b       B gather loop, per lane, distance `--pack-dist` K steps (16)
+#   pack_a       A gather loop (non-contiguous case only), per lane
+#   pack_b_line  B gather loop, one prefetch per distinct cache line
+#   pack_a_line  A gather loop, one prefetch per distinct cache line
+#   macro        macro-kernel panel-ahead, `--macro-lines` lines (default 4)
+#   ctile        C micro-tile before its K loop, `prefetcht0`
+#   ctile_w      C micro-tile before its K loop, `prefetchw`
+#   all          pack_a, pack_b and macro together (round 1's "all")
+#   <site>@<d>   one site at an explicit distance, e.g. `pack_b@32`, `macro@8`
 #
 # Methodology, following bench_complex_efficiency.jl: single thread,
-# warm-up-then-median over `REPS` (21) calls, and a start/middle/end canary
+# warm-up-then-median over `REPS` (21) calls -- fewer for a case whose single
+# call is slow (at least 3, and about `--budget` seconds (default 4) of timed
+# calls per timing; the per-row `reps` column says how many), and a start/middle/end canary
 # (always timed with every site off) whose spread is printed and warned on
 # above 10%. In addition, within each (dtype, shape) the variants are timed
 # ADJACENTLY -- base, then each variant, then base again -- so a drift between
@@ -54,8 +73,15 @@ const REPS = SMOKE ? 1 : argopt("reps", 21)
 const PACK_DIST = argopt("pack-dist", 16)
 const MACRO_LINES = argopt("macro-lines", 4)
 const DTYPES_RUN = parse_dtypes(argopt("dtypes", SMOKE ? "Float64" : "Float64,Float32,ComplexF64,ComplexF32"))
-const VARIANT_NAMES = let v = split(argopt("variants", "pack_b,pack_a,macro,all"), ',')
+const VARIANT_NAMES = let v = split(argopt("variants", "pack_b,pack_a,pack_b_line,pack_a_line,macro,ctile,ctile_w"), ',')
     filter(!=("base"), strip.(v))
+end
+
+const BUDGET_S = parse(Float64, argopt("budget", "4"))
+const FAMILIES = Tuple(strip.(split(argopt("family", "control,scattered"), ',')))
+for f in FAMILIES
+    f in ("control", "scattered", "large", "irregular") ||
+        throw(ArgumentError("unknown --family $(repr(f))"))
 end
 
 const CONTROL_SHAPES = SMOKE ? [MAIN_SHAPES[2], SMALL_SHAPES[1]] : vcat(MAIN_SHAPES, SMALL_SHAPES)
@@ -71,18 +97,21 @@ const PROV_PATH = joinpath(OUTDIR, "prefetch$(TAG)_PROVENANCE.txt")
 
 # Variant name -> the (site, distance) settings it switches on; every other
 # site is off.
+const ROUND1_ALL = () -> ((:pack_a, PACK_DIST), (:pack_b, PACK_DIST), (:macro, MACRO_LINES))
+
+default_distance(site::Symbol) =
+    site === :macro ? MACRO_LINES : site in (:ctile, :ctile_w) ? 1 : PACK_DIST
+
 function variant_settings(name::AbstractString)
-    if name == "all"
-        return ((:pack_a, PACK_DIST), (:pack_b, PACK_DIST), (:macro, MACRO_LINES))
-    elseif occursin('@', name)
+    name == "all" && return ROUND1_ALL()
+    if occursin('@', name)
         site, d = split(name, '@'; limit = 2)
+        Symbol(site) in PREFETCH_SITES || throw(ArgumentError("unknown site in variant $(repr(name))"))
         return ((Symbol(site), parse(Int, d)),)
-    elseif name in ("pack_a", "pack_b")
-        return ((Symbol(name), PACK_DIST),)
-    elseif name == "macro"
-        return ((:macro, MACRO_LINES),)
     end
-    throw(ArgumentError("unknown variant $(repr(name))"))
+    site = Symbol(name)
+    site in PREFETCH_SITES || throw(ArgumentError("unknown variant $(repr(name))"))
+    return ((site, default_distance(site)),)
 end
 
 function apply_variant!(settings)
@@ -100,7 +129,10 @@ end
 function time_case(::Type{T}, fx) where {T}
     return Base.invokelatest() do
         plan = plan_contract(fx.Cv, fx.Av, fx.indA, fx.Bv, fx.indB, fx.indC)
-        median_time_s(() -> execute!(plan, one(T), zero(T)); reps = REPS)
+        execute!(plan, one(T), zero(T))           # compile (after a switch) + warm
+        t1 = @elapsed execute!(plan, one(T), zero(T))
+        reps = clamp(floor(Int, BUDGET_S / t1), min(3, REPS), REPS)
+        (median_time_s(() -> execute!(plan, one(T), zero(T)); reps = reps), reps)
     end
 end
 
@@ -109,25 +141,27 @@ canary(crng, label) = (apply_variant!(()); Base.invokelatest(run_canary, crng, l
 # One (dtype, shape): base, every variant, base again -- adjacent.
 function measure_shape!(rows, csv, ::Type{T}, family, name, fx, M, K, N) where {T}
     apply_variant!(())
-    tb1 = time_case(T, fx)
+    tb1, _ = time_case(T, fx)
     tv = Float64[]
+    rv = Int[]
     for v in VARIANT_NAMES
         apply_variant!(variant_settings(v))
-        push!(tv, time_case(T, fx))
+        t, r = time_case(T, fx)
+        push!(tv, t); push!(rv, r)
     end
     apply_variant!(())
-    tb2 = time_case(T, fx)
+    tb2, _ = time_case(T, fx)
     tbase = (tb1 + tb2) / 2
     bspread = abs(tb2 - tb1) / min(tb1, tb2)
     @printf(
         "%-10s %-9s %-24s base %9.3f us (%5.1f GF/s, spread %4.1f%%) ",
         T, family, name, 1.0e6tbase, gflops(T, M, K, N, tbase), 100bspread
     )
-    for (v, t) in zip(VARIANT_NAMES, tv)
+    for (v, t, nreps) in zip(VARIANT_NAMES, tv, rv)
         r = t / tbase
         @printf(" %s %.3f", v, r)
         println(
-            csv, "$T,$family,$name,$M,$K,$N,$v,", @sprintf("%.9f,%.9f,%.9f,%.5f,%.5f", t, tb1, tb2, r, bspread), ",$REPS"
+            csv, "$T,$family,$name,$M,$K,$N,$v,", @sprintf("%.9f,%.9f,%.9f,%.5f,%.5f", t, tb1, tb2, r, bspread), ",$nreps"
         )
         push!(rows, (dtype = T, family = family, shape = name, variant = v, ratio = r, bspread = bspread))
     end
@@ -138,7 +172,7 @@ end
 function summarize(io, rows)
     println(io, "\n== geomean ratio t_variant / t_base per (dtype, family); < 1 = faster ==")
     println(io, "   (max base_spread in that group shown: ratios inside it are noise)")
-    for T in DTYPES_RUN, family in ("control", "scattered")
+    for T in DTYPES_RUN, family in FAMILIES
         sel = filter(r -> r.dtype == T && r.family == family, rows)
         isempty(sel) && continue
         maxspread = maximum(r.bspread for r in sel)
@@ -154,7 +188,7 @@ end
 
 function main()
     print_env_header(stdout, "bench_prefetch.jl")
-    println("variants = base + ", join(VARIANT_NAMES, ", "), "   reps = ", REPS,
+    println("families = ", join(FAMILIES, ","), "   variants = base + ", join(VARIANT_NAMES, ", "), "   reps <= ", REPS,
         "   pack-dist = ", PACK_DIST, "   macro-lines = ", MACRO_LINES)
     for v in VARIANT_NAMES
         variant_settings(v)  # validate every name before spending any time
@@ -167,13 +201,24 @@ function main()
     push!(canaries, canary(crng, "start"))
 
     for (i, T) in enumerate(DTYPES_RUN)
-        for spec in CONTROL_SHAPES
-            fx = build_plain(T, spec, Random.MersenneTwister(0x9F7E))
-            measure_shape!(rows, csv, T, "control", spec.name, fx, spec.Ma, spec.Ka, spec.Na)
+        if "control" in FAMILIES
+            for spec in CONTROL_SHAPES
+                fx = build_plain(T, spec, Random.MersenneTwister(0x9F7E))
+                measure_shape!(rows, csv, T, "control", spec.name, fx, spec.Ma, spec.Ka, spec.Na)
+            end
         end
-        for v in SCATTERED
-            fx = build_scattered(T, Random.MersenneTwister(0x9F7E), v)
-            measure_shape!(rows, csv, T, "scattered", string(v), fx, fx.M, fx.K, fx.N)
+        for (family, variants, build) in (
+                ("scattered", SCATTERED, build_scattered),
+                ("large", LARGE_VARIANTS, build_large),
+                ("irregular", IRREGULAR_VARIANTS, build_irregular),
+            )
+            family in FAMILIES || continue
+            for v in variants
+                fx = build(T, Random.MersenneTwister(0x9F7E), v)
+                measure_shape!(rows, csv, T, family, string(v), fx, fx.M, fx.K, fx.N)
+                fx = nothing
+                GC.gc()  # the large fixtures are hundreds of MB each
+            end
         end
         flush(csv)
         i < length(DTYPES_RUN) && push!(canaries, canary(crng, "after-$T"))
@@ -198,6 +243,7 @@ function main()
         println(io, "target = ", QuasiStrided.target_profile())
         println(io, "reps = ", REPS, "  pack-dist = ", PACK_DIST, "  macro-lines = ", MACRO_LINES)
         println(io, "variants = ", join(VARIANT_NAMES, ","))
+        println(io, "families = ", join(FAMILIES, ","), "  budget = ", BUDGET_S, " s")
         println(io, "slurm job = ", get(ENV, "SLURM_JOB_ID", "none"), "  node = ", gethostname())
         println(io, "canaries = ", canaries)
         @printf(io, "canary spread = %.2f%%\n", 100spread)
