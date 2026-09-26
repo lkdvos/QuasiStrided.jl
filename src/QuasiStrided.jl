@@ -48,10 +48,12 @@ include("planning/blocking.jl")
 include("execution/workspace.jl")
 include("planning/plan.jl")
 
-# --- Execution: the five-loop nest, and the tile-by-tile oracle ---
+# --- Execution: the five-loop nest, the tile-by-tile oracle, and the
+# opt-in unpacked direct path for small contractions ---
 include("execution/macrokernel.jl")
 include("execution/execute.jl")
 include("execution/oracle.jl")
+include("execution/direct.jl")
 
 # --- Integrations ---
 include("integrations/tensoroperations.jl")

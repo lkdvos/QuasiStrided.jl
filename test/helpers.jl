@@ -4,8 +4,9 @@
 using StridedViews: StridedView, offset
 
 # plan_contract/execute!/ContractPlan aren't exported (only contract! is);
-# execute_tilewise! is never exported at all (it's an internal oracle).
-# `test/runtests.jl` deliberately leaves these four out of its own
+# execute_tilewise! is never exported at all (it's an internal oracle), nor is
+# the opt-in execute_direct!.
+# `test/runtests.jl` deliberately leaves these five out of its own
 # name-restoring `using QuasiStrided: ...` block, because a `const` may not
 # shadow an imported binding; the workspace API is reached as
 # `QuasiStrided.<name>` for the same reason.
@@ -13,6 +14,7 @@ const plan_contract = QuasiStrided.plan_contract
 const execute! = QuasiStrided.execute!
 const ContractPlan = QuasiStrided.ContractPlan
 const execute_tilewise! = QuasiStrided.execute_tilewise!
+const execute_direct! = QuasiStrided.execute_direct!
 
 # TO names are always qualified: a bare `using TensorOperations` collides with
 # QuasiStrided's `scalartype`.
