@@ -56,7 +56,62 @@ end
         packed_a::PA, packed_b::PB, kc_len::Int, alpha, beta
     ) where {PA, PB, S, R <: Axis, C <: Axis}
     destination = DestinationTile(storage, base, rows, cols)
+    # Off by default; folds to nothing (sites `:ctile`/`:ctile_w`, below).
+    _ctile_prefetch!(storage, base, rows, cols)
     unsafe_execute_tile!(kernel, destination, packed_a, packed_b, kc_len, alpha, beta)
+    return nothing
+end
+
+# C micro-tile prefetch (sites `:ctile` -> `prefetcht0`, `:ctile_w` ->
+# `prefetchw`; src/hardware/prefetch.jl; EXPERIMENTAL, off by default) -- the
+# classic BLIS C prefetch. Issued for the CURRENT tile immediately before its
+# microkernel call, i.e. before the K loop: the K loop (`kc_len` rank-1
+# updates, hundreds of cycles at the shipped `kc`) is the latency the lines
+# have to arrive in before the store phase reads/writes them. The next tile is
+# not prefetched: its C axes are only built at the next iteration, and the
+# current tile's K loop already hides the latency for the current one.
+#
+# Every line of the tile, following C's actual layout: when one axis is a
+# gap-free affine run (`_dense_lanes`, src/packing/pack.jl -- column-major C's
+# rows, or a row-major C's columns), one line range per index of the other
+# axis; otherwise (both axes long-stride or block-scattered, offsets from the
+# scatter tables) one prefetch per element. With both sites off the body folds
+# away (checked in test/execution/test_prefetch.jl).
+@inline function _ctile_prefetch!(storage::S, base::Int, rows::R, cols::C) where {S, R <: Axis, C <: Axis}
+    RD = _prefetch_distance(Val(:ctile))
+    WD = _prefetch_distance(Val(:ctile_w))
+    (RD > 0 || WD > 0) || return nothing
+    storage isa DenseArray || return nothing
+    GC.@preserve storage begin
+        WD > 0 && _prefetch_tile_lines!(storage, base, rows, cols, Val(1))
+        RD > 0 && _prefetch_tile_lines!(storage, base, rows, cols, Val(0))
+    end
+    return nothing
+end
+
+@inline function _prefetch_tile_lines!(
+        storage::S, base::Int, rows::R, cols::C, rw::Val
+    ) where {S, R <: Axis, C <: Axis}
+    p0 = pointer(storage)
+    E = sizeof(eltype(storage))
+    m = axis_length(rows)
+    n = axis_length(cols)
+    (m == 0 || n == 0) && return nothing
+    if _dense_lanes(rows, E)
+        for j in 0:(n - 1)
+            a, b = _lane_bytes(p0, E, base + axis_offset(cols, j), rows, m)
+            _prefetch_lines!(a, b, rw)
+        end
+    elseif _dense_lanes(cols, E)
+        for i in 0:(m - 1)
+            a, b = _lane_bytes(p0, E, base + axis_offset(rows, i), cols, n)
+            _prefetch_lines!(a, b, rw)
+        end
+    else
+        for j in 0:(n - 1), i in 0:(m - 1)
+            prefetch(p0 + E * (base + axis_offset(rows, i) + axis_offset(cols, j)), rw, Val(3))
+        end
+    end
     return nothing
 end
 
