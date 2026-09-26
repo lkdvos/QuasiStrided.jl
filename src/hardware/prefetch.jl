@@ -59,7 +59,7 @@ end
 # Per-site switches
 # ----------------------------------------------------------------------------
 #
-# Three EXPERIMENTAL insertion points, each off by default and independently
+# EXPERIMENTAL insertion points, each off by default and independently
 # switchable:
 #
 #   :pack_b  -- the B gather loop (`_pack_b_sliver!`'s scalar fallback,
@@ -70,10 +70,22 @@ end
 #               (src/execution/execute.jl, loop 1): while the microkernel
 #               consumes one packed A/B micropanel, prefetch the head of the
 #               next one. `distance` is the number of cache lines of that head.
+#   :pack_b_line, :pack_a_line
+#            -- cache-line-granular versions of `:pack_b`/`:pack_a` (same
+#               loops, same `distance` in K steps): one prefetch per distinct
+#               line a K step's lanes touch, issued only when those lines
+#               differ from the previous step's, instead of one per lane per
+#               step. When both the per-lane and the line site of one operand
+#               are on, the line site wins.
+#   :ctile   -- the C micro-tile (src/execution/macrokernel.jl,
+#               `unsafe_execute_micro_tile!`): every line of the tile the
+#               microkernel is about to write, prefetched (`prefetcht0`) right
+#               before its K loop starts. Any `distance > 0` means on.
+#   :ctile_w -- the same, with write intent (`prefetchw`).
 #
 # `_prefetch_distance(Val(site))` returns a literal `Int`, `0` meaning off. Each
 # call site branches on it with `> 0`, which folds at compile time, so a
-# disabled site contributes no instruction at all -- test/hardware/
+# disabled site contributes no instruction at all -- test/execution/
 # test_prefetch.jl checks that by counting `prefetch` in the native code of the
 # packers and of `_execute_nest!`.
 #
@@ -83,11 +95,36 @@ end
 # on its next call, so the new value takes effect everywhere with no runtime
 # flag in any loop. It is a process-wide, compile-time setting, meant for
 # benchmarks and tests -- a redefinition costs a recompile of the engine.
-const PREFETCH_SITES = (:pack_a, :pack_b, :macro)
+const PREFETCH_SITES = (:pack_a, :pack_b, :macro, :pack_a_line, :pack_b_line, :ctile, :ctile_w)
 
 @inline _prefetch_distance(::Val{:pack_a}) = 0
 @inline _prefetch_distance(::Val{:pack_b}) = 0
 @inline _prefetch_distance(::Val{:macro}) = 0
+@inline _prefetch_distance(::Val{:pack_a_line}) = 0
+@inline _prefetch_distance(::Val{:pack_b_line}) = 0
+@inline _prefetch_distance(::Val{:ctile}) = 0
+@inline _prefetch_distance(::Val{:ctile_w}) = 0
+
+# ----------------------------------------------------------------------------
+# Cache-line helpers, shared by the line-granular packing sites and `:ctile`
+# ----------------------------------------------------------------------------
+
+# Line size assumed for line-granular prefetch. 64 bytes on every x86 this
+# package targets; on a 128-byte-line machine the only cost is prefetching
+# each line twice.
+const PREFETCH_LINE_BYTES = 64
+const _LINE_SHIFT = 6
+
+# Prefetch every line overlapping the inclusive byte range `[a, b]`.
+@inline function _prefetch_lines!(a::UInt, b::UInt, rw::Val)
+    l = a >> _LINE_SHIFT
+    lend = b >> _LINE_SHIFT
+    while l <= lend
+        prefetch(Ptr{Cvoid}(l << _LINE_SHIFT), rw, Val(3))
+        l += 1
+    end
+    return nothing
+end
 
 """
     set_prefetch!(site::Symbol, distance::Integer) -> Int

@@ -269,7 +269,9 @@ end
 # the last step's lines at the end of the sliver. It never reads outside the
 # sliver: a scattered axis's offset is only ever looked up at a valid step.
 #
-# One prefetch per LANE, not per cache line, deliberately: the lanes of one K
+# (`:pack_a_line`/`:pack_b_line` are the cache-line-granular alternative; see
+# `_line_gather_prefetcher` below.) For the per-lane sites: one prefetch per
+# LANE, not per cache line, deliberately: the lanes of one K
 # step may share a line (unit-stride lanes) or each sit on their own (a
 # scattered or long-stride lane axis), and the loop cannot tell which without
 # a runtime test. On a unit-stride K axis this also re-prefetches a line the
@@ -281,19 +283,26 @@ end
 # `_prefetch_step!(nothing, ...)` is an empty inlined method: the disabled
 # gather loop is the same code as before this hook existed.
 @inline _prefetch_step!(::Nothing, p::Int, nlanes::Int) = nothing
-@inline _prefetch_step!(pf::PF, p::Int, nlanes::Int) where {PF} = pf(p, nlanes)
+# Call-site `@inline`: the line-granular hook is past the inliner's cost
+# threshold, and an out-of-line call per K step would cost more than it saves.
+@inline _prefetch_step!(pf::PF, p::Int, nlanes::Int) where {PF} = @inline pf(p, nlanes)
 
 # `LANES_ON_ROWS` is `true` for A (lane `t` is row `t`, K step `p` is column
 # `p`) and `false` for B (K step is the row, lane the column), matching the
 # `load` closures of the sliver packers below. Only a `DenseArray` storage has
 # a `pointer` to prefetch through; anything else gets no prefetch.
+#
+# `site`/`line_site` are the operand's per-lane and line-granular switches;
+# the line site takes precedence when both are on.
 @inline function _gather_prefetcher(
-        site::Val, source::QSTile, kc::Int, ::Val{LANES_ON_ROWS}
+        site::Val, line_site::Val, source::QSTile, kc::Int, lr::Val{LANES_ON_ROWS}
     ) where {LANES_ON_ROWS}
-    D = _prefetch_distance(site)
-    D > 0 || return nothing
     storage = source.storage
     storage isa DenseArray || return nothing
+    DL = _prefetch_distance(line_site)
+    DL > 0 && return _line_gather_prefetcher(DL, source, kc, lr)
+    D = _prefetch_distance(site)
+    D > 0 || return nothing
     base = pointer(storage)
     E = sizeof(eltype(storage))
     qmax = kc - 1
@@ -304,6 +313,128 @@ end
             prefetch(base + E * o)
         end
         return nothing
+    end
+end
+
+# Whether lanes `0:n-1` of `ax` cover a gap-free byte run, i.e. every line
+# between the first and last lane's is touched: an affine lane axis whose
+# stride is at most one line. Only this case prefetches by line range; any
+# other axis (long stride, scattered) is handled lane by lane.
+@inline _dense_lanes(ax::AffineAxis, E::Int) = abs(ax.stride) * E <= PREFETCH_LINE_BYTES
+@inline _dense_lanes(::Axis, ::Int) = false
+
+# Inclusive absolute byte range `[a, b]` of lanes `0:n-1` of `ax` at element
+# offset `o` (the other axis's contribution plus the tile base). Exact for an
+# affine axis, which is the only kind it is called on for a range prefetch.
+# `% UInt` (not `UInt(...)`): the offset is a valid, nonnegative element
+# offset, and the checked conversion would put an InexactError branch in the
+# hot loop.
+@inline function _lane_bytes(base::Ptr, E::Int, o::Int, ax, n::Int)
+    lo, hi = minmax(o + axis_offset(ax, 0), o + axis_offset(ax, n - 1))
+    return (UInt(base) + (E * lo) % UInt, UInt(base) + (E * hi + E - 1) % UInt)
+end
+
+# The line-granular gather hook (sites `:pack_a_line`/`:pack_b_line`). K step
+# `p` prefetches for step `q = p + D`, and nothing once `q` is past the
+# sliver's last step (unlike the per-lane hook, which clamps: that step was
+# already prefetched `D` steps earlier, so a clamp would only repeat it). Which lines step `q` needs that earlier
+# steps did not is decided by a MODE chosen once per sliver, outside the K
+# loop, from the two axes' kinds and strides (`_line_mode`), so the per-step
+# cost is a predictable branch or two plus the prefetches themselves:
+#
+#   period `P`: when the K axis is affine with `d = |stride|*E` bytes and `d`
+#     divides 64, a lane's addresses sampled every `P = 64/d` steps are spaced
+#     exactly one line apart, so issuing only on steps `q` that are multiples
+#     of `P` prefetches each of its lines exactly once, whatever its alignment
+#     -- with no per-lane test. `d >= 64` (every step a new line) gives `P = 1`.
+#
+#   1 dense lanes (gap-free run, e.g. unit-stride N for B): on each issuing
+#     step, one prefetch at the run's first byte, one per further 64 bytes,
+#     and one at its last byte unless that line is already covered. A scattered K axis issues every step.
+#   2 long-stride lanes over a K axis with a period: every lane, on each
+#     issuing step (e.g. column-major B: one prefetch per lane per 8 steps).
+#   3 anything else (scattered K axis, or `d` not dividing 64): lane by lane,
+#     a prefetch only for a lane whose line at `q` differs from its line at
+#     `q - 1`.
+@inline function _line_mode(lanes, steps, E::Int)
+    P = _step_period(steps, E)
+    _dense_lanes(lanes, E) && return (1, max(P, 1))
+    return P > 0 ? (2, P) : (3, 0)
+end
+
+# 0 = no usable period.
+@inline function _step_period(steps::AffineAxis, E::Int)
+    d = abs(steps.stride) * E
+    d >= PREFETCH_LINE_BYTES && return 1
+    (d > 0 && PREFETCH_LINE_BYTES % d == 0) && return PREFETCH_LINE_BYTES ÷ d
+    return 0
+end
+@inline _step_period(::Axis, ::Int) = 0
+
+@inline _affine_parts(ax::AffineAxis) = (ax.base, ax.stride)
+@inline _affine_parts(::Axis) = (0, 0)  # never reached: only affine lanes are dense
+
+# Each mode is its OWN closure type, so `_gather_prefetcher` returns a small
+# `Union` and the call to `_pack_panel!` is union-split: every mode gets its
+# own specialized K loop, with no per-step mode branch and no mode/period
+# state kept live across the loop.
+@inline function _line_gather_prefetcher(
+        D::Int, source::QSTile, kc::Int, ::Val{LANES_ON_ROWS}
+    ) where {LANES_ON_ROWS}
+    storage = source.storage
+    base = pointer(storage)
+    E = sizeof(eltype(storage))
+    lanes = LANES_ON_ROWS ? source.rows : source.cols
+    steps = LANES_ON_ROWS ? source.cols : source.rows
+    mode, P = _line_mode(lanes, steps, E)
+    pmask = P - 1  # P is a power of two whenever it is used as a mask
+    qmax = kc - 1
+    sbase = source.base
+    if mode == 1
+        # Dense lanes are affine (`_dense_lanes`), so lane `t` is at
+        # `lb + t*ls`; the run's low end and byte span follow from that
+        # without a per-step `minmax`.
+        lb, ls = _affine_parts(lanes)
+        als = abs(ls)
+        return function (p::Int, nlanes::Int)
+            q = p + D
+            (q > qmax || (q & pmask) != 0) && return nothing
+            lo = base + E * (sbase + axis_offset(steps, q) + lb + (ls < 0 ? (nlanes - 1) * ls : 0))
+            hi = lo + (E * ((nlanes - 1) * als + 1) - 1)
+            prefetch(lo)
+            a = lo + PREFETCH_LINE_BYTES
+            while a < hi
+                prefetch(a)
+                a += PREFETCH_LINE_BYTES
+            end
+            # The last line only if it is not the one `a` last covered.
+            (UInt(hi) >> _LINE_SHIFT) != (UInt(a - PREFETCH_LINE_BYTES) >> _LINE_SHIFT) && prefetch(hi)
+            return nothing
+        end
+    elseif mode == 2
+        return function (p::Int, nlanes::Int)
+            q = p + D
+            (q > qmax || (q & pmask) != 0) && return nothing
+            oq = sbase + axis_offset(steps, q)
+            for t in 0:(nlanes - 1)
+                prefetch(base + E * (oq + axis_offset(lanes, t)))
+            end
+            return nothing
+        end
+    else
+        return function (p::Int, nlanes::Int)
+            q = p + D
+            q > qmax && return nothing
+            oq = sbase + axis_offset(steps, q)
+            op = sbase + axis_offset(steps, q - 1)
+            for t in 0:(nlanes - 1)
+                lo = axis_offset(lanes, t)
+                a = UInt(base) + (E * (oq + lo)) % UInt
+                b = UInt(base) + (E * (op + lo)) % UInt
+                (a >> _LINE_SHIFT) != (b >> _LINE_SHIFT) && prefetch(Ptr{Cvoid}(a))
+            end
+            return nothing
+        end
     end
 end
 
@@ -337,7 +468,7 @@ end
 
     load = (i, p) -> tile_load(source, i, p)
     plane_offset = (plane, i, p) -> packed_a_offset(kernel, i, p)
-    pf = _gather_prefetcher(Val(:pack_a), source, kc, Val(true))
+    pf = _gather_prefetcher(Val(:pack_a), Val(:pack_a_line), source, kc, Val(true))
     storage = source.storage
     GC.@preserve storage begin
         _pack_panel!(packed, T2, RealFormat(), Val(MR), kc, m, transform, load, plane_offset, pf)
@@ -351,7 +482,7 @@ end
     ) where {V, MR, NR, T2, F}
     load = (j, p) -> tile_load(source, p, j)  # source.rows=K, source.cols=N
     plane_offset = (plane, j, p) -> packed_b_offset(kernel, j, p)
-    pf = _gather_prefetcher(Val(:pack_b), source, kc, Val(false))
+    pf = _gather_prefetcher(Val(:pack_b), Val(:pack_b_line), source, kc, Val(false))
     storage = source.storage
     GC.@preserve storage begin
         _pack_panel!(packed, T2, RealFormat(), Val(NR), kc, n, transform, load, plane_offset, pf)
@@ -477,7 +608,7 @@ end
 
     load = (i, p) -> tile_load(source, i, p)
     plane_offset = (plane, i, p) -> packed_a_plane_offset(kernel, plane, i, p)
-    pf = _gather_prefetcher(Val(:pack_a), source, kc, Val(true))
+    pf = _gather_prefetcher(Val(:pack_a), Val(:pack_a_line), source, kc, Val(true))
     storage = source.storage
     GC.@preserve storage begin
         _pack_panel!(packed, T2, format, Val(MR), kc, m, transform, load, plane_offset, pf)
@@ -505,7 +636,7 @@ end
 
     load = (j, p) -> tile_load(source, p, j)  # source.rows=K, source.cols=N
     plane_offset = (plane, j, p) -> packed_b_plane_offset(kernel, plane, j, p)
-    pf = _gather_prefetcher(Val(:pack_b), source, kc, Val(false))
+    pf = _gather_prefetcher(Val(:pack_b), Val(:pack_b_line), source, kc, Val(false))
     storage = source.storage
     GC.@preserve storage begin
         _pack_panel!(packed, T2, format, Val(NR), kc, n, transform, load, plane_offset, pf)
