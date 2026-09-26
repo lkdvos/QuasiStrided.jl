@@ -95,6 +95,37 @@ end
 # on its next call, so the new value takes effect everywhere with no runtime
 # flag in any loop. It is a process-wide, compile-time setting, meant for
 # benchmarks and tests -- a redefinition costs a recompile of the engine.
+#
+# Measured: every site stays OFF by default because none pays for itself
+# (`benchmark/bench_prefetch.jl`, Float64/Float32/ComplexF64/ComplexF32, 21
+# reps, ratio = t_site_on / t_off per shape, base-before/after spread and
+# canary spread reported, all canaries <= 2.9%; `benchmark/perf_prefetch.jl`
+# for the counters). Round 1 (2026-09-25): jobs 7109952 (Ice Lake-SP), 7109953
+# (Genoa/Zen4), 7109954 (Rome/Zen2). Round 2 (2026-09-26, on main 5242652):
+# jobs 7111536 / 7111537 / 7111538, same three node types.
+#
+#   :pack_b, :pack_b_line -- slower everywhere. Plain/scattered geomean
+#     1.01-1.16, worst 1.45 (Float32 12x256x256, Ice Lake); 128-256 MB
+#     operands 1.00-1.06. Going per-line cuts executed prefetches ~8x but
+#     `instructions` still rise 17-44% and loads 16-30%: the cost is the hook
+#     (the offset-table read for step p+D, address math), not the prefetch uops,
+#     in a loop that is already load/store bound. Distances 4/16/64: no change.
+#   :pack_a, :pack_a_line -- neutral to slightly slower (0.99-1.05) everywhere
+#     EXCEPT the `--family irregular` gathers (axes of length 4 with strides up
+#     to 2^21, DRAM resident): 0.87 on Ice Lake (cycles 0.82x, L3-miss stalls
+#     0.07x, demand L3 misses ~0.05x -- the prefetch really hides DRAM
+#     latency), but 1.08-1.11 on Genoa and 1.24-1.27 on Rome (cycles
+#     +13-18%, DRAM fills unchanged). Too narrow and too ISA-split for a
+#     default; the AMD distance was never swept on those shapes.
+#   :macro -- neutral everywhere (0.98-1.02, 1-16 lines).
+#   :ctile, :ctile_w -- slower on real types (1.05-1.08, worst 1.33),
+#     neutral on complex; write intent changes nothing. The 16x6 Float64 C
+#     tile is ~12 lines the out-of-order core already hides behind the K loop.
+#
+# Cause, overall: hardware stream/stride prefetchers already cover every
+# stride-predictable pattern this engine can express (it only takes
+# StridedViews, so truly random-index gathers are not expressible), so a
+# software prefetch only adds instructions.
 const PREFETCH_SITES = (:pack_a, :pack_b, :macro, :pack_a_line, :pack_b_line, :ctile, :ctile_w)
 
 @inline _prefetch_distance(::Val{:pack_a}) = 0
