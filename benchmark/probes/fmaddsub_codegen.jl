@@ -75,31 +75,41 @@ kernels(::Type{ComplexF64}) = [
     ("planar", PlanarKernel(Val(24), Val(3), ComplexF64, Val(8))),
     ("1m", OneMKernel(Val(4), Val(6), ComplexF64, Val(4))),
     ("1m", OneMKernel(Val(12), Val(8), ComplexF64, Val(8))),
-    [("fmaddsub", FMAddSubKernel(Val(MR), Val(NR), ComplexF64, Val(W)))
-        for (MR, NR, W) in QuasiStrided.KERNEL_SHAPES_C64_FMADDSUB]...,
+    [
+        ("fmaddsub", FMAddSubKernel(Val(MR), Val(NR), ComplexF64, Val(W)))
+            for (MR, NR, W) in QuasiStrided.KERNEL_SHAPES_C64_FMADDSUB
+    ]...,
 ]
 kernels(::Type{ComplexF32}) = [
     ("planar", PlanarKernel(Val(8), Val(5), ComplexF32, Val(8))),
     ("planar", PlanarKernel(Val(48), Val(3), ComplexF32, Val(16))),
     ("1m", OneMKernel(Val(8), Val(6), ComplexF32, Val(8))),
     ("1m", OneMKernel(Val(24), Val(8), ComplexF32, Val(16))),
-    [("fmaddsub", FMAddSubKernel(Val(MR), Val(NR), ComplexF32, Val(W)))
-        for (MR, NR, W) in QuasiStrided.KERNEL_SHAPES_C32_FMADDSUB]...,
+    [
+        ("fmaddsub", FMAddSubKernel(Val(MR), Val(NR), ComplexF32, Val(W)))
+            for (MR, NR, W) in QuasiStrided.KERNEL_SHAPES_C32_FMADDSUB
+    ]...,
 ]
 
-println("cpu = ", Sys.CPU_NAME, "   julia = ", VERSION,
+println(
+    "cpu = ", Sys.CPU_NAME, "   julia = ", VERSION,
     "   (LLVM target: ", Base.JLOptions().cpu_target == C_NULL ? "native" :
-    unsafe_string(Base.JLOptions().cpu_target), ")")
-@printf("%-10s %-9s %-10s %8s %8s %5s %5s %4s %7s %5s %5s %5s %8s %8s\n",
+        unsafe_string(Base.JLOptions().cpu_target), ")"
+)
+@printf(
+    "%-10s %-9s %-10s %8s %8s %5s %5s %4s %7s %5s %5s %5s %8s %8s\n",
     "T", "method", "shape", "fmaddsub", "fmsubadd", "fma", "fms", "mul", "add/sub",
-    "shuf", "blend", "bcast", "spill_st", "spill_ld")
+    "shuf", "blend", "bcast", "spill_st", "spill_ld"
+)
 for T in (ComplexF64, ComplexF32)
     for (name, k) in kernels(T)
         r = probe(k)
         shape = "$(QuasiStrided.mr(k))x$(QuasiStrided.nr(k))/W$(QuasiStrided.lanewidth(k))"
-        @printf("%-10s %-9s %-10s %8d %8d %5d %5d %4d %7d %5d %5d %5d %8d %8d\n",
+        @printf(
+            "%-10s %-9s %-10s %8d %8d %5d %5d %4d %7d %5d %5d %5d %8d %8d\n",
             T, name, shape, r.fmaddsub, r.fmsubadd, r.fma, r.fms, r.mul, r.addsub,
-            r.shuf, r.blend, r.bcast, r.spill_st, r.spill_ld)
+            r.shuf, r.blend, r.bcast, r.spill_st, r.spill_ld
+        )
         if DUMP
             println(r.asm)
         end

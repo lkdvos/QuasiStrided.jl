@@ -49,6 +49,8 @@ using QuasiStrided: AxisGroup, axis_length, offsets, fill_offsets!, BlockDescrip
     include("execution/test_workspace.jl")
     include("execution/test_scalar_vs_simd.jl")
     include("execution/test_macro_blocking.jl")
+    include("execution/test_direct.jl")
+    include("execution/test_halfpack.jl")
 
     # Last among the functional tests: it does a bare `using TensorOperations`,
     # which exports its own `scalartype` and would otherwise conflict with the
