@@ -348,9 +348,11 @@ Everything else `_execute_tile_prologue!` validates is still validated: the
 destination extent against the kernel's `(MR, NR)`, `kc >= 0`, both packed
 capacities, and the empty / `kc == 0` / `alpha == 0` short-circuits.
 
-The one caller in this package is `_execute_nest!` (src/execution/execute.jl), which
+The callers in this package are `_execute_nest!` (src/execution/execute.jl), which
 validates the union of an entire (ic, jc) macro block's micro-tiles in one
-[`checked_span_bounds`](@ref) call before running any of them. That is an
+[`checked_span_bounds`](@ref) call before running any of them, and
+`_execute_half_packed_nest!` (src/execution/halfpack.jl), which does the same
+per jc block for its single M sliver. That is an
 exactly equivalent test: the block's micro-tiles are the full cross product of
 its M-sliver row sets and N-sliver column sets, those sets partition the
 block's two offset buffers, and the check only compares range extremes -- so

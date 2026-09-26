@@ -66,6 +66,18 @@ function zero_accumulator(kernel::SIMDKernel{MR, NR, T, W}) where {MR, NR, T, W}
     return ntuple(_ -> z, Val((MR ÷ W) * NR))
 end
 
+# Address of A's logical row `i` at K step `p`, as `_accumulate_step` hands it
+# to `panel_vload`. The default -- every `packed_a` that is an actual packed
+# panel (`PackedPanel`, or a plain `AbstractVector` in packed layout) -- is
+# exactly the kernel's packed formula `packed_a_offset(kernel, i, p)`, so the
+# packed paths (`execute!`, `execute_tilewise!`, 1m's inner kernel) compile to
+# the same code as before this indirection existed. The one other method is
+# `UnpackedAView`'s (src/execution/halfpack.jl), for an A read in place from
+# its own storage. Dispatch is on `packed_a`'s TYPE, which `_accumulate_step`
+# is specialized on anyway, so the choice is made at compile time: there is
+# no runtime branch on any path.
+@inline _a_step_offset(::PA, kernel, i::Int, p::Int) where {PA} = packed_a_offset(kernel, i, p)
+
 # Fully unrolled, closure-free K-step body: one vector load per A row-vector,
 # one scalar load per B column, NVECA*NR FMAs, generated as straight-line code.
 @generated function _accumulate_step(
@@ -85,7 +97,7 @@ end
     bvars = [Symbol(:b, j) for j in 0:(NR - 1)]
 
     load_a = [
-        :($(avars[v + 1]) = panel_vload(Vec{$W, $T}, packed_a, packed_a_offset(kernel, $(v * W), p)))
+        :($(avars[v + 1]) = panel_vload(Vec{$W, $T}, packed_a, _a_step_offset(packed_a, kernel, $(v * W), p)))
             for v in 0:(NVECA - 1)
     ]
     load_b = [
@@ -117,7 +129,9 @@ is a no-op), but **not bitwise identical** (FMA grouping/order differ —
 compare with a tolerance, never `==`). `packed_a`/`packed_b` may be a
 [`PackedPanel`](@ref) — what the driver passes, and the only form that keeps
 a large accumulator register-resident — or any contiguous `AbstractVector{T}`
-such as a `Vector` or unit-range `view`.
+such as a `Vector` or unit-range `view`. `packed_a` may also be an
+[`UnpackedAView`](@ref) (A read in place by `execute_half_packed!`), which
+`_a_step_offset` addresses by its own formula instead of the packed one.
 """
 @inline function Base.accumulate(
         kernel::SIMDKernel{MR, NR, T, W}, acc::NTuple{NV, Vec{W, T}},
