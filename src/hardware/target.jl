@@ -211,8 +211,8 @@ function _init_target!()
     return nothing
 end
 
-# Shared by the deinterleaving complex packer and the planar store: both pay
-# off only with 512-bit vector registers.
+# Shared by the deinterleaving complex packer and the complex vector stores:
+# AVX2 and AVX-512 only (unmeasured on NEON).
 @inline _complex_fastpath_isa_eligible(profile::TargetProfile) =
-    profile.vector_bytes == _isa_vector_bytes(Val(:avx512))
+    profile.vector_bytes >= _isa_vector_bytes(Val(:avx2))
 @inline _complex_fastpath_isa_eligible() = _complex_fastpath_isa_eligible(target_profile())
