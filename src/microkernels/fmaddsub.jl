@@ -106,6 +106,7 @@ end
     ) where {MR, NR, T, W, R, NA, PA, PB}
     MV = (2 * MR) ÷ W
     _check_acc(:_accumulate_step_fmaddsub, R, T, NA, MV * NR)
+    W * sizeof(R) == 32 && return _fenced_fmaddsub_step(MV, NR, W, R)
 
     av = [Symbol(:a, v) for v in 0:(MV - 1)]
     sv = [Symbol(:s, v) for v in 0:(MV - 1)]
@@ -149,6 +150,47 @@ end
             $(load_a...)
             $(load_b...)
             return $(Expr(:tuple, acc_exprs...))
+        end
+    end
+end
+
+# AVX2 (see `_fenced_planar_step`): the `swap(a)*bi` pass, a fence, then the
+# `a*br` pass on A loaded again, so `a` and `swap(a)` are never live together.
+function _fenced_fmaddsub_step(MV, NR, W, R)
+    loads = Any[]
+    for v in 0:(MV - 1)
+        push!(loads, :(panel_vload(Vec{$W, $R}, packed_a, packed_a_plane_offset(kernel, 0, $(v * W), p))))
+    end
+    body = Any[]
+    outs = Any[]
+    for v in 0:(MV - 1)
+        push!(body, :($(Symbol(:s, v)) = _swap_pairs($(loads[v + 1]))))
+    end
+    for j in 0:(NR - 1)
+        push!(body, :(bi = Vec{$W, $R}(_b_step_load2(packed_b, kernel, $j, p)[2])))
+        for v in 0:(MV - 1)
+            i = v + MV * j + 1
+            push!(body, :($(Symbol(:m, i)) = _fmaddsub($(Symbol(:s, v)), bi, acc[$i])))
+        end
+    end
+    push!(body, :(_kstep_fence()))
+    for v in 0:(MV - 1)
+        push!(body, :($(Symbol(:a, v)) = $(loads[v + 1])))
+    end
+    for j in 0:(NR - 1)
+        push!(body, :(br = Vec{$W, $R}(_b_step_load2(packed_b, kernel, $j, p)[1])))
+        for v in 0:(MV - 1)
+            i = v + MV * j + 1
+            push!(outs, Symbol(:c, i))
+            push!(body, :($(Symbol(:c, i)) = _fmaddsub($(Symbol(:a, v)), br, $(Symbol(:m, i)))))
+        end
+    end
+    push!(body, :(_kstep_fence()))
+    return quote
+        Base.@_inline_meta
+        @inbounds begin
+            $(body...)
+            return $(Expr(:tuple, outs...))
         end
     end
 end

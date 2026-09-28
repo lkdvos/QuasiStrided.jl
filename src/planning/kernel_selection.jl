@@ -39,8 +39,7 @@ const KERNEL_SHAPES_C32_PLANAR = (
     (48, 3, 16), (32, 6, 16), (16, 8, 16), (8, 5, 8), (8, 6, 4), (4, 6, 4),
 )
 const KERNEL_SHAPES_C32_ONEM = ((24, 8, 16), (32, 6, 16), (16, 8, 16), (8, 6, 8))
-# FMAddSub starts from 1m's shapes (same accumulator layout); the `NR = 5` AVX2
-# entries fit 16 registers, where `NR = 6` spills.
+# FMAddSub starts from 1m's shapes (same accumulator layout), plus `NR = 5` AVX2 tiles.
 const KERNEL_SHAPES_C64_FMADDSUB = ((12, 8, 8), (8, 8, 8), (4, 6, 4), (4, 5, 4))
 const KERNEL_SHAPES_C32_FMADDSUB = ((24, 8, 16), (16, 8, 16), (8, 6, 8), (8, 5, 8))
 

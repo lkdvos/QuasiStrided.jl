@@ -210,6 +210,10 @@ end
     return (true, alphaT, betaT)
 end
 
+# Emits no instruction: a `memory` clobber that stops LLVM moving (or merging)
+# loads across it, while the register-only FMAs stay free to move.
+@inline _kstep_fence() = Base.llvmcall("call void asm sideeffect \"\", \"~{memory}\"()\nret void", Cvoid, Tuple{})
+
 # One checked K panel: `zero_accumulator`, `accumulate`, `store_tile!`.
 function execute_tile!(
         kernel::K, destination::QSTile, packed_a::PA, packed_b::PB,

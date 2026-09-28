@@ -112,12 +112,43 @@ end
         )
     end
 
+    W * sizeof(R) == 32 && return _fenced_planar_step(load_a, load_b, acc_exprs, MV, NR)
     return quote
         Base.@_inline_meta
         @inbounds begin
             $(load_a...)
             $(load_b...)
             return $(Expr(:tuple, acc_exprs...))
+        end
+    end
+end
+
+# At AVX2's 16 registers LLVM hoists every broadcast of the K step and spills
+# them; fencing each column keeps its broadcasts next to its FMAs.
+function _fenced_planar_step(load_a, load_b, acc_exprs, MV, NR)
+    NV = MV * NR
+    outs = Any[]
+    for i in 1:(2 * NV)
+        push!(outs, Symbol(:c, i))
+    end
+    body = Any[]
+    for ex in load_a
+        push!(body, ex)
+    end
+    for j in 0:(NR - 1)
+        push!(body, load_b[j + 1])
+        for v in 0:(MV - 1)
+            i = v + MV * j + 1
+            push!(body, :($(outs[i]) = $(acc_exprs[i])))
+            push!(body, :($(outs[NV + i]) = $(acc_exprs[NV + i])))
+        end
+        push!(body, :(_kstep_fence()))
+    end
+    return quote
+        Base.@_inline_meta
+        @inbounds begin
+            $(body...)
+            return $(Expr(:tuple, outs...))
         end
     end
 end

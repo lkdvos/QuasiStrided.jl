@@ -73,7 +73,14 @@ const _QSF = QuasiStrided
         # sets do not reliably match.
         isa = target_profile().isa
         has_fma = Sys.ARCH === :x86_64 && isa in (:avx2, :avx512) && get(ENV, "CI", "false") != "true"
-        function hot_loop(asm)
+        function hot_loop(k)
+            asm = sprint() do io
+                code_native(
+                    io, Base.accumulate,
+                    (typeof(k), typeof(zero_accumulator(k)), PackedPanel{realtype(k)}, PackedPanel{realtype(k)}, Int);
+                    debuginfo = :none, syntax = :intel
+                )
+            end
             lines = split(asm, '\n')
             labels = Dict{String, Int}()
             best = nothing
@@ -85,25 +92,20 @@ const _QSF = QuasiStrided
             end
             return best === nothing ? "" : join(lines[best[1]:best[2]], '\n')
         end
-        shapes = isa === :avx512 ?
-            ((ComplexF64, (8, 8, 8)), (ComplexF32, (16, 8, 16)), (ComplexF64, (4, 5, 4))) :
-            ((ComplexF64, (4, 5, 4)), (ComplexF32, (8, 5, 8)))
+        avx2 = ((ComplexF64, (4, 5, 4)), (ComplexF32, (8, 5, 8)), (ComplexF64, (4, 6, 4)), (ComplexF32, (8, 6, 8)))
+        shapes = isa === :avx512 ? ((ComplexF64, (8, 8, 8)), (ComplexF32, (16, 8, 16)), avx2...) : avx2
         for (T, (MR, NR, W)) in shapes
-            k = FMAddSubKernel(Val(MR), Val(NR), T, Val(W))
-            R = real(T)
-            asm = sprint() do io
-                code_native(
-                    io, Base.accumulate,
-                    (typeof(k), typeof(zero_accumulator(k)), PackedPanel{R}, PackedPanel{R}, Int);
-                    debuginfo = :none, syntax = :intel
-                )
-            end
-            loop = hot_loop(asm)
+            loop = hot_loop(FMAddSubKernel(Val(MR), Val(NR), T, Val(W)))
             MV = (2 * MR) ÷ W
             @test count(r"vfmaddsub\d+p", loop) == 2 * MV * NR skip = !has_fma
             @test count(r"vf(n?madd|n?msub)\d+p[sd]", loop) == 0 skip = !has_fma
             @test count(r"v(mul|add|sub)p[sd]", loop) == 0 skip = !has_fma
             @test count(r"v(shufp|permilp)", loop) == MV skip = !has_fma
+            @test count(r"\[r[sb]p", loop) == 0 skip = !has_fma
+        end
+        for (T, (MR, NR, W)) in ((ComplexF64, (4, 5, 4)), (ComplexF32, (8, 5, 8)))
+            loop = hot_loop(PlanarKernel(Val(MR), Val(NR), T, Val(W)))
+            @test count(r"vfn?madd\d+p", loop) == 4 * NR skip = !has_fma
             @test count(r"\[r[sb]p", loop) == 0 skip = !has_fma
         end
     end
