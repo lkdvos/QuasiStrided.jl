@@ -3,10 +3,14 @@
 # src/planning/defaults.jl caches the host-dependent results per eltype, since
 # the `Val(profile.isa)` dispatch below is dynamic.
 
-# `OneMMethod`/`FMAddSubMethod` are chosen only by naming the kernel (FMAddSub
-# also by the AVX-512 small-M demotion, `_small_m_shape`).
+# `OneMMethod` is chosen only by naming the kernel, `FMAddSubMethod` also by the
+# small-M demotion (`_small_m_shape`) and as the AVX2 complex default.
 _default_method(::Type{<:Real}) = RealMethod()
 _default_method(::Type{<:Complex}) = PlanarMethod()
+# At AVX2's 16 registers fmaddsub's single accumulator plane fits `NR = 6` with a
+# register to spare; planar's two planes spill there when B is read in place.
+_isa_method(::Val, ::Type{T}) where {T} = _default_method(T)
+_isa_method(::Val{:avx2}, ::Type{<:Complex}) = FMAddSubMethod()
 
 const _MixedMethod = Union{ComplexRealMethod, RealComplexMethod}
 
@@ -142,6 +146,8 @@ _shape_override(::Val{:avx2}, ::Type{ComplexF32}, ::PlanarMethod) = (8, 5, 8)
 # The AVX2-sized 1m shape, for a caller naming `OneMMethod()` (the fit would
 # hand it an AVX-512 shape).
 _shape_override(::Val{:avx2}, ::Type{ComplexF64}, ::OneMMethod) = (4, 6, 4)
+_shape_override(::Val{:avx2}, ::Type{ComplexF64}, ::FMAddSubMethod) = (4, 6, 4)
+_shape_override(::Val{:avx2}, ::Type{ComplexF32}, ::FMAddSubMethod) = (8, 6, 8)
 
 # Where the `MR = MV*W` rule applies. Not on NEON (2W on 128-bit lanes is no
 # better than the fallback), nor complex off AVX-512 (planar's two accumulator
@@ -224,8 +230,10 @@ end
 # ----------------------------------------------------------------------------
 
 # The default kernel for `T` on `profile`, uncached.
-@noinline _kernel_for(profile::TargetProfile, ::Type{T}) where {T} =
-    _kernel_from_shape(_derived_shape(profile, T), T, _default_method(T))
+@noinline function _kernel_for(profile::TargetProfile, ::Type{T}) where {T}
+    method = _isa_method(Val(profile.isa), T)
+    return _kernel_from_shape(_derived_shape(profile, T, method), T, method)
+end
 
 # The real MV = 4 shape steps down to its MV = 2 sibling when `Qm` is below one
 # tall tile, or below two and the half tile pads to fewer rows. Above `2MR` the
@@ -256,12 +264,12 @@ end
     return half in kernel_shapes(T, method) ? half : shape
 end
 
-# Small-M demotion for complex `T` on AVX-512, where the planar fitted shape is
-# the spilling `MR = 2W` tile: the native-width FMAddSub shape that pads `Qm`
-# least, ties by the larger tile. `_small_m_candidates` is the cached,
+# Small-M demotion for complex `T` on AVX-512 (where the planar fitted shape is
+# the spilling `MR = 2W` tile) and AVX2: the native-width FMAddSub shape that
+# pads `Qm` least, ties by the larger tile. `_small_m_candidates` is the cached,
 # host-dependent half (empty where the rule does not apply).
 _small_m_candidates(::Val, ::TargetProfile, ::Type) = NTuple{3, Int}[]
-function _small_m_candidates(::Val{:avx512}, profile::TargetProfile, ::Type{T}) where {T <: Complex}
+function _small_m_candidates(::Union{Val{:avx512}, Val{:avx2}}, profile::TargetProfile, ::Type{T}) where {T <: Complex}
     lanes = profile.vector_bytes ÷ sizeof(real(T))
     return [shape for shape in kernel_shapes(T, FMAddSubMethod()) if shape[3] == lanes]
 end

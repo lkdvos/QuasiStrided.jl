@@ -46,7 +46,7 @@ using QuasiStrided: OneMKernel, OneMMethod, PlanarKernel, PlanarMethod, OneEForm
             @test_throws ArgumentError _kernel_from_shape((7, 7, 7), T, OneMMethod())
             # Never the default: method ranking does not transfer between machines.
             @test _default_method(T) === PlanarMethod()
-            @test QuasiStrided._default_kernel(T, 1024, 1024) isa PlanarKernel
+            @test !(QuasiStrided._default_kernel(T, 1024, 1024) isa OneMKernel)
         end
     end
 

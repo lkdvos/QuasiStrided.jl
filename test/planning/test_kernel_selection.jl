@@ -193,6 +193,8 @@ end
             @test ovr in kernel_shapes(T, PlanarMethod())
         end
         @test _fallback_shape(T) === (8, NR_DEFAULT, _fallback_shape(real(T))[3])
+        # AVX2 defaults to FMAddSub at `NR = 6`.
+        @test _kernel_for(synthetic(:avx2, 32; nregisters = 16), T) isa QuasiStrided.FMAddSubKernel{W ÷ 2, NR_DEFAULT, T, W ÷ 2}
         # Off :avx512 an override row wins whatever the width; without a row
         # the shape is fitted to the register budget.
         for key in (:avx2, :neon), vb in (0, 16, 32, 64), nreg in (0, 16, 32)
@@ -339,18 +341,20 @@ end
 
 @testset "kernel construction: the complex default, 1m by name, and throws" begin
     for T in (ComplexF64, ComplexF32)
-        kernel = _default_kernel(T)
-        @test kernel isa QuasiStrided.PlanarKernel
-        @test scalartype(kernel) === T && realtype(kernel) === real(T)
-        @test complex_method(kernel) === PlanarMethod() === QuasiStrided._default_method(T)
-        shape = (mr(kernel), nr(kernel), lanewidth(kernel))
         profile = target_profile()
-        @test _planar_pressure(shape...) <= (profile.nregisters > 0 ? profile.nregisters : 16)
+        avx2 = profile.isa === :avx2
+        kernel = _default_kernel(T)
+        @test kernel isa (avx2 ? QuasiStrided.FMAddSubKernel : QuasiStrided.PlanarKernel)
+        @test scalartype(kernel) === T && realtype(kernel) === real(T)
+        @test complex_method(kernel) === (avx2 ? FMAddSubMethod() : PlanarMethod())
+        @test QuasiStrided._default_method(T) === PlanarMethod()
+        shape = (mr(kernel), nr(kernel), lanewidth(kernel))
+        avx2 || @test _planar_pressure(shape...) <= (profile.nregisters > 0 ? profile.nregisters : 16)
         profile.isa === :avx512 && @test shape === first(kernel_shapes(T, PlanarMethod()))
-        @test _default_kernel(T, 1024, 1024) isa QuasiStrided.PlanarKernel
-        # The small-M demotion: FMAddSub on AVX-512, planar elsewhere.
+        @test _default_kernel(T, 1024, 1024) === kernel
+        # The small-M demotion: FMAddSub on AVX-512 and AVX2, planar elsewhere.
         small = _default_kernel(T, 1, 1)
-        @test small isa (profile.isa === :avx512 ? QuasiStrided.FMAddSubKernel : QuasiStrided.PlanarKernel)
+        @test small isa (profile.isa in (:avx512, :avx2) ? QuasiStrided.FMAddSubKernel : QuasiStrided.PlanarKernel)
 
         shape1m = first(kernel_shapes(T, OneMMethod()))
         k1m = QuasiStrided._kernel_from_shape(shape1m, T, OneMMethod())
@@ -374,7 +378,7 @@ end
     @test QuasiStrided._menu_val((8, 6, 4), Float64, RealMethod()) === Val((8, 6, 4))
 end
 
-@testset "_small_m_shape: AVX-512 complex small-M demotion to FMAddSub" begin
+@testset "_small_m_shape: AVX-512 and AVX2 complex small-M demotion to FMAddSub" begin
     sms(T, Qm, p = synthetic(:avx512, 64)) =
         QuasiStrided._small_m_shape(QuasiStrided._small_m_candidates(Val(p.isa), p, T), Qm)
     # Least padded rows, then the larger tile.
@@ -389,8 +393,10 @@ end
         @test shape[3] == 64 ÷ sizeof(real(T))
     end
     @test sms(Float64, 4) === nothing
-    for isakey in (:avx2, :neon, :unknown), T in (ComplexF64, ComplexF32)
-        @test sms(T, 2, synthetic(isakey, 32)) === nothing
+    for T in (ComplexF64, ComplexF32)
+        L = 32 ÷ sizeof(real(T))
+        @test sms(T, 2, synthetic(:avx2, 32; nregisters = 16)) === (L, NR_DEFAULT, L)
+        @test sms(T, 2, synthetic(:neon, 32)) === sms(T, 2, synthetic(:unknown, 32)) === nothing
     end
 end
 

@@ -151,7 +151,7 @@ const _QSF = QuasiStrided
                 @test _kernel_from_shape(s, T, FMAddSubMethod()) isa FMAddSubKernel{s[1], s[2], T, s[3]}
             end
             @test_throws ArgumentError _kernel_from_shape((7, 7, 7), T, FMAddSubMethod())
-            @test !(_QSF._default_kernel(T, 1024, 1024) isa FMAddSubKernel)
+            @test (_QSF._default_kernel(T, 1024, 1024) isa FMAddSubKernel) == (target_profile().isa === :avx2)
         end
     end
 
