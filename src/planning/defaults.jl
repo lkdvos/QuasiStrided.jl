@@ -72,6 +72,8 @@ end
     # Static, so a real `T`'s method stays a concrete `RealMethod`.
     method = T <: Complex && d.fmaddsub ? FMAddSubMethod() : _default_method(T)
     shape = _store_shape(_extent_shape(d.shape, T, method, Qm), T, method, Qm, run)
+    # Where C's rows defeat the vector store, planar's scalar store is the faster one.
+    T <: Complex && d.fmaddsub && run != Qm && run % shape[1] != 0 && return (d.fitted, _default_method(T))
     (Qm > 0 && Qm < shape[1]) || return (shape, method)
     T <: Complex || return (d.fitted, method)
     small = _small_m_shape(d.small_m, Qm)

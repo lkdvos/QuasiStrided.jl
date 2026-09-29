@@ -180,8 +180,8 @@ function _planned(
     morder = _order_free_labels(mlabels, indC, C)
     norder = _order_free_labels(nlabels, indC, C)
 
-    # Only real `T` swaps and only real kernels run-demote; `0` is a placeholder.
-    run_m = T <: Real || method isa _MixedMethod ? _leading_unit_run(morder, indC, C) : 0
+    # Only real `T` swaps, so `run_n` is a placeholder for complex.
+    run_m = _leading_unit_run(morder, indC, C)
     run_n = T <: Real ? _leading_unit_run(norder, indC, C) : 0
 
     mgroup = _build_pair_group(morder, indA, A, indC, C)  # maps: (A, C)

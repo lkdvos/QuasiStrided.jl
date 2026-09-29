@@ -266,6 +266,25 @@ end
     end
 end
 
+@testset "AVX2 complex: fmaddsub where C's rows take its vector store, else planar" begin
+    saved = QuasiStrided._TARGET[]
+    try
+        QuasiStrided._TARGET[] = synthetic(:avx2, 32; nregisters = 16)
+        for T in (ComplexF64, ComplexF32)
+            W = 32 ÷ sizeof(real(T))
+            fms, planar = ((W, NR_DEFAULT, W), FMAddSubMethod()), ((W, 5, W), PlanarMethod())
+            @test QuasiStrided._default_shape(T, 64, 64) === fms
+            @test QuasiStrided._default_shape(T, 64, 64, 2W) === fms
+            @test QuasiStrided._default_shape(T, 64, 64, W + 2) === planar
+            A, B = randn(T, 64, 8), randn(T, 8, 64)
+            @test QuasiStrided.plan_contract(StridedView(zeros(T, 64, 64)), StridedView(A), (1, 2), StridedView(B), (2, 3), (1, 3)).kernel isa QuasiStrided.FMAddSubKernel
+            @test QuasiStrided.plan_contract(StridedView(zeros(T, 64, 64)), StridedView(A), (1, 2), StridedView(B), (2, 3), (3, 1)).kernel isa QuasiStrided.PlanarKernel
+        end
+    finally
+        QuasiStrided._TARGET[] = saved
+    end
+end
+
 @testset "_derived_shape is always a constructible member of the method's menu" begin
     methods = (
         (Float64, RealMethod()), (Float32, RealMethod()), (ComplexF64, PlanarMethod()),
