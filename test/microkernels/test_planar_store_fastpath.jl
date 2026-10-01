@@ -105,14 +105,15 @@ end
         @test !eligible(zeros(Float64, m * n), AffineAxis(0, 1, m))
     end
 
-    @testset "ISA gate: AVX-512 only" begin
+    @testset "ISA gate: AVX2 and AVX-512" begin
         profile(key, vb, nreg) = TargetProfile(key, Sys.ARCH, "t", vb, nreg, CacheLevel(), CacheLevel(), CacheLevel())
         @test QuasiStrided._complex_fastpath_isa_eligible(profile(:avx512, 64, 32))
-        for (key, vb, nreg) in ((:avx2, 32, 16), (:neon, 16, 32), (:unknown, 0, 0))
+        @test QuasiStrided._complex_fastpath_isa_eligible(profile(:avx2, 32, 16))
+        for (key, vb, nreg) in ((:neon, 16, 32), (:unknown, 0, 0))
             @test !QuasiStrided._complex_fastpath_isa_eligible(profile(key, vb, nreg))
         end
         @test !QuasiStrided._complex_fastpath_isa_eligible(unknown_target())
-        @test STORE_FASTPATH_ON == (target_profile().vector_bytes == QuasiStrided._isa_vector_bytes(Val(:avx512)))
+        @test STORE_FASTPATH_ON == (target_profile().vector_bytes >= QuasiStrided._isa_vector_bytes(Val(:avx2)))
     end
 end
 

@@ -3,12 +3,13 @@
 # blocking.jl is keyed on `Val(profile.isa)`, a dynamic dispatch far too slow to
 # repeat on every `plan_contract`.
 
-# The default `shape`, the `fitted` small-M demotion shape, the AVX-512 complex
-# small-M FMAddSub candidates, the unscaled real blocking row and the core's L2
-# share, all derived from `profile`, which is the cache key.
+# The default `shape` and whether it is an `fmaddsub` one, the `fitted` small-M demotion shape, the
+# complex small-M FMAddSub candidates, the unscaled real blocking row and the
+# core's L2 share, all derived from `profile`, which is the cache key.
 struct ResolvedDefaults
     profile::TargetProfile
     shape::NTuple{3, Int}
+    fmaddsub::Bool
     fitted::NTuple{3, Int}
     small_m::Vector{NTuple{3, Int}}
     real_row::Blocking
@@ -16,14 +17,14 @@ struct ResolvedDefaults
 end
 
 function _resolve_defaults(profile::TargetProfile, ::Type{T}) where {T}
-    method = _default_method(T)
+    method = _isa_method(Val(profile.isa), T)
     # First, so an element type with no menu throws from here.
     shape = _derived_shape(profile, T, method)
-    fitted = _fitted_shape(profile, T, method)
+    fitted = _fitted_shape(profile, T, _default_method(T))
     small_m = _small_m_candidates(Val(profile.isa), profile, T)
     real_row = _real_blocking_row(profile, real(T))
     l2_core = _l2_core_bytes(profile)
-    return ResolvedDefaults(profile, shape, fitted, small_m, real_row, l2_core)
+    return ResolvedDefaults(profile, shape, method isa FMAddSubMethod, fitted, small_m, real_row, l2_core)
 end
 
 # One slot per supported element type (a method dispatch, not a `Dict` probe);
@@ -56,24 +57,28 @@ end
     return fresh
 end
 
-_default_kernel(::Type{T}) where {T} =
-    _kernel_from_shape(_resolved_defaults(T).shape, T, _default_method(T))
+function _default_kernel(::Type{T}) where {T}
+    d = _resolved_defaults(T)
+    return _kernel_from_shape(d.shape, T, d.fmaddsub ? FMAddSubMethod() : _default_method(T))
+end
 
 # The automatic `(shape, method)` for extents `Qm`/`Qn` and C's unit-stride run
 # along M (`run = Qm`: no layout known). Returned as plain values so
 # `plan_contract` never holds a menu-wide kernel Union. The extent and store
 # step-downs apply first; then an `Qm` that cannot fill one tile demotes to the
-# fitted shape, or on AVX-512 complex to FMAddSub.
+# fitted shape, or for complex on AVX-512/AVX2 to FMAddSub.
 @inline function _default_shape(::Type{T}, Qm::Int, Qn::Int, run::Int = Qm) where {T}
     d = _resolved_defaults(T)
-    method = _default_method(T)
-    shape = _store_shape(_extent_shape(d.shape, T, method, Qm), T, method, Qm, run)
-    (Qm > 0 && Qm < shape[1]) || return (shape, method)
     # Static, so a real `T`'s method stays a concrete `RealMethod`.
+    method = T <: Complex && d.fmaddsub ? FMAddSubMethod() : _default_method(T)
+    shape = _store_shape(_extent_shape(d.shape, T, method, Qm), T, method, Qm, run)
+    # Where C's rows defeat the vector store, planar's scalar store is the faster one.
+    T <: Complex && d.fmaddsub && run != Qm && run % shape[1] != 0 && return (d.fitted, _default_method(T))
+    (Qm > 0 && Qm < shape[1]) || return (shape, method)
     T <: Complex || return (d.fitted, method)
     small = _small_m_shape(d.small_m, Qm)
     small === nothing || return (small, FMAddSubMethod())
-    return (d.fitted, method)
+    return (d.fitted, _default_method(T))
 end
 
 # The automatic `(shape, method)` under `method`, `_default_method(T, TA, TB)`.

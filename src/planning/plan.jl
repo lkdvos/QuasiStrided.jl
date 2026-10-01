@@ -67,9 +67,9 @@ invalid input.
     `T` in the workspace, of `M * min(N, nc)` elements.
   * `kernel = nothing` picks one from the hardware profile and the extents: a
     [`SIMDKernel`](@ref) for a real `T`, a [`PlanarKernel`](@ref) for a
-    complex one (an [`FMAddSubKernel`](@ref) for a short M on AVX-512), a
-    [`ComplexRealKernel`](@ref)/[`RealComplexKernel`](@ref) for a complex `T`
-    with a real `B`/`A`. [`OneMKernel`](@ref) is used only when named.
+    complex one (an [`FMAddSubKernel`](@ref) on AVX2, and for a short M on
+    AVX-512), a [`ComplexRealKernel`](@ref)/[`RealComplexKernel`](@ref) for a
+    complex `T` with a real `B`/`A`. [`OneMKernel`](@ref) is used only when named.
   * Labels within the M and N composites are ordered by their stride in `C`;
     the K order follows a cost model of the two packs. For a real `T` the
     operand roles are swapped (B feeds M) when only the N side gives `C` a
@@ -180,8 +180,8 @@ function _planned(
     morder = _order_free_labels(mlabels, indC, C)
     norder = _order_free_labels(nlabels, indC, C)
 
-    # Only real `T` swaps and only real kernels run-demote; `0` is a placeholder.
-    run_m = T <: Real || method isa _MixedMethod ? _leading_unit_run(morder, indC, C) : 0
+    # Only real `T` swaps, so `run_n` is a placeholder for complex.
+    run_m = _leading_unit_run(morder, indC, C)
     run_n = T <: Real ? _leading_unit_run(norder, indC, C) : 0
 
     mgroup = _build_pair_group(morder, indA, A, indC, C)  # maps: (A, C)

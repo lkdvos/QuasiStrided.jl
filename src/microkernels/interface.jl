@@ -13,8 +13,8 @@ abstract type DescriptorKernel{MR, NR, T} end
 
 # Which complex-arithmetic method a kernel implements, as singletons so blocking
 # and the shape menus dispatch on it. No method ranking is hardcoded: planar is
-# the default, 1m and fmaddsub are used only when named (plus fmaddsub for the
-# AVX-512 small-M demotion, `_small_m_shape` in src/planning/kernel_selection.jl).
+# the default, 1m is used only when named, fmaddsub also on AVX2 and for the
+# small-M demotion (`_isa_method`, `_small_m_shape` in src/planning/kernel_selection.jl).
 abstract type ComplexMethod end
 struct RealMethod <: ComplexMethod end      # what a real kernel reports
 struct PlanarMethod <: ComplexMethod end    # split re/im planes, 4 real FMAs per MAC
@@ -209,6 +209,10 @@ end
 
     return (true, alphaT, betaT)
 end
+
+# Emits no instruction: a `memory` clobber that stops LLVM moving (or merging)
+# loads across it, while the register-only FMAs stay free to move.
+@inline _kstep_fence() = Base.llvmcall("call void asm sideeffect \"\", \"~{memory}\"()\nret void", Cvoid, Tuple{})
 
 # One checked K panel: `zero_accumulator`, `accumulate`, `store_tile!`.
 function execute_tile!(
